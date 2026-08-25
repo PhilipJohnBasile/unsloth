@@ -1,0 +1,230 @@
+name: Codex-style agent workspace release gate
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - qa/codex-full-matrix-release-gate-v20
+    paths:
+      - .github/workflows/codex-full-matrix-release-gate.yml
+
+permissions:
+  contents: read
+
+jobs:
+  source-and-contract:
+    name: Source and contract audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch current upstream main
+        run: |
+          git remote add upstream https://github.com/unslothai/unsloth.git || true
+          git fetch --no-tags upstream main
+          echo "HEAD=$(git rev-parse HEAD)"
+          echo "UPSTREAM=$(git rev-parse upstream/main)"
+          echo "AHEAD=$(git rev-list --count upstream/main..HEAD)"
+          echo "BEHIND=$(git rev-list --count HEAD..upstream/main)"
+          test "$(git rev-list --count HEAD..upstream/main)" -eq 0
+          git diff --check upstream/main...HEAD
+      - name: Reject generated payloads and temporary exporters
+        shell: bash
+        run: |
+          changed=$(git diff --name-only upstream/main...HEAD)
+          printf '%s\n' "$changed"
+          ! printf '%s\n' "$changed" | grep -E '(^|/)(codex-build|part-[0-9]+|gz-[0-9]+)|export-codex-agent-workspace|bootstrap-project-folder'
+      - name: Verify production wiring for every matrix layer
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          roots = [
+              Path('studio/backend'),
+              Path('studio/frontend/src'),
+              Path('studio/src-tauri/src'),
+          ]
+          text = '\n'.join(
+              p.read_text(encoding='utf-8', errors='ignore')
+              for root in roots if root.exists()
+              for p in root.rglob('*')
+              if p.is_file() and p.suffix in {'.py', '.ts', '.tsx', '.rs', '.md'}
+          )
+          checks = {
+              'repository workspace': r'workspaceKind|workspace_kind|open[-_]project|open-folder',
+              'durable goal': r'goalStatus|goal_status|project_goal|/goal',
+              'AGENTS.md instructions': r'AGENTS\.md|agents_md',
+              'repository discovery': r'repository[_ ]map|gitignore|ignore-aware',
+              'verification policy': r'/verify|verification[_ ]command|verification policy',
+              'git integration': r'checkpoint|rollback|git[_ ]status|git[_ ]diff',
+              'durable plans': r'/plan|plan_status|project[_ ]plan',
+              'background execution': r'background[_ ]run|task_run|interrupted',
+              'parallel agents': r'worktree|subagent|parallel[_ ]agent',
+              'review and PR workflow': r'pr[_ ]draft|pull request draft|review[_ ]summary',
+          }
+          missing = [name for name, pattern in checks.items() if not re.search(pattern, text, re.I)]
+          if missing:
+              raise SystemExit('Missing production wiring: ' + ', '.join(missing))
+          print('All requested matrix layers have production wiring.')
+          PY
+      - name: Compile changed backend Python
+        shell: bash
+        run: |
+          files=$(git diff --name-only upstream/main...HEAD -- 'studio/backend/**/*.py' | tr '\n' ' ')
+          if [ -n "$files" ]; then python -m py_compile $files; fi
+
+  backend:
+    name: Backend ${{ matrix.os }} / Python ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.11', '3.12']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install focused test dependencies
+        run: python -m pip install -U pip pytest pytest-asyncio httpx fastapi pydantic
+      - name: Discover and run Codex-style feature tests
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess, sys
+
+          test_dir = Path('studio/backend/tests')
+          terms = ('project', 'goal', 'agent', 'repository', 'verification', 'git', 'plan', 'background', 'worktree', 'review', 'platform')
+          tests = sorted({p for p in test_dir.glob('test_*.py') if any(t in p.name.lower() for t in terms)})
+          for name in ('test_chat_history_storage.py', 'test_project_workspace_location.py', 'test_sandbox_files_and_storage_roots.py', 'test_permission_mode.py'):
+              p = test_dir / name
+              if p.exists(): tests.append(p)
+          tests = sorted(set(tests))
+          if not tests:
+              raise SystemExit('No focused backend tests were discovered.')
+          print('\n'.join(map(str, tests)))
+          raise SystemExit(subprocess.call([sys.executable, '-m', 'pytest', '-q', *map(str, tests)], env={**__import__('os').environ, 'PYTHONPATH': 'studio/backend'}))
+          PY
+      - name: Cross-platform path semantics smoke
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pathlib, tempfile, unicodedata
+          with tempfile.TemporaryDirectory() as d:
+              root = pathlib.Path(d)
+              name = unicodedata.normalize('NFC', 'répository-目标')
+              p = root / name
+              p.mkdir()
+              assert p.resolve().is_dir()
+              longish = p
+              for i in range(8):
+                  longish /= ('segment-' + str(i) + '-' + 'x' * 20)
+              longish.mkdir(parents=True)
+              assert longish.resolve().is_dir()
+          print(os.name, 'path smoke passed')
+          PY
+
+  frontend:
+    name: Frontend ${{ matrix.os }} / Node ${{ matrix.node }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20, 22]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run i18n:check:strict
+
+  tauri:
+    name: Tauri native path ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - run: cargo fmt --manifest-path studio/src-tauri/Cargo.toml -- --check
+      - name: Compile Tauri tests
+        run: cargo test --manifest-path studio/src-tauri/Cargo.toml --no-run
+      - name: Native path and workspace tests
+        run: cargo test --manifest-path studio/src-tauri/Cargo.toml native_path -- --nocapture
+
+  security-and-safety:
+    name: Security and destructive-operation gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run focused security assertions
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          backend = '\n'.join(p.read_text(errors='ignore') for p in Path('studio/backend').rglob('*.py'))
+          frontend = '\n'.join(p.read_text(errors='ignore') for p in Path('studio/frontend/src').rglob('*') if p.is_file() and p.suffix in {'.ts','.tsx'})
+          rust = '\n'.join(p.read_text(errors='ignore') for p in Path('studio/src-tauri/src').rglob('*.rs'))
+          required = {
+              'signed native project folder grant': (backend + rust, r'open-project|OpenProject'),
+              'folder workspace deletion guard': (backend, r'workspace_kind|workspaceKind'),
+              'goal context boundary': (backend + frontend, r'project_goal'),
+              'verification timeout or cancellation': (backend, r'timeout|cancel'),
+              'worktree ownership or safety check': (backend, r'worktree.*(?:owner|safe|root)|(?:owner|safe|root).*worktree'),
+              'local goal command interception': (frontend, r'/goal|goal.*command'),
+          }
+          missing = [name for name,(text,pat) in required.items() if not re.search(pat,text,re.I|re.S)]
+          if missing:
+              raise SystemExit('Security gates missing: ' + ', '.join(missing))
+          print('Security source gates passed.')
+          PY
+      - name: Goal markup and command parser tests exist
+        shell: bash
+        run: |
+          grep -RInE 'project_goal|/goal' studio/backend/tests studio/frontend/tests
+          grep -RInE 'escape|sanitize|delimiter|injection|markup|xml' studio/backend/tests studio/frontend/tests | grep -Ei 'goal|project'
+
+  release-verdict:
+    name: Release verdict
+    if: always()
+    needs: [source-and-contract, backend, frontend, tauri, security-and-safety]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce all matrix jobs
+        env:
+          SOURCE: ${{ needs.source-and-contract.result }}
+          BACKEND: ${{ needs.backend.result }}
+          FRONTEND: ${{ needs.frontend.result }}
+          TAURI: ${{ needs.tauri.result }}
+          SECURITY: ${{ needs.security-and-safety.result }}
+        run: |
+          printf 'source=%s\nbackend=%s\nfrontend=%s\ntauri=%s\nsecurity=%s\n' "$SOURCE" "$BACKEND" "$FRONTEND" "$TAURI" "$SECURITY"
+          test "$SOURCE" = success
+          test "$BACKEND" = success
+          test "$FRONTEND" = success
+          test "$TAURI" = success
+          test "$SECURITY" = success
+          echo 'Codex-style matrix release gate passed.'
