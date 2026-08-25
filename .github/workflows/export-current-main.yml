@@ -17,15 +17,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Build source and history archives
-        run: |
-          git bundle create unsloth-current-main.bundle --all
-          tar --exclude=.git -czf unsloth-current-main.tar.gz .
+      - name: Build repository bundle
+        run: git bundle create unsloth-current-main.bundle --all
       - uses: actions/upload-artifact@v4
         with:
           name: unsloth-current-main-source
-          path: |
-            unsloth-current-main.bundle
-            unsloth-current-main.tar.gz
+          path: unsloth-current-main.bundle
           retention-days: 1
           compression-level: 0
