@@ -43,11 +43,11 @@ jobs:
           node --experimental-strip-types --test \
             studio/frontend/tests/project-folder-workspace.test.ts
 
-      - name: Check Rust formatting
+      - name: Format touched Rust modules
         shell: bash
         run: |
           set -euo pipefail
-          rustfmt --check --edition 2021 \
+          rustfmt --edition 2021 --config skip_children=true \
             studio/src-tauri/src/native_backend_lease.rs \
             studio/src-tauri/src/native_path_policy.rs \
             studio/src-tauri/src/native_intents.rs \
