@@ -9,7 +9,11 @@ mixed handlers explicitly send their database transaction through Starlette's th
 """
 
 import asyncio
+import os
 import sqlite3
+import time
+import uuid
+from pathlib import Path
 from typing import Annotated, Any, Literal, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -277,6 +281,9 @@ class ChatProject(BaseModel):
     instructions: str = ""
     rootPath: Optional[str] = None
     sandboxPath: Optional[str] = None
+    workspaceKind: Literal["managed", "folder"] = "managed"
+    workspaceAvailable: bool = True
+    workspaceError: Optional[str] = None
     archived: bool = False
     createdAt: int
     updatedAt: int
@@ -294,6 +301,11 @@ class ChatProjectPatch(BaseModel):
     archived: Optional[bool] = None
     createdAt: Optional[int] = None
     updatedAt: Optional[int] = None
+
+
+class OpenProjectFolderRequest(BaseModel):
+    nativePathLease: str = Field(min_length = 1)
+    name: Optional[str] = Field(default = None, max_length = 120)
 
 
 class ChatThreadListResponse(BaseModel):
@@ -957,13 +969,60 @@ def delete_attachment(
     return {"ok": True}
 
 
+def _project_with_workspace_status(project: dict) -> ChatProject:
+    try:
+        resolved = ensure_chat_project_workspace(project["id"]) or project
+    except ProjectWorkspaceError as exc:
+        return ChatProject(
+            **project,
+            workspaceAvailable = False,
+            workspaceError = (
+                f'Project folder "{exc.path}" is unavailable. '
+                "Reconnect it or choose another folder."
+            ),
+        )
+    return ChatProject(
+        **resolved, workspaceAvailable = True, workspaceError = None
+    )
+
+
+def _resolve_project_folder_path(
+    native_path_lease: str, *, verifier = None
+) -> tuple[str, str]:
+    """Consume the purpose-bound desktop grant for the chosen directory."""
+    from utils.native_path_leases import NativePathLeaseError, verify_native_path_lease
+
+    verify = verifier or verify_native_path_lease
+    try:
+        grant = verify(
+            native_path_lease,
+            operation = "open-project",
+            expected_kind = "document-folder",
+            expected_path_type = "directory",
+        )
+    except NativePathLeaseError as exc:
+        raise HTTPException(status_code = 400, detail = str(exc)) from exc
+    return str(grant.canonical_path), str(grant.display_label or "")
+
+
+def _same_project_root(first: str | None, second: str) -> bool:
+    if not first:
+        return False
+    try:
+        left = os.path.normcase(str(Path(first).expanduser().resolve(strict = False)))
+        right = os.path.normcase(str(Path(second).expanduser().resolve(strict = False)))
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return left == right
+
+
 @router.get("/projects", response_model = ChatProjectListResponse)
 def list_projects(
     include_archived: bool = Query(False), current_subject: str = Depends(get_current_subject)
 ):
     return ChatProjectListResponse(
         projects = [
-            ChatProject(**(ensure_chat_project_workspace(project["id"]) or project))
+            _project_with_workspace_status(project)
             for project in list_chat_projects(include_archived = include_archived)
         ]
     )
@@ -972,7 +1031,12 @@ def list_projects(
 @router.post("/projects", response_model = ChatProject)
 def save_project(payload: ChatProject, current_subject: str = Depends(get_current_subject)):
     try:
-        return ChatProject(**upsert_chat_project(payload.model_dump()))
+        project = payload.model_dump()
+        # Import/restore may recreate a logical project, but only the signed
+        # desktop endpoint below is allowed to grant a filesystem directory.
+        project["rootPath"] = None
+        project["workspaceKind"] = "managed"
+        return _project_with_workspace_status(upsert_chat_project(project))
     except ProjectWorkspaceError as exc:
         # A project is the only thing Studio writes to Documents, so a folder it
         # cannot create there fails here and nowhere else. Only this error, and
@@ -989,15 +1053,63 @@ def save_project(payload: ChatProject, current_subject: str = Depends(get_curren
         ) from exc
 
 
+@router.post("/projects/open-folder", response_model = ChatProject)
+def open_project_folder(
+    payload: OpenProjectFolderRequest,
+    current_subject: str = Depends(get_current_subject),
+):
+    root_path, display_label = _resolve_project_folder_path(payload.nativePathLease)
+    requested_name = (payload.name or "").strip()
+
+    # Reopening the exact same user-owned folder selects its existing project.
+    # Managed workspaces and nested/parent overlaps are rejected by storage.
+    for existing in list_chat_projects(include_archived = True):
+        if existing.get("workspaceKind") != "folder":
+            continue
+        if not _same_project_root(existing.get("rootPath"), root_path):
+            continue
+        patch: dict[str, object] = {}
+        if existing.get("archived"):
+            patch["archived"] = False
+        if requested_name and requested_name != existing.get("name"):
+            patch["name"] = requested_name
+        if patch:
+            patch["updatedAt"] = int(time.time() * 1000)
+            existing = update_chat_project(existing["id"], patch) or existing
+        return _project_with_workspace_status(existing)
+
+    now = int(time.time() * 1000)
+    name = (requested_name or display_label.strip() or Path(root_path).name or "Project")[:120]
+    project = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "instructions": "",
+        "rootPath": root_path,
+        "workspaceKind": "folder",
+        "archived": False,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    try:
+        return _project_with_workspace_status(upsert_chat_project(project))
+    except ProjectWorkspaceError as exc:
+        reason = str(exc).strip()
+        suffix = f" {reason}" if reason else ""
+        raise HTTPException(
+            status_code = 409,
+            detail = f'Could not use project folder "{exc.path}".{suffix}',
+        ) from exc
+
+
 @router.get("/projects/{project_id}", response_model = ChatProject)
 def get_project(project_id: str, current_subject: str = Depends(get_current_subject)):
-    project = ensure_chat_project_workspace(project_id)
+    project = get_chat_project(project_id)
     if project is None:
         raise HTTPException(
             status_code = 404,
             detail = f"Project {project_id} not found",
         )
-    return ChatProject(**project)
+    return _project_with_workspace_status(project)
 
 
 @router.patch("/projects/{project_id}", response_model = ChatProject)
@@ -1011,14 +1123,12 @@ def patch_project(
         if field in patch and patch[field] is None:
             raise HTTPException(status_code = 400, detail = f"{field} cannot be null")
     project = update_chat_project(project_id, patch)
-    if project is not None:
-        project = ensure_chat_project_workspace(project_id)
     if project is None:
         raise HTTPException(
             status_code = 404,
             detail = f"Project {project_id} not found",
         )
-    return ChatProject(**project)
+    return _project_with_workspace_status(project)
 
 
 def _delete_project_rag_sources(project_id: str) -> None:
@@ -1086,7 +1196,10 @@ async def delete_project(
     _cancel_active_generations(member_ids)
     # The project's chats go with it, so their archives have to as well.
     await run_in_threadpool(_remove_conversation_archives, member_ids, cutoff = cutoff)
-    if project.get("sandboxPath"):
+    if (
+        project.get("workspaceKind", "managed") == "managed"
+        and project.get("sandboxPath")
+    ):
         from core.inference.tools import (
             finish_workspace_delete_when_idle,
             forget_orphaned_project,

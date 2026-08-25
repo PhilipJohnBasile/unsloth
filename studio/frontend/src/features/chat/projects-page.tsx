@@ -303,6 +303,15 @@ export function ProjectsPage() {
   }, [hasMore, visibleCount]);
 
   function openProject(projectId: string) {
+    const project = projects.find((candidate) => candidate.id === projectId);
+    if (project?.workspaceAvailable === false) {
+      toast.error("Project folder is unavailable", {
+        description:
+          project.workspaceError ??
+          "Reconnect the folder before opening this project.",
+      });
+      return;
+    }
     const runtime = useChatRuntimeStore.getState();
     runtime.setActiveThreadId(null);
     runtime.setActiveProjectId(projectId);

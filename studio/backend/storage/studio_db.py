@@ -102,6 +102,7 @@ _schema_lock = threading.Lock()
 _schema_ready = False
 _SQLITE_IN_CHUNK_SIZE = 900
 _PROJECT_WORKSPACE_SUBDIRS = ("sandbox",)
+_PROJECT_WORKSPACE_KINDS = frozenset({"managed", "folder"})
 _CHAT_ATTACHMENT_INVENTORY_VERSION = 1
 
 
@@ -130,12 +131,28 @@ class ProjectWorkspaceError(OSError):
         self.path = path
 
 
-def _ensure_project_workspace(root_path: str) -> str:
+def _project_workspace_kind(project: dict) -> str:
+    kind = str(project.get("workspaceKind") or "managed")
+    return kind if kind in _PROJECT_WORKSPACE_KINDS else "managed"
+
+
+def _ensure_project_workspace(
+    root_path: str, workspace_kind: str = "managed"
+) -> str:
     root = Path(root_path).expanduser()
     try:
-        root_resolved = ensure_dir(root).resolve()
-        for subdir in _PROJECT_WORKSPACE_SUBDIRS:
-            ensure_dir(root_resolved / subdir)
+        if workspace_kind == "folder":
+            # This directory already belongs to the user. Never create it,
+            # replace it, follow a symlink root, or add a nested sandbox.
+            if root.is_symlink():
+                raise OSError("Selected project folder is a symbolic link")
+            root_resolved = root.resolve(strict = True)
+            if not root_resolved.is_dir():
+                raise NotADirectoryError(str(root))
+        else:
+            root_resolved = ensure_dir(root).resolve()
+            for subdir in _PROJECT_WORKSPACE_SUBDIRS:
+                ensure_dir(root_resolved / subdir)
     except OSError as exc:
         raise ProjectWorkspaceError(str(root), exc) from exc
     return str(root_resolved)
@@ -214,6 +231,10 @@ def delete_project_workspace(project: dict) -> None:
 
 
 def _delete_project_workspace(project: dict) -> None:
+    # A folder workspace points at a directory the user owned before Studio.
+    # Project deletion may remove the record, never that directory or its files.
+    if _project_workspace_kind(project) == "folder":
+        return
     root_path = project.get("rootPath")
     if not root_path:
         return
@@ -338,6 +359,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             name TEXT NOT NULL,
             instructions TEXT,
             root_path TEXT,
+            workspace_kind TEXT NOT NULL DEFAULT 'managed',
             archived INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             updated_at INTEGER NOT NULL
@@ -349,6 +371,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     }
     if "root_path" not in chat_project_cols:
         conn.execute("ALTER TABLE chat_projects ADD COLUMN root_path TEXT")
+    if "workspace_kind" not in chat_project_cols:
+        conn.execute(
+            "ALTER TABLE chat_projects ADD COLUMN workspace_kind "
+            "TEXT NOT NULL DEFAULT 'managed'"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_chat_projects_archived_updated_at ON chat_projects(archived, updated_at)"
     )
@@ -1677,12 +1704,20 @@ def _chat_thread_from_row(row: sqlite3.Row, include_settings: bool = True) -> di
 def _chat_project_from_row(row: sqlite3.Row) -> dict:
     data = dict(row)
     root_path = data.get("root_path")
+    workspace_kind = str(data.get("workspace_kind") or "managed")
+    if workspace_kind not in _PROJECT_WORKSPACE_KINDS:
+        workspace_kind = "managed"
     return {
         "id": data["id"],
         "name": data["name"],
         "instructions": data.get("instructions") or "",
         "rootPath": root_path or None,
-        "sandboxPath": os.path.join(root_path, "sandbox") if root_path else None,
+        "sandboxPath": (
+            root_path
+            if root_path and workspace_kind == "folder"
+            else os.path.join(root_path, "sandbox") if root_path else None
+        ),
+        "workspaceKind": workspace_kind,
         "archived": bool(data["archived"]),
         "createdAt": data["created_at"],
         "updatedAt": data["updated_at"],
@@ -2370,19 +2405,64 @@ def count_chat_threads() -> int:
         conn.close()
 
 
+def _normalized_project_path(value: str) -> Path:
+    return Path(value).expanduser().resolve(strict = False)
+
+
+def _project_paths_overlap(first: str, second: str) -> bool:
+    try:
+        left = _normalized_project_path(first)
+        right = _normalized_project_path(second)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return left == right or left in right.parents or right in left.parents
+
+
+def _assert_folder_workspace_does_not_overlap(
+    project_id: str, root_path: str
+) -> None:
+    for existing in list_chat_projects(include_archived = True):
+        if existing["id"] == project_id:
+            continue
+        for candidate in (existing.get("rootPath"), existing.get("sandboxPath")):
+            if not candidate or not _project_paths_overlap(root_path, candidate):
+                continue
+            raise ProjectWorkspaceError(
+                root_path,
+                OSError(
+                    f'Selected folder overlaps existing project "{existing["name"]}"'
+                ),
+            )
+
+
 def upsert_chat_project(project: dict) -> dict:
     existing = get_chat_project(project["id"])
+    workspace_kind = (
+        _project_workspace_kind(existing)
+        if existing
+        else _project_workspace_kind(project)
+    )
     root_path = existing.get("rootPath") if existing else None
     if not root_path:
-        root_path = _default_project_root(project)
-    root_path = _ensure_project_workspace(root_path)
+        root_path = (
+            project.get("rootPath")
+            if workspace_kind == "folder"
+            else _default_project_root(project)
+        )
+    if not root_path:
+        raise ProjectWorkspaceError(
+            "", OSError("Folder-backed projects require a selected folder")
+        )
+    root_path = _ensure_project_workspace(root_path, workspace_kind)
+    if workspace_kind == "folder":
+        _assert_folder_workspace_does_not_overlap(project["id"], root_path)
     conn = get_connection()
     try:
         conn.execute(
             """
             INSERT INTO chat_projects
-                (id, name, instructions, root_path, archived, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (id, name, instructions, root_path, workspace_kind, archived, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 instructions = excluded.instructions,
@@ -2396,6 +2476,7 @@ def upsert_chat_project(project: dict) -> dict:
                 project["name"],
                 project.get("instructions") or "",
                 root_path,
+                workspace_kind,
                 1 if project.get("archived") else 0,
                 int(project["createdAt"]),
                 int(project["updatedAt"]),
@@ -2441,8 +2522,9 @@ def ensure_chat_project_workspace(id: str) -> Optional[dict]:
     project = get_chat_project(id)
     if project is None:
         return None
+    workspace_kind = _project_workspace_kind(project)
     root_path = project.get("rootPath") or _default_project_root(project)
-    root_path = _ensure_project_workspace(root_path)
+    root_path = _ensure_project_workspace(root_path, workspace_kind)
     # a delete running in another threadpool worker can drop the row at any point before the
     # directory is created, so confirm the project outlived the create rather than trusting a
     # pre-create snapshot. Removing the directory here is not this function's call: only the
@@ -2530,7 +2612,7 @@ def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
         conn.execute("DELETE FROM chat_projects WHERE id = ?", (id,))
         _mark_chat_attachment_inventory_clean(conn)
         conn.commit()
-        if delete_files:
+        if delete_files and _project_workspace_kind(project) != "folder":
             _delete_project_workspace(project)
         # The membership this transaction actually deleted, which is not the
         # caller's earlier listing when a chat was moved in between the two.

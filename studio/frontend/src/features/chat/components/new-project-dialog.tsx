@@ -13,17 +13,30 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
+  pickNativeProjectFolder,
+  useNativePathLeasesSupported,
+} from "@/features/native-intents";
+import {
   ProjectSourceDropzone,
   type StagedSource,
   uploadStagedSources,
 } from "@/features/rag/components/project-source-dropzone";
+import { isTauri } from "@/lib/api-base";
 import { toast } from "@/lib/toast";
-import { Folder02Icon } from "@hugeicons/core-free-icons";
+import { Folder02Icon, FolderOpenIcon } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 
-import { createChatProject } from "../hooks/use-chat-projects";
+import {
+  createChatProject,
+  openChatProjectFromFolder,
+} from "../hooks/use-chat-projects";
 import { useChatRuntimeStore } from "../stores/chat-runtime-store";
 import type { ProjectRecord } from "../types";
+
+interface SelectedProjectFolder {
+  token: string;
+  displayName: string;
+}
 
 function currentRoute(): string {
   if (typeof window === "undefined") return "";
@@ -50,8 +63,12 @@ export function NewProjectDialog({
   ) => void | Promise<void>;
 }) {
   const navigate = useNavigate();
+  const nativePathLeasesSupported = useNativePathLeasesSupported();
   const [name, setName] = useState("");
   const [staged, setStaged] = useState<StagedSource[]>([]);
+  const [selectedFolder, setSelectedFolder] =
+    useState<SelectedProjectFolder | null>(null);
+  const [selectingFolder, setSelectingFolder] = useState(false);
   const [busy, setBusy] = useState(false);
   // A desktop drop reaches `staged` only once its native registration settles.
   // Creating before then would upload without the files the user just dropped.
@@ -68,9 +85,13 @@ export function NewProjectDialog({
     };
   }, []);
 
+  const canChooseFolder = isTauri && nativePathLeasesSupported;
+
   function reset() {
     setName("");
     setStaged([]);
+    setSelectedFolder(null);
+    setSelectingFolder(false);
     setStagingDrop(false);
   }
 
@@ -82,16 +103,36 @@ export function NewProjectDialog({
     onOpenChange(false);
   }
 
+  async function chooseExistingFolder() {
+    if (!canChooseFolder || busy || selectingFolder) return;
+    setSelectingFolder(true);
+    try {
+      const selected = await pickNativeProjectFolder();
+      if (!selected) return;
+      setSelectedFolder(selected);
+      setName((current) => current.trim() || selected.displayName);
+    } catch (error) {
+      toast.error("Could not select project folder", {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setSelectingFolder(false);
+    }
+  }
+
   async function commitCreate() {
     const trimmed = name.trim();
-    if (!trimmed || busy || stagingDrop) return;
+    if (!trimmed || busy || stagingDrop || selectingFolder) return;
     setBusy(true);
     // Sidebar callers keep this mounted across routes, so unmounting alone
     // cannot tell whether the user has moved on during a slow upload.
     const origin = currentRoute();
     try {
-      const project = await createChatProject(trimmed);
-      // Upload before closing so the Sources panel lists them on first fetch.
+      const project = selectedFolder
+        ? await openChatProjectFromFolder(selectedFolder.token, trimmed)
+        : await createChatProject(trimmed);
+      // Project sources are still RAG inputs. The workspace folder is not
+      // ingested; chats and code tools access it directly as their working dir.
       await uploadStagedSources(project.id, staged);
       if (!mounted.current) return;
       const stayedOnRoute = currentRoute() === origin;
@@ -157,6 +198,53 @@ export function NewProjectDialog({
             className="min-w-0 flex-1 bg-transparent py-4 pr-4 pl-2.5 text-base outline-none placeholder:text-muted-foreground disabled:cursor-not-allowed"
           />
         </div>
+
+        <div className="space-y-2.5">
+          <p className="text-ui-15 font-medium text-foreground">Workspace</p>
+          <div className="grid grid-cols-2 gap-2">
+            <Button
+              type="button"
+              variant={selectedFolder ? "outline" : "secondary"}
+              disabled={busy}
+              onClick={() => setSelectedFolder(null)}
+            >
+              <HugeiconsIcon icon={Folder02Icon} strokeWidth={1.75} />
+              Managed workspace
+            </Button>
+            <Button
+              type="button"
+              variant={selectedFolder ? "secondary" : "outline"}
+              disabled={!canChooseFolder || busy || selectingFolder}
+              onClick={() => void chooseExistingFolder()}
+            >
+              <HugeiconsIcon icon={FolderOpenIcon} strokeWidth={1.75} />
+              {selectingFolder
+                ? "Choosing…"
+                : selectedFolder
+                  ? "Change folder"
+                  : "Existing folder"}
+            </Button>
+          </div>
+          {selectedFolder ? (
+            <div className="rounded-[16px] border border-border bg-background px-4 py-3 dark:border-white/10">
+              <p className="truncate text-sm font-medium" title={selectedFolder.displayName}>
+                {selectedFolder.displayName}
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+                Every project chat and code tool works directly in this folder.
+                The folder is never uploaded as a project source or deleted by
+                Unsloth.
+              </p>
+            </div>
+          ) : (
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              {canChooseFolder
+                ? "Unsloth creates and manages a private workspace. Choose Existing folder to work directly in a repository, like a Codex project."
+                : "Existing-folder workspaces require the managed desktop app. Unsloth will create a private workspace here."}
+            </p>
+          )}
+        </div>
+
         <ProjectSourceDropzone
           staged={staged}
           onChange={setStaged}
@@ -170,9 +258,15 @@ export function NewProjectDialog({
           <Button
             type="button"
             onClick={() => void commitCreate()}
-            disabled={!name.trim() || busy || stagingDrop}
+            disabled={
+              !name.trim() || busy || stagingDrop || selectingFolder
+            }
           >
-            {busy ? "Creating…" : stagingDrop ? "Adding sources…" : submitLabel}
+            {busy
+              ? "Creating…"
+              : stagingDrop
+                ? "Adding sources…"
+                : submitLabel}
           </Button>
         </DialogFooter>
       </DialogContent>

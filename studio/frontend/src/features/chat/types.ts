@@ -22,6 +22,9 @@ export interface ProjectRecord {
   instructions?: string;
   rootPath?: string | null;
   sandboxPath?: string | null;
+  workspaceKind?: "managed" | "folder";
+  workspaceAvailable?: boolean;
+  workspaceError?: string | null;
   archived: boolean;
   createdAt: number;
   updatedAt: number;

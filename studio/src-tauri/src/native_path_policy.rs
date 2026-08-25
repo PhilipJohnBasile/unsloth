@@ -187,7 +187,10 @@ pub fn classify_native_document_folder(path: &Path) -> Result<ClassifiedPath, St
     reject_sensitive_document_folder(&classified.canonical_path)?;
     Ok(ClassifiedPath {
         path_kind: NativePathKind::DocumentFolder,
-        allowed_operations: vec![NativePathOperation::LinkDocuments],
+        allowed_operations: vec![
+            NativePathOperation::LinkDocuments,
+            NativePathOperation::OpenProject,
+        ],
         ..classified
     })
 }
@@ -911,5 +914,19 @@ mod tests {
         ] {
             assert!(reject_sensitive_artifact(path).is_ok());
         }
+    }
+    #[test]
+    fn document_folder_allows_linking_and_project_workspace_use() {
+        let path = temp_path("project-documents");
+        fs::create_dir(&path).unwrap();
+        let classified = classify_native_document_folder(&path).unwrap();
+        assert_eq!(
+            classified.allowed_operations,
+            vec![
+                NativePathOperation::LinkDocuments,
+                NativePathOperation::OpenProject,
+            ]
+        );
+        let _ = fs::remove_dir(path);
     }
 }

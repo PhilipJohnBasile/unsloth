@@ -102,6 +102,63 @@ def test_the_workspace_error_carries_the_folder_it_could_not_make(tmp_path, monk
     assert caught.value.path == str(blocked)
 
 
+def test_project_folder_grant_has_its_own_operation(tmp_path):
+    from types import SimpleNamespace
+
+    from routes.chat_history import _resolve_project_folder_path
+
+    selected = tmp_path / "repo"
+    selected.mkdir()
+    seen = {}
+
+    def verify(lease, **kwargs):
+        seen.update(kwargs)
+        assert lease == "signed-folder"
+        return SimpleNamespace(canonical_path = selected, display_label = "repo")
+
+    path, label = _resolve_project_folder_path("signed-folder", verifier = verify)
+
+    assert path == str(selected)
+    assert label == "repo"
+    assert seen == {
+        "operation": "open-project",
+        "expected_kind": "document-folder",
+        "expected_path_type": "directory",
+    }
+
+
+def test_unavailable_folder_does_not_break_project_list(tmp_path, monkeypatch):
+    from routes import chat_history
+    from storage.studio_db import ProjectWorkspaceError
+
+    missing = tmp_path / "missing"
+    project = {
+        "id": "folder-project",
+        "name": "Missing repo",
+        "instructions": "",
+        "rootPath": str(missing),
+        "sandboxPath": str(missing),
+        "workspaceKind": "folder",
+        "archived": False,
+        "createdAt": 1,
+        "updatedAt": 1,
+    }
+    monkeypatch.setattr(chat_history, "list_chat_projects", lambda **kwargs: [project])
+    monkeypatch.setattr(
+        chat_history,
+        "ensure_chat_project_workspace",
+        lambda project_id: (_ for _ in ()).throw(
+            ProjectWorkspaceError(str(missing), FileNotFoundError(str(missing)))
+        ),
+    )
+
+    result = chat_history.list_projects(current_subject = "tester")
+
+    assert len(result.projects) == 1
+    assert result.projects[0].workspaceAvailable is False
+    assert str(missing) in (result.projects[0].workspaceError or "")
+
+
 def test_creating_a_project_says_which_folder_failed(tmp_path, monkeypatch):
     """A folder Studio cannot create is the one failure this route has.
 

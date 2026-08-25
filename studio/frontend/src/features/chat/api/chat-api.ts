@@ -973,6 +973,20 @@ export async function saveChatProject(
   return saved;
 }
 
+export async function openChatProjectFolder(
+  nativePathLease: string,
+  name: string,
+): Promise<ProjectRecord> {
+  const response = await authFetch("/api/chat/projects/open-folder", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nativePathLease, name }),
+  });
+  const project = await parseJsonOrThrow<ProjectRecord>(response);
+  notifyChatProjectsUpdated();
+  return project;
+}
+
 export async function updateChatProject(
   projectId: string,
   patch: Partial<ProjectRecord>,

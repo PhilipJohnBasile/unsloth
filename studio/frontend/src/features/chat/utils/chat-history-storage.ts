@@ -16,6 +16,7 @@ import {
   listChatProjects,
   listChatThreads,
   notifyChatHistoryUpdated,
+  openChatProjectFolder,
   recordChatImportLedger,
   saveChatMessage,
   saveChatProject,
@@ -908,6 +909,13 @@ export async function createStoredChatProject(
     createdAt: now,
     updatedAt: now,
   });
+}
+
+export async function openStoredChatProjectFolder(
+  nativePathLease: string,
+  name: string,
+): Promise<ProjectRecord> {
+  return openChatProjectFolder(nativePathLease, name);
 }
 
 export async function updateStoredChatProject(

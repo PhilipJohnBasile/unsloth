@@ -10,6 +10,7 @@ import {
   isExpectedBackgroundChatStorageError,
   listStoredChatProjects,
   moveStoredChatItemToProject,
+  openStoredChatProjectFolder,
   updateStoredChatProject,
 } from "../utils/chat-history-storage";
 import { offerToDeleteKeptSandboxes } from "../utils/offer-kept-sandbox-files";
@@ -121,6 +122,13 @@ export function useChatProjects(): {
 
 export async function createChatProject(name: string): Promise<ProjectRecord> {
   return createStoredChatProject(name);
+}
+
+export async function openChatProjectFromFolder(
+  nativePathLease: string,
+  name: string,
+): Promise<ProjectRecord> {
+  return openStoredChatProjectFolder(nativePathLease, name);
 }
 
 export async function renameChatProject(
