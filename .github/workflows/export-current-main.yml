@@ -1,0 +1,31 @@
+name: Export current main source
+
+on:
+  push:
+    branches:
+      - tmp/export-current-main
+    paths:
+      - .github/workflows/export-current-main.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build source and history archives
+        run: |
+          git bundle create unsloth-current-main.bundle --all
+          tar --exclude=.git -czf unsloth-current-main.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: unsloth-current-main-source
+          path: |
+            unsloth-current-main.bundle
+            unsloth-current-main.tar.gz
+          retention-days: 1
+          compression-level: 0
