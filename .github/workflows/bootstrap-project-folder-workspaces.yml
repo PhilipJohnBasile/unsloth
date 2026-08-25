@@ -1,0 +1,33 @@
+name: Bootstrap project-folder workspaces
+
+on:
+  push:
+    branches:
+      - feat/project-folder-workspaces
+    paths:
+      - .github/workflows/bootstrap-project-folder-workspaces.yml
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply the isolated upstream project-folder commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "PhilipJohnBasile"
+          git config user.email "1419847+PhilipJohnBasile@users.noreply.github.com"
+          git remote add upstream https://github.com/unslothai/unsloth.git
+          git fetch --no-tags upstream f835d72ff4b2d7eb70ab8470e8d9602f2edfe21a
+          git cherry-pick f835d72ff4b2d7eb70ab8470e8d9602f2edfe21a
+          git rm .github/workflows/bootstrap-project-folder-workspaces.yml
+          git commit -m "chore: remove project-folder bootstrap workflow"
+          git push origin HEAD:feat/project-folder-workspaces
