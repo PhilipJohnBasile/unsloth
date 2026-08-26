@@ -1,0 +1,195 @@
+name: Temporary PR 9673 Codecov audit
+
+on:
+  push:
+    branches:
+      - tmp/pr9673-codecov-audit-20260826
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      PYTHONPATH: ${{ github.workspace }}/studio/backend
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+    steps:
+      - name: Check out audit branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch upstream base
+        shell: bash
+        run: |
+          git remote add upstream https://github.com/unslothai/unsloth.git
+          git fetch --no-tags upstream main
+          mkdir -p artifacts
+          git diff --name-status upstream/main...HEAD > artifacts/changed-files.txt
+          git diff --no-color --unified=0 upstream/main...HEAD -- '*.py' > artifacts/python.patch
+          git archive --format=tar.gz --output=artifacts/source.tar.gz HEAD
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install backend dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r studio/backend/requirements/studio.txt
+          python -m pip install \
+            python-multipart aiofiles sqlalchemy psutil pyyaml requests mammoth unpdf \
+            pytest pytest-asyncio pytest-cov coverage diff-cover httpx
+          python -m pip install 'torch>=2.4,<2.11' \
+            --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple
+          python -m pip install 'transformers>=4.51,<5.5' 'peft>=0.18,<0.19'
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+
+      - name: Run workspace backend coverage suite
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest -q \
+            --cov=studio/backend \
+            --cov-branch \
+            --cov-report=xml:artifacts/coverage.xml \
+            --cov-report=json:artifacts/coverage.json \
+            --cov-report=term-missing \
+            studio/backend/tests/test_agent_workspace_background_inference.py \
+            studio/backend/tests/test_agent_workspace_context.py \
+            studio/backend/tests/test_agent_workspace_durable_agents.py \
+            studio/backend/tests/test_agent_workspace_discovery_routes.py \
+            studio/backend/tests/test_agent_workspace_execution.py \
+            studio/backend/tests/test_agent_workspace_github_handoff.py \
+            studio/backend/tests/test_agent_workspace_git.py \
+            studio/backend/tests/test_agent_workspace_routes.py \
+            studio/backend/tests/test_agent_workspace_state_and_verification.py \
+            studio/backend/tests/test_agent_workspace_worktree_recovery.py \
+            studio/backend/tests/test_agent_workspace_worktree_task_safety.py \
+            studio/backend/tests/test_chat_history_routes.py \
+            studio/backend/tests/test_chat_history_storage.py \
+            studio/backend/tests/test_credential_secrets.py \
+            studio/backend/tests/test_deep_research_handoff_simulation.py \
+            studio/backend/tests/test_edit_file_tool.py \
+            studio/backend/tests/test_log_filter_no_truncation.py \
+            studio/backend/tests/test_mcp_stdio_api_key_gate.py \
+            studio/backend/tests/test_native_path_lease_replay.py \
+            studio/backend/tests/test_project_context_transport.py \
+            studio/backend/tests/test_project_folder_workspace.py \
+            studio/backend/tests/test_project_workspace_location.py \
+            studio/backend/tests/test_research_progress_events.py \
+            studio/backend/tests/test_research_project_context.py \
+            studio/backend/tests/test_research_runs_storage.py \
+            | tee artifacts/pytest-coverage.txt
+
+      - name: Build exact changed-line coverage inventory
+        if: always()
+        shell: bash
+        run: |
+          if [ -f artifacts/coverage.xml ]; then
+            coverage report -m > artifacts/coverage-report.txt || true
+            diff-cover artifacts/coverage.xml \
+              --compare-branch=upstream/main \
+              --json-report artifacts/diff-cover.json \
+              --html-report artifacts/diff-cover.html \
+              > artifacts/diff-cover.txt || true
+          fi
+
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import re
+          import subprocess
+          from pathlib import Path
+
+          out = Path('artifacts')
+          coverage_path = out / 'coverage.json'
+          if not coverage_path.exists():
+              (out / 'patch-coverage.txt').write_text('coverage.json was not generated\n')
+              raise SystemExit(0)
+
+          cov = json.loads(coverage_path.read_text(encoding='utf-8'))
+          raw = subprocess.check_output(
+              ['git', 'diff', '--no-color', '--unified=0', 'upstream/main...HEAD', '--', '*.py'],
+              text=True,
+          )
+
+          added: dict[str, set[int]] = {}
+          current: str | None = None
+          for line in raw.splitlines():
+              if line.startswith('+++ b/'):
+                  current = line[6:]
+                  added.setdefault(current, set())
+                  continue
+              if current is None or not line.startswith('@@'):
+                  continue
+              match = re.search(r'\+(\d+)(?:,(\d+))?', line)
+              if not match:
+                  continue
+              start = int(match.group(1))
+              count = int(match.group(2) or '1')
+              added[current].update(range(start, start + count))
+
+          rows = []
+          total_exec = 0
+          total_hit = 0
+          for path, lines in sorted(added.items()):
+              file_cov = cov.get('files', {}).get(path)
+              if file_cov is None and path.startswith('studio/backend/'):
+                  file_cov = cov.get('files', {}).get(path.removeprefix('studio/backend/'))
+              if file_cov is None:
+                  continue
+              executed = set(file_cov['executed_lines'])
+              missing = set(file_cov['missing_lines'])
+              executable = lines & (executed | missing)
+              hit = executable & executed
+              missed = sorted(executable - executed)
+              if not executable:
+                  continue
+              total_exec += len(executable)
+              total_hit += len(hit)
+              rows.append({
+                  'path': path,
+                  'executable_added_lines': len(executable),
+                  'covered_added_lines': len(hit),
+                  'coverage': round(100 * len(hit) / len(executable), 2),
+                  'missing_lines': missed,
+              })
+
+          payload = {
+              'covered_added_lines': total_hit,
+              'executable_added_lines': total_exec,
+              'patch_coverage': round(100 * total_hit / total_exec, 2) if total_exec else None,
+              'files': rows,
+          }
+          (out / 'patch-coverage.json').write_text(json.dumps(payload, indent=2) + '\n')
+          with (out / 'patch-coverage.txt').open('w', encoding='utf-8') as f:
+              f.write(
+                  f"Patch coverage: {payload['patch_coverage']}% "
+                  f"({total_hit}/{total_exec})\n\n"
+              )
+              for row in sorted(rows, key=lambda r: (r['coverage'], -r['executable_added_lines'])):
+                  f.write(
+                      f"{row['coverage']:6.2f}%  {row['covered_added_lines']:4d}/"
+                      f"{row['executable_added_lines']:4d}  {row['path']}\n"
+                  )
+                  if row['missing_lines']:
+                      f.write('  missing: ' + ', '.join(map(str, row['missing_lines'])) + '\n')
+          PY
+
+      - name: Upload audit evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr9673-codecov-audit
+          path: artifacts
+          retention-days: 2
