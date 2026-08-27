@@ -29038,6 +29038,15 @@ class LlamaCppBackend:
                         if decision_slot is not None:
                             abort_tool_decision(decision_slot, approval_id)
 
+                    project_rule_proof = (
+                        {
+                            "policyHash": project_rule.get("policyHash"),
+                            "approved": _decision == "allow",
+                        }
+                        if decision.tool_name == "terminal" and project_rule is not None
+                        else None
+                    )
+
                     # Can the turn this call is part of still be SERVED once it returns?
                     # Everything below prices what a result may add; nothing asked whether
                     # the prompt fits with no result at all. It can already not fit: the
@@ -29288,6 +29297,8 @@ class LlamaCppBackend:
                                 rag_scope = rag_scope,
                                 disable_sandbox = bypass_permissions,
                             )
+                            if accepts_kwarg(execute_tool, "project_rule_proof"):
+                                kwargs["project_rule_proof"] = project_rule_proof
                             # Same branch the forced recall is filtered against, so a
                             # model-initiated search cannot reach a sibling response the
                             # forced recall correctly refused.

@@ -7897,11 +7897,17 @@ def project_terminal_rule_policy(
             secure_command_rule_traversal_supported,
         )
 
-        # Windows cannot yet inspect `.codex/rules` without following path
-        # strings. Keep Full access usable while making the missing policy
-        # capability visible in the project panel.
         if not secure_command_rule_traversal_supported():
-            return None
+            return {
+                "decision": "forbidden",
+                "commands": [],
+                "matchedRules": [],
+                "policyHash": None,
+                "error": (
+                    "Secure project command policy is unavailable on this platform. "
+                    "Full access terminal commands are disabled for project sessions."
+                ),
+            }
         with project_workspace_access(project_id) as workspace:
             discovered = discover_project_command_rules(
                 workspace.root,
@@ -10742,6 +10748,7 @@ def execute_tool(
     context_tokens = _UNSET_CONTEXT_TOKENS,
     search_images: bool = False,
     result_budget_tokens: int | None = None,
+    project_rule_proof: dict | None = None,
 ) -> str:
     """Execute a tool by name with the given arguments; returns a string.
 
@@ -10910,6 +10917,7 @@ def execute_tool(
                 disable_sandbox = disable_sandbox,
                 output_callback = output_callback,
                 thread_id = thread_id,
+                project_rule_proof = project_rule_proof,
             )
     # Same in-flight guard as the two above: it writes into the session workdir,
     # so a chat deleted mid-call must not unlink it underneath.
@@ -16520,6 +16528,7 @@ def _bash_exec(
     disable_sandbox: bool = False,
     output_callback = None,
     thread_id: str | None = None,
+    project_rule_proof: dict | None = None,
 ) -> str:
     """Execute a bash command in a subprocess sandbox.
 
@@ -16533,20 +16542,19 @@ def _bash_exec(
     capability_error = _sandboxed_command_execution_error(disable_sandbox = disable_sandbox)
     if capability_error is not None:
         return capability_error
-    project_policy = project_terminal_rule_policy(
+    preflight_policy = project_terminal_rule_policy(
         session_id,
         command,
         outside_sandbox = disable_sandbox,
     )
-    if project_policy is not None and project_policy.get("decision") == "forbidden":
-        reason = project_policy.get("error")
+    if preflight_policy is not None and preflight_policy.get("decision") == "forbidden":
+        reason = preflight_policy.get("error")
         if not reason:
-            matched = project_policy.get("matchedRules") or []
+            matched = preflight_policy.get("matchedRules") or []
             reasons = [str(rule.get("justification") or "").strip() for rule in matched]
             reason = next((value for value in reversed(reasons) if value), None)
         suffix = f" {reason}" if reason else ""
         return _truncate(f"Blocked by project command rules.{suffix}")
-
     # Block dangerous commands (skipped when the sandbox is disabled)
     if not disable_sandbox:
         blocked = _find_blocked_commands(command)
@@ -16616,6 +16624,38 @@ def _bash_exec(
         else:
             popen_kwargs["cwd"] = workdir
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+        # Bind the approval decision to the exact policy snapshot used by the
+        # loop. Re-read as late as possible, after the execution boundary and
+        # argv are ready but before any child process exists.
+        project_policy = project_terminal_rule_policy(
+            session_id,
+            command,
+            outside_sandbox = disable_sandbox,
+        )
+        if project_policy is not None:
+            decision = project_policy.get("decision")
+            reason = project_policy.get("error")
+            if decision == "forbidden":
+                if not reason:
+                    matched = project_policy.get("matchedRules") or []
+                    reasons = [str(rule.get("justification") or "").strip() for rule in matched]
+                    reason = next((value for value in reversed(reasons) if value), None)
+            else:
+                proof_hash = (
+                    project_rule_proof.get("policyHash")
+                    if isinstance(project_rule_proof, dict)
+                    else None
+                )
+                if not proof_hash or proof_hash != project_policy.get("policyHash"):
+                    decision = "forbidden"
+                    reason = "Project command policy changed or was not reviewed before execution."
+                elif decision == "prompt" and project_rule_proof.get("approved") is not True:
+                    decision = "forbidden"
+                    reason = "This project command requires approval for the current policy."
+            if decision == "forbidden":
+                suffix = f" {reason}" if reason else ""
+                return _truncate(f"Blocked by project command rules.{suffix}")
 
         proc = subprocess.Popen(argv, **popen_kwargs)
 

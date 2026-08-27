@@ -1307,6 +1307,15 @@ def run_safetensors_tool_loop(
                 if decision_slot is not None:
                     abort_tool_decision(decision_slot, approval_id)
 
+            project_rule_proof = (
+                {
+                    "policyHash": project_rule.get("policyHash"),
+                    "approved": _decision == "allow",
+                }
+                if decision.tool_name == "terminal" and project_rule is not None
+                else None
+            )
+
             eff_timeout = None if tool_call_timeout >= 9999 else tool_call_timeout
             # RAG: cap paraphrased KB re-searches that slip past the dup guard.
             if (
@@ -1330,6 +1339,8 @@ def run_safetensors_tool_loop(
                     )
                     if _accepts_kwarg(execute_tool, "conversation_branch"):
                         kwargs["conversation_branch"] = request_branch
+                    if _accepts_kwarg(execute_tool, "project_rule_proof"):
+                        kwargs["project_rule_proof"] = project_rule_proof
                     # And the room the model has left, as the GGUF loop does: without a
                     # budget the tool's clamp is skipped and a model-chosen top_k of 8
                     # appends roughly 4K tokens to an already full prompt.

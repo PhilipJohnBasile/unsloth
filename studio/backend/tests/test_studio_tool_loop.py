@@ -606,7 +606,11 @@ def test_project_prompt_rule_restores_confirmation_in_full_access(executed, monk
     monkeypatch.setattr(
         loop_mod,
         "project_terminal_rule_policy",
-        lambda *_args, **_kwargs: {"decision": "prompt", "matchedRules": []},
+        lambda *_args, **_kwargs: {
+            "decision": "prompt",
+            "matchedRules": [],
+            "policyHash": "a" * 64,
+        },
     )
     monkeypatch.setattr(
         loop_mod,
@@ -651,6 +655,7 @@ def test_project_prompt_rule_restores_confirmation_in_full_access(executed, monk
     assert slots == ["project-rule"]
     assert _events(lines, "tool_start")[0]["awaiting_confirmation"] is True
     assert executed[0]["disable_sandbox"] is True
+    assert executed[0]["project_rule_proof"] == {"policyHash": "a" * 64, "approved": True}
 
 
 def test_sandbox_stays_on_by_default(executed):

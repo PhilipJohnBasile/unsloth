@@ -219,10 +219,21 @@ def test_full_access_project_commands_keep_the_explicit_escape_hatch(
             disable_sandbox = True,
         )
     else:
+        policy = {
+            "decision": None,
+            "matchedRules": [],
+            "policyHash": "a" * 64,
+        }
+        monkeypatch.setattr(
+            tools,
+            "project_terminal_rule_policy",
+            lambda *_args, **_kwargs: dict(policy),
+        )
         result = tools._bash_exec(
             "echo full",
             session_id = session_id,
             disable_sandbox = True,
+            project_rule_proof = {"policyHash": policy["policyHash"], "approved": False},
         )
 
     assert "Execution error: popen reached" in result

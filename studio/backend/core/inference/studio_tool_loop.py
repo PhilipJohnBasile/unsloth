@@ -1265,6 +1265,15 @@ async def stream_with_studio_tools(
                 reprompts = max_reprompts
                 continue
 
+            project_rule_proof = (
+                {
+                    "policyHash": project_rule.get("policyHash"),
+                    "approved": verdict == "allow",
+                }
+                if project_rule is not None
+                else None
+            )
+
             def _invoke(output_callback: Any, call = decision) -> str:
                 kwargs: dict[str, Any] = {
                     "cancel_event": cancel_event,
@@ -1299,6 +1308,8 @@ async def stream_with_studio_tools(
                         pass
                 if accepts_output_callback(execute_tool):
                     kwargs["output_callback"] = output_callback
+                if accepts_kwarg(execute_tool, "project_rule_proof"):
+                    kwargs["project_rule_proof"] = project_rule_proof
                 kwargs.update(search_images_kwargs(execute_tool, call.tool_name))
                 return execute_tool(call.tool_name, call.arguments, **kwargs)
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import json
 import os
 import re
 import shlex
@@ -34,8 +35,44 @@ _ALLOWED_FIELDS = frozenset({"pattern", "decision", "justification", "match", "n
 _SHELL_NAMES = frozenset({"bash", "sh", "zsh"})
 _SIMPLE_SEPARATORS = frozenset({";", "&&", "||", "|", "&"})
 _ADVANCED_SHELL = re.compile(
-    r"(?:\$|`|[<>*?{}\[\]]|(?:^|[;&|\s])[A-Za-z_][A-Za-z0-9_]*=)",
+    r"(?:\$|`|[()<>*?{}\[\]]|(?:^|[;&|\s])[A-Za-z_][A-Za-z0-9_]*=)",
 )
+_SHELL_CONTROL_WORDS = frozenset(
+    {
+        "!",
+        "[[",
+        "]]",
+        "case",
+        "coproc",
+        "do",
+        "done",
+        "elif",
+        "else",
+        "esac",
+        "fi",
+        "for",
+        "function",
+        "if",
+        "in",
+        "select",
+        "then",
+        "time",
+        "until",
+        "while",
+    }
+)
+
+
+def _policy_hash(files: Sequence[dict]) -> str:
+    payload = [
+        {
+            "path": str(item.get("path") or ""),
+            "sha256": str(item.get("sha256") or ""),
+        }
+        for item in files
+    ]
+    encoded = json.dumps(payload, separators = (",", ":"), sort_keys = True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def secure_command_rule_traversal_supported() -> bool:
@@ -435,6 +472,7 @@ def discover_project_command_rules(
                 "rules": [],
                 "files": [],
                 "bytesRead": 0,
+                "policyHash": _policy_hash([]),
             }
         try:
             rules_fd = _open_directory_at(codex_fd, "rules")
@@ -444,6 +482,7 @@ def discover_project_command_rules(
                 "rules": [],
                 "files": [],
                 "bytesRead": 0,
+                "policyHash": _policy_hash([]),
             }
         names = _rule_file_names(rules_fd, max_directory_entries)
         if len(names) > max_files:
@@ -495,6 +534,7 @@ def discover_project_command_rules(
             "rules": loaded_rules,
             "files": files,
             "bytesRead": used,
+            "policyHash": _policy_hash(files),
         }
     except AgentWorkspaceError:
         raise
@@ -570,6 +610,8 @@ def split_terminal_command_for_rules(command: str, *, _depth: int = 0) -> list[l
         return [["bash", "-lc", command]]
     if not tokens:
         raise AgentWorkspaceError("Terminal command is invalid for project rule evaluation.")
+    if any(token.casefold() in _SHELL_CONTROL_WORDS for token in tokens):
+        return [["bash", "-lc", command]]
 
     commands: list[list[str]] = []
     current: list[str] = []
@@ -614,6 +656,7 @@ def evaluate_terminal_command_rules(discovered: dict, command: str) -> dict:
         "decision": decision,
         "commands": commands,
         "matchedRules": matches,
+        "policyHash": discovered.get("policyHash"),
     }
 
 

@@ -167,6 +167,33 @@ prefix_rule(pattern = ["rm"], decision = "forbidden")
     assert evaluated["decision"] == "prompt"
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "(rm -rf build)",
+        "if true; then rm -rf build; fi",
+        'for path in build; do rm -rf "$path"; done',
+        "! rm -rf build",
+    ],
+)
+def test_terminal_rule_evaluation_falls_back_for_shell_control_syntax(tmp_path, command):
+    root = tmp_path / "repository"
+    root.mkdir()
+    _write_rules(
+        root,
+        "default.rules",
+        """
+prefix_rule(pattern = ["bash"], decision = "prompt")
+prefix_rule(pattern = ["rm"], decision = "forbidden")
+""",
+    )
+
+    evaluated = evaluate_terminal_command_rules(_discover(root), command)
+
+    assert evaluated["commands"] == [["bash", "-lc", command]]
+    assert evaluated["decision"] == "prompt"
+
+
 def test_terminal_allow_requires_every_command_in_a_plain_chain_to_match(tmp_path):
     root = tmp_path / "repository"
     root.mkdir()
@@ -203,6 +230,100 @@ def test_full_access_terminal_enforces_forbidden_rule_before_process_setup(monke
     )
 
     assert result == ("Blocked by project command rules. Use the reviewed cleanup command instead.")
+
+
+def test_full_access_project_policy_capability_failure_is_forbidden(monkeypatch):
+    monkeypatch.setattr(rules, "secure_command_rule_traversal_supported", lambda: False)
+
+    policy = tools.project_terminal_rule_policy(
+        "project-example",
+        "git status",
+        outside_sandbox = True,
+    )
+
+    assert policy["decision"] == "forbidden"
+    assert "unavailable on this platform" in policy["error"]
+
+
+def test_full_access_terminal_rejects_policy_change_between_approval_and_spawn(
+    tmp_path, monkeypatch
+):
+    policies = iter(
+        [
+            {
+                "decision": "allow",
+                "matchedRules": [],
+                "policyHash": "a" * 64,
+            },
+            {
+                "decision": "prompt",
+                "matchedRules": [],
+                "policyHash": "b" * 64,
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        tools,
+        "project_terminal_rule_policy",
+        lambda *_args, **_kwargs: next(policies),
+    )
+    monkeypatch.setattr(tools, "_harden_parent_against_proc_env_leak", lambda: True)
+    monkeypatch.setattr(tools, "_get_workdir", lambda _session_id: str(tmp_path))
+    monkeypatch.setattr(tools, "_project_execution_boundary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(tools, "_tracks_workspace_artifacts", lambda _session_id: False)
+    monkeypatch.setattr(tools, "_build_bypass_env", lambda _workdir: {})
+    monkeypatch.setattr(tools, "_call_started", lambda _workdir: "call")
+    monkeypatch.setattr(tools, "_call_finished", lambda _token: None)
+    monkeypatch.setattr(
+        tools.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("policy drift reached process creation")
+        ),
+    )
+
+    result = tools._bash_exec(
+        "git status",
+        session_id = "project-example",
+        disable_sandbox = True,
+        project_rule_proof = {"policyHash": "a" * 64, "approved": False},
+    )
+
+    assert "Blocked by project command rules" in result
+    assert "changed or was not reviewed" in result
+
+
+def test_execute_tool_forwards_policy_proof_only_to_terminal(monkeypatch):
+    observed = {}
+
+    def bash(
+        command,
+        *_args,
+        project_rule_proof = None,
+        **_kwargs,
+    ):
+        observed["terminal"] = (command, project_rule_proof)
+        return "terminal-ok"
+
+    def python(code, *_args, **kwargs):
+        assert "project_rule_proof" not in kwargs
+        observed["python"] = code
+        return "python-ok"
+
+    monkeypatch.setattr(tools, "_bash_exec", bash)
+    monkeypatch.setattr(tools, "_python_exec", python)
+    proof = {"policyHash": "a" * 64, "approved": True}
+
+    assert (
+        tools.execute_tool(
+            "terminal",
+            {"command": "git status"},
+            project_rule_proof = proof,
+        )
+        == "terminal-ok"
+    )
+    assert tools.execute_tool("python", {"code": "print(1)"}) == "python-ok"
+    assert observed == {"terminal": ("git status", proof), "python": "print(1)"}
 
 
 def test_project_rules_route_returns_only_the_bounded_snapshot(tmp_path, monkeypatch):
@@ -300,7 +421,15 @@ def test_missing_rule_directories_return_an_empty_trusted_snapshot(tmp_path):
     root = tmp_path / "repository"
     root.mkdir()
 
-    assert _discover(root) == {"trusted": True, "rules": [], "files": [], "bytesRead": 0}
+    discovered = _discover(root)
+    assert discovered == {
+        "trusted": True,
+        "rules": [],
+        "files": [],
+        "bytesRead": 0,
+        "policyHash": discovered["policyHash"],
+    }
+    assert len(discovered["policyHash"]) == 64
     (root / ".codex").mkdir()
     assert _discover(root)["rules"] == []
 

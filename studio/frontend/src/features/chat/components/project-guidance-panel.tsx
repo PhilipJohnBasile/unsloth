@@ -38,6 +38,7 @@ export function ProjectGuidancePanel({
   );
   const [skills, setSkills] = useState<ProjectSkills | null>(null);
   const [rules, setRules] = useState<ProjectCommandRules | null>(null);
+  const [rulesUnavailable, setRulesUnavailable] = useState(false);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -71,6 +72,7 @@ export function ProjectGuidancePanel({
       if (nextRules.status === "fulfilled") {
         setRules(nextRules.value);
       }
+      setRulesUnavailable(nextRules.status === "rejected");
       const failures = [
         rejectedMessage(nextInstructions, "Could not load AGENTS.md."),
         rejectedMessage(nextSkills, "Could not load project skills."),
@@ -178,7 +180,11 @@ export function ProjectGuidancePanel({
 
             <SkillsCard skills={skills} loading={loading} />
 
-            <RulesCard rules={rules} loading={loading} />
+            <RulesCard
+              rules={rules}
+              loading={loading}
+              unavailable={rulesUnavailable}
+            />
           </div>
         </>
       ) : (
@@ -289,9 +295,11 @@ function SkillsCard({
 function RulesCard({
   rules,
   loading,
+  unavailable,
 }: {
   rules: ProjectCommandRules | null;
   loading: boolean;
+  unavailable: boolean;
 }) {
   return (
     <div className="rounded-xl bg-background/70 px-3 py-2">
@@ -335,9 +343,11 @@ function RulesCard({
         </div>
       ) : (
         <p className="mt-1 text-xs text-muted-foreground">
-          {loading
-            ? "Resolving command policy..."
-            : "No .codex/rules files found."}
+          {unavailable
+            ? "Command policy unavailable. Full access terminal commands are blocked."
+            : loading
+              ? "Resolving command policy..."
+              : "No .codex/rules files found."}
         </p>
       )}
       <p className="mt-2 text-[10px] text-muted-foreground">

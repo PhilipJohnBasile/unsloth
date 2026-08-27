@@ -203,6 +203,10 @@ test("guidance panel keeps successful sections when one refresh fails", async ()
   );
 
   assert.match(panel, /Promise\.allSettled\(\[/);
+  assert.match(
+    panel,
+    /Command policy unavailable\. Full access terminal commands are blocked\./,
+  );
   assert.match(panel, /nextInstructions\.status === "fulfilled"/);
   assert.match(panel, /nextSkills\.status === "fulfilled"/);
   assert.match(panel, /nextRules\.status === "fulfilled"/);
