@@ -27,6 +27,7 @@ import {
 } from "../hooks/use-chat-projects";
 import type { ProjectRecord } from "../types";
 import { ProjectGuidancePanel } from "./project-guidance-panel";
+import { ProjectHooksPanel } from "./project-hooks-panel";
 
 export function ProjectWorkspaceControls({
   project,
@@ -185,6 +186,7 @@ function ProjectWorkspaceControlsInner({
           </div>
         </div>
         <ProjectGuidancePanel project={project} />
+        <ProjectHooksPanel project={project} />
       </section>
 
       <AlertDialog
