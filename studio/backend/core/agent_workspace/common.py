@@ -22,6 +22,7 @@ class ProjectWorkspace:
     kind: str
     device_id: Optional[int]
     file_id: Optional[int]
+    revision: int = 0
 
 
 def project_workspace(project_id: str) -> ProjectWorkspace:
@@ -80,6 +81,7 @@ def project_workspace(project_id: str) -> ProjectWorkspace:
         kind = kind,
         device_id = expected_device,
         file_id = expected_file,
+        revision = int(project.get("workspaceRevision") or 0),
     )
 
 
