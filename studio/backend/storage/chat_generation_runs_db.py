@@ -40,6 +40,21 @@ def _loads(value: str | None, fallback: Any) -> Any:
         return fallback
 
 
+def _reject_non_rfc_json_constant(value: str) -> None:
+    raise ValueError(f"Non-RFC JSON constant {value!r}")
+
+
+def _strict_message_loads(value: str | None, fallback: Any) -> Any:
+    if value is None:
+        return fallback
+    value.encode("utf-8", errors = "strict")
+    return json.loads(value, parse_constant = _reject_non_rfc_json_constant)
+
+
+def _strict_message_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii = False, allow_nan = False)
+
+
 def canonical_request(
     *,
     thread_id: str,
@@ -141,7 +156,7 @@ def _sync_assistant_status_locked(conn: sqlite3.Connection, run_id: str, status:
     ).fetchone()
     if row is None or row["metadata_json"] is None:
         return
-    metadata = _loads(row["metadata_json"], {})
+    metadata = _strict_message_loads(row["metadata_json"], {})
     if not isinstance(metadata, dict) or metadata.get("generationRunId") not in (None, run_id):
         return
     metadata.update(
@@ -162,7 +177,7 @@ def _sync_assistant_status_locked(conn: sqlite3.Connection, run_id: str, status:
             metadata.pop("incomplete", None)
     conn.execute(
         "UPDATE chat_messages SET metadata_json=? WHERE id=?",
-        (json.dumps(metadata, ensure_ascii = False), row["assistant_message_id"]),
+        (_strict_message_dumps(metadata), row["assistant_message_id"]),
     )
 
 
@@ -245,18 +260,18 @@ def create_run(
                     assistant_message_id,
                     thread_id,
                     user_message_id,
-                    json.dumps(metadata, ensure_ascii = False),
+                    _strict_message_dumps(metadata),
                     created,
                 ),
             )
         else:
-            assistant_metadata = _loads(assistant["metadata_json"], {})
+            assistant_metadata = _strict_message_loads(assistant["metadata_json"], {})
             existing_run_id = (
                 assistant_metadata.get("generationRunId")
                 if isinstance(assistant_metadata, dict)
                 else None
             )
-            content = _loads(assistant["content_json"], [])
+            content = _strict_message_loads(assistant["content_json"], [])
             has_content = isinstance(content, list) and any(
                 isinstance(part, dict)
                 and (
@@ -281,7 +296,7 @@ def create_run(
             merged_metadata.update(metadata)
             conn.execute(
                 "UPDATE chat_messages SET metadata_json=? WHERE id=?",
-                (json.dumps(merged_metadata, ensure_ascii = False), assistant_message_id),
+                (_strict_message_dumps(merged_metadata), assistant_message_id),
             )
 
         try:

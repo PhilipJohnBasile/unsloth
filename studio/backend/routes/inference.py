@@ -90,6 +90,13 @@ from core.inference.llama_admission import (
     peek_llama_admission_snapshot,
 )
 from core.inference.tool_stream_exec import TOOL_APPROVAL_FLUSH_DELAY_S
+from core.manual_compaction import (
+    MAX_MANUAL_COMPACTION_SUMMARY_BYTES,
+    ManualCompactionError,
+    fail_manual_compaction_attempt,
+    record_manual_compaction_output,
+    validate_and_rewrite_manual_compaction_request,
+)
 
 
 def _positive_int_or_none(value: Any) -> Optional[int]:
@@ -18020,8 +18027,688 @@ class _DisconnectPolicyRequest:
 
 def _chat_cancel_event(request: Request) -> threading.Event:
     """Reuse a durable run's event across auto-load and generation registration."""
-    event = getattr(getattr(request, "state", None), "generation_cancel_event", None)
-    return event if event is not None else threading.Event()
+    state = getattr(request, "state", None)
+    event = getattr(state, "generation_cancel_event", None)
+    if event is None:
+        event = threading.Event()
+        if state is not None:
+            state.generation_cancel_event = event
+    return event
+
+
+async def _fail_claimed_manual_compaction(attempt_id: str | None, *, cancelled: bool) -> None:
+    """Best-effort terminal CAS for an inference attempt that cannot commit."""
+    if attempt_id is None:
+        return
+    try:
+        await asyncio.to_thread(
+            fail_manual_compaction_attempt,
+            attempt_id,
+            "inference_cancelled" if cancelled else "inference_failed",
+            cancelled = cancelled,
+        )
+    except ManualCompactionError:
+        # A concurrent commit or terminalization already owns the attempt.
+        return
+    except Exception as exc:
+        logger.warning(
+            "manual_compaction.terminalize_failed",
+            attempt_id = attempt_id,
+            error_type = type(exc).__name__,
+        )
+
+
+def _manual_compaction_route_lifecycle(handler):
+    """Terminalize a claimed attempt when routing fails before a response exists."""
+
+    @functools.wraps(handler)
+    async def _wrapped(payload, request, *args, **kwargs):
+        try:
+            return await handler(payload, request, *args, **kwargs)
+        except BaseException as exc:
+            state = getattr(request, "state", None)
+            attempt_id = getattr(state, "manual_compaction_attempt_id", None)
+            cancel_event = getattr(state, "generation_cancel_event", None)
+            cancelled = (
+                isinstance(exc, (asyncio.CancelledError, ClientDisconnect))
+                or (isinstance(exc, HTTPException) and exc.status_code == 499)
+                or bool(cancel_event is not None and cancel_event.is_set())
+            )
+            await _fail_claimed_manual_compaction(
+                attempt_id,
+                cancelled = cancelled,
+            )
+            if attempt_id is not None and not cancelled:
+                return _manual_compaction_error_response()
+            raise
+
+    return _wrapped
+
+
+def _reject_manual_compaction_json_constant(value: str) -> None:
+    raise ValueError(f"Non-RFC JSON constant {value!r}")
+
+
+def _manual_compaction_json_loads(data: str) -> Any:
+    data.encode("utf-8", errors = "strict")
+    return json.loads(data, parse_constant = _reject_manual_compaction_json_constant)
+
+
+def _manual_compaction_stream_event(
+    data: str, *, content: list[str], role_seen: list[bool]
+) -> tuple[str | None, bool]:
+    """Observe one OpenAI SSE data value without trusting the client."""
+    try:
+        event = _manual_compaction_json_loads(data)
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return None, False
+    if not isinstance(event, dict):
+        return None, False
+    if "error" in event or not set(event) <= {
+        "id",
+        "object",
+        "created",
+        "model",
+        "system_fingerprint",
+        "choices",
+    }:
+        return None, False
+    choices = event.get("choices")
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        return None, False
+    choice = choices[0]
+    if not {"index", "delta"} <= set(choice) or not set(choice) <= {
+        "index",
+        "delta",
+        "finish_reason",
+    }:
+        return None, False
+    if type(choice.get("index")) is not int or choice["index"] != 0:
+        return None, False
+    delta = choice.get("delta")
+    if not isinstance(delta, dict) or not set(delta) <= {"role", "content"}:
+        return None, False
+    role = delta.get("role")
+    if role is not None:
+        if role != "assistant" or role_seen[0]:
+            return None, False
+        role_seen[0] = True
+    piece = delta.get("content")
+    if piece is not None:
+        if not isinstance(piece, str):
+            return None, False
+        content.append(piece)
+    finish_reason = choice.get("finish_reason")
+    if finish_reason is not None and not isinstance(finish_reason, str):
+        return None, False
+    if finish_reason is not None:
+        if delta:
+            return None, False
+    elif not delta:
+        return None, False
+    return finish_reason, True
+
+
+def _manual_compaction_nonstream_event(data: str, *, content: list[str]) -> tuple[str | None, bool]:
+    """Observe one provider-proxied non-streaming ChatCompletion JSON line."""
+    try:
+        event = _manual_compaction_json_loads(data)
+    except (TypeError, ValueError, UnicodeEncodeError):
+        return None, False
+    if (
+        not isinstance(event, dict)
+        or "error" in event
+        or not set(event)
+        <= {
+            "id",
+            "object",
+            "created",
+            "model",
+            "system_fingerprint",
+            "service_tier",
+            "choices",
+            "usage",
+        }
+    ):
+        return None, False
+    if "usage" in event and event["usage"] is not None and not isinstance(event["usage"], dict):
+        return None, False
+    choices = event.get("choices") if isinstance(event, dict) else None
+    if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+        return None, False
+    choice = choices[0]
+    if not {"index", "message", "finish_reason"} <= set(choice) or not set(choice) <= {
+        "index",
+        "message",
+        "finish_reason",
+        "logprobs",
+    }:
+        return None, False
+    if choice.get("logprobs") is not None:
+        return None, False
+    if type(choice.get("index")) is not int or choice["index"] != 0:
+        return None, False
+    message = choice.get("message")
+    if (
+        not isinstance(message, dict)
+        or not {"role", "content"} <= set(message)
+        or not set(message)
+        <= {
+            "role",
+            "content",
+            "refusal",
+            "reasoning_content",
+            "tool_calls",
+            "function_call",
+            "audio",
+        }
+    ):
+        return None, False
+    if any(
+        message.get(key) is not None
+        for key in (
+            "refusal",
+            "reasoning_content",
+            "tool_calls",
+            "function_call",
+            "audio",
+        )
+    ):
+        return None, False
+    if message.get("role") != "assistant":
+        return None, False
+    piece = message.get("content")
+    finish_reason = choice.get("finish_reason")
+    if not isinstance(piece, str) or not isinstance(finish_reason, str):
+        return None, False
+    content.append(piece)
+    return finish_reason, True
+
+
+def _manual_compaction_text_is_valid(text: str) -> bool:
+    if not text.strip():
+        return False
+    try:
+        return len(text.encode("utf-8", errors = "strict")) <= MAX_MANUAL_COMPACTION_SUMMARY_BYTES
+    except UnicodeEncodeError:
+        return False
+
+
+_MANUAL_COMPACTION_ERROR_MESSAGE = "Manual compaction failed. Prepare a new attempt and try again."
+_MANUAL_COMPACTION_CANCELLED_MESSAGE = "Manual compaction was cancelled."
+_MAX_MANUAL_COMPACTION_WIRE_BYTES = 4 * 1024 * 1024
+
+
+def _manual_compaction_error_body(*, cancelled: bool = False) -> dict[str, Any]:
+    return openai_error_body(
+        _MANUAL_COMPACTION_CANCELLED_MESSAGE if cancelled else _MANUAL_COMPACTION_ERROR_MESSAGE,
+        status = 499 if cancelled else 502,
+        code = "manual_compaction_cancelled" if cancelled else "manual_compaction_failed",
+    )
+
+
+def _manual_compaction_error_response(*, cancelled: bool = False) -> JSONResponse:
+    return JSONResponse(
+        status_code = 499 if cancelled else 502,
+        content = _manual_compaction_error_body(cancelled = cancelled),
+    )
+
+
+def _manual_compaction_sse_error() -> str:
+    encoded = json.dumps(
+        _manual_compaction_error_body(),
+        ensure_ascii = True,
+        allow_nan = False,
+        separators = (",", ":"),
+    )
+    return f"data: {encoded}\n\ndata: [DONE]\n\n"
+
+
+class _ManualCompactionStreamObserver:
+    """Validate the complete SSE response before releasing it to the client."""
+
+    def __init__(self, body_iterator, *, attempt_id: str, cancel_event: threading.Event) -> None:
+        self._body_iterator = body_iterator
+        self._attempt_id = attempt_id
+        self._cancel_event = cancel_event
+        self._content: list[str] = []
+        self._role_seen = [False]
+        self._content_bytes = 0
+        self._terminal_reason: str | None = None
+        self._valid = True
+        self._validated = False
+        self._recorded = False
+        self._saw_done = False
+        self._terminalized = False
+        self._terminal_cancelled = False
+        self._buffer = ""
+        self._wire_bytes = 0
+        self._pending_chunks: list[Any] = []
+        self._ready_chunks: list[Any] = []
+        self._ready_index = 0
+        self._source_finished = False
+        self._error_emitted = False
+        self._delivery_complete = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._ready_index < len(self._ready_chunks):
+            chunk = self._ready_chunks[self._ready_index]
+            self._ready_index += 1
+            return chunk
+        if self._source_finished:
+            if self._terminalized and not self._terminal_cancelled and not self._error_emitted:
+                self._error_emitted = True
+                return _manual_compaction_sse_error()
+            if self._validated and not self._recorded and not self._terminalized:
+                try:
+                    await self._record_if_complete()
+                except BaseException as exc:
+                    cancelled = isinstance(exc, (asyncio.CancelledError, ClientDisconnect)) or bool(
+                        self._cancel_event.is_set()
+                    )
+                    await self._terminalize(
+                        "Manual compaction delivery finalization was interrupted",
+                        cancelled = cancelled,
+                    )
+                    if cancelled:
+                        raise
+                if self._terminalized:
+                    return await self.__anext__()
+            if self._recorded:
+                self._delivery_complete = True
+            raise StopAsyncIteration
+        while True:
+            try:
+                chunk = await self._body_iterator.__anext__()
+            except StopAsyncIteration:
+                self._source_finished = True
+                await self._finish()
+                if self._validated:
+                    self._ready_chunks = self._pending_chunks
+                    self._pending_chunks = []
+                    return await self.__anext__()
+                self._pending_chunks = []
+                return await self.__anext__()
+            except BaseException as exc:
+                cancelled = isinstance(exc, (asyncio.CancelledError, ClientDisconnect)) or bool(
+                    self._cancel_event.is_set()
+                )
+                await self._terminalize(
+                    "Manual compaction inference stream was interrupted",
+                    cancelled = cancelled,
+                )
+                self._source_finished = True
+                self._pending_chunks = []
+                if cancelled:
+                    raise
+                return await self.__anext__()
+            try:
+                chunk_bytes = (
+                    len(chunk)
+                    if isinstance(chunk, bytes)
+                    else len(chunk.encode("utf-8", errors = "strict"))
+                    if isinstance(chunk, str)
+                    else 0
+                )
+            except UnicodeEncodeError:
+                chunk_bytes = 0
+            if (
+                chunk_bytes <= 0
+                or self._wire_bytes + chunk_bytes > _MAX_MANUAL_COMPACTION_WIRE_BYTES
+            ):
+                await self._terminalize(
+                    "Manual compaction provider response exceeded its wire limit",
+                    cancelled = False,
+                )
+            else:
+                self._wire_bytes += chunk_bytes
+                self._pending_chunks.append(chunk)
+                await self._observe_chunk(chunk)
+            if self._terminalized:
+                self._source_finished = True
+                self._pending_chunks = []
+                aclose = getattr(self._body_iterator, "aclose", None)
+                if aclose is not None:
+                    try:
+                        await aclose()
+                    except BaseException:
+                        pass
+                return await self.__anext__()
+
+    async def _terminalize(self, reason: str, *, cancelled: bool) -> None:
+        if self._terminalized or self._delivery_complete:
+            return
+        self._valid = False
+        self._terminalized = True
+        self._terminal_cancelled = cancelled
+        self._cancel_event.set()
+        await _fail_claimed_manual_compaction(
+            self._attempt_id,
+            cancelled = cancelled,
+        )
+
+    async def _record_if_complete(self) -> None:
+        if (
+            self._recorded
+            or self._terminalized
+            or not self._validated
+            or not self._valid
+            or not self._saw_done
+            or self._terminal_reason != "stop"
+            or self._cancel_event.is_set()
+        ):
+            return
+        text = "".join(self._content)
+        if not _manual_compaction_text_is_valid(text):
+            await self._terminalize(
+                "Manual compaction output was blank, malformed, or too large",
+                cancelled = False,
+            )
+            return
+        try:
+            await asyncio.to_thread(
+                record_manual_compaction_output,
+                self._attempt_id,
+                text = text,
+                finish_reason = self._terminal_reason,
+            )
+        except Exception:
+            await self._terminalize(
+                "Manual compaction output could not be recorded",
+                cancelled = False,
+            )
+            return
+        self._recorded = True
+
+    async def _observe_data(self, data: str) -> None:
+        if data == "[DONE]":
+            if self._saw_done:
+                await self._terminalize(
+                    "Manual compaction output contained multiple terminal sentinels",
+                    cancelled = False,
+                )
+                return
+            self._saw_done = True
+            if self._terminal_reason is None:
+                await self._terminalize(
+                    "Manual compaction output ended without a terminal choice",
+                    cancelled = False,
+                )
+                return
+            return
+        if self._saw_done:
+            await self._terminalize(
+                "Manual compaction output continued after its terminal sentinel",
+                cancelled = False,
+            )
+            return
+        prior_parts = len(self._content)
+        finish_reason, event_valid = _manual_compaction_stream_event(
+            data,
+            content = self._content,
+            role_seen = self._role_seen,
+        )
+        if not event_valid:
+            await self._terminalize(
+                "Manual compaction provider returned invalid SSE",
+                cancelled = False,
+            )
+            return
+        if len(self._content) != prior_parts:
+            if self._terminal_reason is not None:
+                await self._terminalize(
+                    "Manual compaction output continued after its terminal choice",
+                    cancelled = False,
+                )
+                return
+            try:
+                self._content_bytes += len(self._content[-1].encode("utf-8", errors = "strict"))
+            except UnicodeEncodeError:
+                await self._terminalize(
+                    "Manual compaction output was not valid UTF-8",
+                    cancelled = False,
+                )
+                return
+            if self._content_bytes > MAX_MANUAL_COMPACTION_SUMMARY_BYTES:
+                await self._terminalize(
+                    "Manual compaction output exceeded the summary size limit",
+                    cancelled = False,
+                )
+                return
+        if finish_reason is not None:
+            if self._terminal_reason is not None:
+                await self._terminalize(
+                    "Manual compaction output contained multiple terminal choices",
+                    cancelled = False,
+                )
+                return
+            self._terminal_reason = finish_reason
+            if finish_reason != "stop":
+                await self._terminalize(
+                    f"Manual compaction output ended with finish_reason={finish_reason}",
+                    cancelled = False,
+                )
+
+    async def _observe_nonstream_data(self, data: str) -> None:
+        if self._terminal_reason is not None or self._content:
+            await self._terminalize(
+                "Manual compaction provider returned multiple non-streaming responses",
+                cancelled = False,
+            )
+            return
+        finish_reason, event_valid = _manual_compaction_nonstream_event(
+            data,
+            content = self._content,
+        )
+        if not event_valid:
+            await self._terminalize(
+                "Manual compaction provider returned invalid non-streaming JSON",
+                cancelled = False,
+            )
+            return
+        self._terminal_reason = finish_reason
+        text = self._content[0]
+        if not _manual_compaction_text_is_valid(text):
+            await self._terminalize(
+                "Manual compaction output was blank, malformed, or too large",
+                cancelled = False,
+            )
+            return
+        self._content_bytes = len(text.encode("utf-8", errors = "strict"))
+        if finish_reason != "stop":
+            await self._terminalize(
+                f"Manual compaction output ended with finish_reason={finish_reason}",
+                cancelled = False,
+            )
+
+    async def _observe_chunk(self, chunk: Any) -> None:
+        try:
+            if isinstance(chunk, bytes):
+                decoded = chunk.decode("utf-8", errors = "strict")
+            elif isinstance(chunk, str):
+                decoded = chunk
+            else:
+                raise TypeError("stream chunks must be text or bytes")
+        except UnicodeDecodeError:
+            await self._terminalize(
+                "Manual compaction provider returned invalid UTF-8",
+                cancelled = False,
+            )
+            return
+        except TypeError:
+            await self._terminalize(
+                "Manual compaction provider returned an invalid stream chunk",
+                cancelled = False,
+            )
+            return
+        self._buffer += decoded
+        lines = self._buffer.split("\n")
+        self._buffer = lines.pop()
+        for line in lines:
+            line = line.rstrip("\r")
+            if line.startswith("data:"):
+                await self._observe_data(line[5:].strip())
+            elif line.lstrip().startswith("{"):
+                await self._observe_nonstream_data(line.strip())
+            elif line and not line.startswith(":"):
+                await self._terminalize(
+                    "Manual compaction provider returned invalid SSE framing",
+                    cancelled = False,
+                )
+
+    async def _finish(self) -> None:
+        if self._buffer.strip():
+            line = self._buffer.rstrip("\r")
+            if line.startswith("data:"):
+                await self._observe_data(line[5:].strip())
+            elif line.lstrip().startswith("{"):
+                await self._observe_nonstream_data(line.strip())
+            else:
+                await self._terminalize(
+                    "Manual compaction provider returned invalid SSE framing",
+                    cancelled = False,
+                )
+        if self._recorded or self._terminalized:
+            return
+        if self._cancel_event.is_set():
+            await self._terminalize(
+                "Manual compaction inference was cancelled",
+                cancelled = True,
+            )
+            return
+        if not self._saw_done:
+            await self._terminalize(
+                "Manual compaction output ended without a terminal sentinel",
+                cancelled = False,
+            )
+            return
+        text = "".join(self._content)
+        if not _manual_compaction_text_is_valid(text):
+            await self._terminalize(
+                "Manual compaction output was blank, malformed, or too large",
+                cancelled = False,
+            )
+            return
+        self._validated = True
+
+    async def athrow(self, *args):
+        thrown = args[0] if args else asyncio.CancelledError
+        is_cancelled = (
+            thrown is asyncio.CancelledError
+            or isinstance(thrown, (asyncio.CancelledError, ClientDisconnect))
+            or self._cancel_event.is_set()
+        )
+        await self._terminalize(
+            "Manual compaction inference stream was cancelled"
+            if is_cancelled
+            else "Manual compaction inference stream was interrupted",
+            cancelled = is_cancelled,
+        )
+        athrow = getattr(self._body_iterator, "athrow", None)
+        if athrow is not None:
+            return await athrow(*args)
+        await self.aclose()
+        if args and isinstance(args[0], BaseException):
+            raise args[0]
+        exception_type = args[0] if args else asyncio.CancelledError
+        raise exception_type(*args[1:])
+
+    async def aclose(self) -> None:
+        await self._terminalize(
+            "Manual compaction inference stream was cancelled",
+            cancelled = True,
+        )
+        aclose = getattr(self._body_iterator, "aclose", None)
+        if aclose is not None:
+            await aclose()
+
+
+def _observe_manual_compaction_stream(
+    body_iterator, *, attempt_id: str, cancel_event: threading.Event
+):
+    return _ManualCompactionStreamObserver(
+        body_iterator,
+        attempt_id = attempt_id,
+        cancel_event = cancel_event,
+    )
+
+
+async def _observe_manual_compaction_response(
+    response: Response, *, attempt_id: str | None, cancel_event: threading.Event | None
+) -> Response:
+    if attempt_id is None or cancel_event is None:
+        return response
+    if cancel_event.is_set():
+        await _fail_claimed_manual_compaction(
+            attempt_id,
+            cancelled = True,
+        )
+        return _manual_compaction_error_response(cancelled = True)
+    status_code = getattr(response, "status_code", None)
+    if type(status_code) is not int or not 200 <= status_code < 300:
+        await _fail_claimed_manual_compaction(
+            attempt_id,
+            cancelled = False,
+        )
+        return _manual_compaction_error_response()
+    body_iterator = getattr(response, "body_iterator", None)
+    if body_iterator is not None:
+        response.body_iterator = _observe_manual_compaction_stream(
+            body_iterator,
+            attempt_id = attempt_id,
+            cancel_event = cancel_event,
+        )
+        return response
+    body = getattr(response, "body", None)
+    try:
+        raw_body = bytes(body).decode("utf-8", errors = "strict")
+    except (AttributeError, TypeError, ValueError, UnicodeDecodeError):
+        await _fail_claimed_manual_compaction(
+            attempt_id,
+            cancelled = False,
+        )
+        return _manual_compaction_error_response()
+    content: list[str] = []
+    finish_reason, event_valid = _manual_compaction_nonstream_event(
+        raw_body,
+        content = content,
+    )
+    if not event_valid or finish_reason is None or len(content) != 1:
+        await _fail_claimed_manual_compaction(
+            attempt_id,
+            cancelled = False,
+        )
+        return _manual_compaction_error_response()
+    text = content[0]
+    if finish_reason != "stop":
+        await _fail_claimed_manual_compaction(
+            attempt_id,
+            cancelled = False,
+        )
+        return _manual_compaction_error_response()
+    if not _manual_compaction_text_is_valid(text):
+        await _fail_claimed_manual_compaction(
+            attempt_id,
+            cancelled = False,
+        )
+        return _manual_compaction_error_response()
+    try:
+        await asyncio.to_thread(
+            record_manual_compaction_output,
+            attempt_id,
+            text = text,
+            finish_reason = finish_reason,
+        )
+    except Exception:
+        await _fail_claimed_manual_compaction(
+            attempt_id,
+            cancelled = False,
+        )
+        return _manual_compaction_error_response()
+    return response
 
 
 @router.post("/chat/completions")
@@ -18046,6 +18733,7 @@ async def openai_chat_completions(
     )
 
 
+@_manual_compaction_route_lifecycle
 async def produce_openai_chat_completions(
     payload: ChatCompletionRequest,
     request: Request,
@@ -18073,6 +18761,28 @@ async def produce_openai_chat_completions(
         request,
         cancel_on_disconnect = cancel_on_disconnect,
     )
+
+    # Manual compaction is a stored-branch operation, not a provider feature. Pin and
+    # rewrite it before any provider or model switch can observe the literal command,
+    # tools, or automatic compaction settings.
+    manual_attempt_id: str | None = None
+    manual_cancel_event: threading.Event | None = None
+    if payload.manual_compaction is not None:
+        try:
+            manual_attempt = validate_and_rewrite_manual_compaction_request(payload)
+            if manual_attempt is not None:
+                manual_attempt_id = manual_attempt["attemptId"]
+                manual_cancel_event = _chat_cancel_event(request)
+                request.state.manual_compaction_attempt_id = manual_attempt_id
+        except ManualCompactionError as exc:
+            raise HTTPException(status_code = exc.status_code, detail = str(exc)) from exc
+
+    async def observed(response: Response) -> Response:
+        return await _observe_manual_compaction_response(
+            response,
+            attempt_id = manual_attempt_id,
+            cancel_event = manual_cancel_event,
+        )
 
     # OpenAI's newer "developer" role is equivalent to "system". Normalize it
     # before provider routing so external providers (which may not accept the
@@ -18116,7 +18826,7 @@ async def produce_openai_chat_completions(
                 status_code = 400,
                 detail = "Video input is only supported on a local GGUF model with video support.",
             )
-        return await _proxy_to_external_provider(payload, request, current_subject)
+        return await observed(await _proxy_to_external_provider(payload, request, current_subject))
 
     # Reject a malformed function tool here: it would otherwise reach
     # llama-server and surface as an opaque 500 "Failed to parse tools".
@@ -18384,9 +19094,11 @@ async def produce_openai_chat_completions(
                         " Load a vision model to send one."
                     ),
                 )
-            return await _monitored_generate_audio(
-                model_name,
-                context_length = llama_backend.context_length,
+            return await observed(
+                await _monitored_generate_audio(
+                    model_name,
+                    context_length = llama_backend.context_length,
+                )
             )
     else:
         backend = await asyncio.to_thread(get_inference_backend)
@@ -18429,7 +19141,7 @@ async def produce_openai_chat_completions(
                         " Load a vision model to send one."
                     ),
                 )
-            return await _monitored_generate_audio(model_name)
+            return await observed(await _monitored_generate_audio(model_name))
 
         # ── Whisper without audio: return clear error ──
         if payload.audio_base64 and _wants_multiple_choices(payload):
@@ -18596,15 +19308,17 @@ async def produce_openai_chat_completions(
                         await _stop_local_disconnect_cancel_watcher(disconnect_watcher)
                         _tracker.__exit__(None, None, None)
 
-                return _SameTaskStreamingResponse(
-                    audio_input_stream(),
-                    unstarted_cleanup = _tracked_cancel_unstarted_cleanup(_tracker),
-                    media_type = "text/event-stream",
-                    headers = {
-                        "Cache-Control": "no-cache",
-                        "Connection": "close",
-                        "X-Accel-Buffering": "no",
-                    },
+                return await observed(
+                    _SameTaskStreamingResponse(
+                        audio_input_stream(),
+                        unstarted_cleanup = _tracked_cancel_unstarted_cleanup(_tracker),
+                        media_type = "text/event-stream",
+                        headers = {
+                            "Cache-Control": "no-cache",
+                            "Connection": "close",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
                 )
             else:
                 # `stream` defaults to False, so this is the ordinary shape of an audio-input chat and it
@@ -18683,7 +19397,7 @@ async def produce_openai_chat_completions(
                         ),
                     ),
                 )
-                return _model_json_response(response)
+                return await observed(_model_json_response(response))
 
     if monitor_id is None and not getattr(request.state, "skip_api_monitor", False):
         monitor_id = api_monitor.start(
@@ -18860,26 +19574,30 @@ async def produce_openai_chat_completions(
         # parity). Naive curl / .NET / System.Text.Json clients omitting the
         # field used to get SSE here and choke on deserialization (#5047).
         if payload.stream:
-            return await _openai_passthrough_stream(
-                request,
-                cancel_event,
-                llama_backend,
-                payload,
-                model_name,
-                completion_id,
-                monitor_id = monitor_id,
+            return await observed(
+                await _openai_passthrough_stream(
+                    request,
+                    cancel_event,
+                    llama_backend,
+                    payload,
+                    model_name,
+                    completion_id,
+                    monitor_id = monitor_id,
+                )
             )
         _cancel_keys = (payload.cancel_id, payload.session_id, completion_id)
         _tracker = _TrackedCancel.for_payload(cancel_event, payload, *_cancel_keys)
         _tracker.__enter__()
         try:
-            return await _openai_passthrough_non_streaming(
-                llama_backend,
-                payload,
-                model_name,
-                monitor_id = monitor_id,
-                request = request,
-                cancel_event = cancel_event,
+            return await observed(
+                await _openai_passthrough_non_streaming(
+                    llama_backend,
+                    payload,
+                    model_name,
+                    monitor_id = monitor_id,
+                    request = request,
+                    cancel_event = cancel_event,
+                )
             )
         finally:
             _tracker.__exit__(None, None, None)
@@ -19627,15 +20345,17 @@ async def produce_openai_chat_completions(
                     reservation.cancel()
                     _tracker.__exit__(None, None, None)
 
-                return _SameTaskStreamingResponse(
-                    admitted_gguf_tool_stream(),
-                    unstarted_cleanup = _gguf_tool_admission_unstarted_cleanup,
-                    media_type = "text/event-stream",
-                    headers = {
-                        "Cache-Control": "no-cache",
-                        "Connection": "close",
-                        "X-Accel-Buffering": "no",
-                    },
+                return await observed(
+                    _SameTaskStreamingResponse(
+                        admitted_gguf_tool_stream(),
+                        unstarted_cleanup = _gguf_tool_admission_unstarted_cleanup,
+                        media_type = "text/event-stream",
+                        headers = {
+                            "Cache-Control": "no-cache",
+                            "Connection": "close",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
                 )
 
             # Non-streaming JSON: drain the agentic generator into one
@@ -19798,8 +20518,10 @@ async def produce_openai_chat_completions(
                 api_monitor.finish(
                     monitor_id, "cancelled" if cancel_event.is_set() else "completed"
                 )
-                return _model_json_response_with_context_truncation(
-                    response, completion_context_truncation
+                return await observed(
+                    _model_json_response_with_context_truncation(
+                        response, completion_context_truncation
+                    )
                 )
             except asyncio.CancelledError:
                 cancel_event.set()
@@ -20243,15 +20965,17 @@ async def produce_openai_chat_completions(
                 reservation.cancel()
                 _tracker.__exit__(None, None, None)
 
-            return _SameTaskStreamingResponse(
-                admitted_gguf_stream_chunks(),
-                unstarted_cleanup = _gguf_admission_unstarted_cleanup,
-                media_type = "text/event-stream",
-                headers = {
-                    "Cache-Control": "no-cache",
-                    "Connection": "close",
-                    "X-Accel-Buffering": "no",
-                },
+            return await observed(
+                _SameTaskStreamingResponse(
+                    admitted_gguf_stream_chunks(),
+                    unstarted_cleanup = _gguf_admission_unstarted_cleanup,
+                    media_type = "text/event-stream",
+                    headers = {
+                        "Cache-Control": "no-cache",
+                        "Connection": "close",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
             )
         else:
             try:
@@ -20504,7 +21228,9 @@ async def produce_openai_chat_completions(
                     ),
                 )
                 api_monitor.finish(monitor_id)
-                return _model_json_response_with_context_truncation(response, _context_truncation)
+                return await observed(
+                    _model_json_response_with_context_truncation(response, _context_truncation)
+                )
 
             except asyncio.CancelledError:
                 cancel_event.set()
@@ -21070,15 +21796,17 @@ async def produce_openai_chat_completions(
                 _sf_tracker.__exit__(None, None, None)
 
         if payload.stream:
-            return _SameTaskStreamingResponse(
-                sf_tool_stream(),
-                unstarted_cleanup = _tracked_cancel_unstarted_cleanup(_sf_tracker),
-                media_type = "text/event-stream",
-                headers = {
-                    "Cache-Control": "no-cache",
-                    "Connection": "close",
-                    "X-Accel-Buffering": "no",
-                },
+            return await observed(
+                _SameTaskStreamingResponse(
+                    sf_tool_stream(),
+                    unstarted_cleanup = _tracked_cancel_unstarted_cleanup(_sf_tracker),
+                    media_type = "text/event-stream",
+                    headers = {
+                        "Cache-Control": "no-cache",
+                        "Connection": "close",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
             )
 
         # Non-streaming JSON: drain the loop, build one ChatCompletion.
@@ -21169,7 +21897,7 @@ async def produce_openai_chat_completions(
                     ),
                 ),
             )
-            return _model_json_response(response)
+            return await observed(_model_json_response(response))
         except asyncio.CancelledError:
             cancel_event.set()
             backend.reset_generation_state(cancel_event)
@@ -21586,15 +22314,17 @@ async def produce_openai_chat_completions(
                         pass
                 _tracker.__exit__(None, None, None)
 
-        return _SameTaskStreamingResponse(
-            stream_chunks(),
-            unstarted_cleanup = _tracked_cancel_unstarted_cleanup(_tracker),
-            media_type = "text/event-stream",
-            headers = {
-                "Cache-Control": "no-cache",
-                "Connection": "close",
-                "X-Accel-Buffering": "no",
-            },
+        return await observed(
+            _SameTaskStreamingResponse(
+                stream_chunks(),
+                unstarted_cleanup = _tracked_cancel_unstarted_cleanup(_tracker),
+                media_type = "text/event-stream",
+                headers = {
+                    "Cache-Control": "no-cache",
+                    "Connection": "close",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         )
 
     # ── Non-streaming response ────────────────────────────────────
@@ -21820,7 +22550,7 @@ async def produce_openai_chat_completions(
                     timings = _last_stats.get("timings") if len(_choices) <= 1 else None,
                 )
             api_monitor.finish(monitor_id)
-            return _model_json_response(response)
+            return await observed(_model_json_response(response))
 
         except asyncio.CancelledError:
             cancel_event.set()

@@ -9,6 +9,7 @@ mixed handlers explicitly send their database transaction through Starlette's th
 """
 
 import asyncio
+import json
 import sqlite3
 from typing import Annotated, Any, Literal, Optional, Union
 
@@ -24,6 +25,15 @@ from pydantic import (
 )
 
 from auth.authentication import get_current_subject
+from core.manual_compaction import (
+    ManualCompactionError,
+    archive_manual_compaction_best_effort,
+    cancel_manual_compaction,
+    commit_manual_compaction,
+    get_manual_compaction_attempt,
+    prepare_manual_compaction,
+)
+from models.inference import ChatMessage as InferenceChatMessage
 from core.inference.llama_server_args import BATCH_MAX, BATCH_MIN, PARALLEL_MAX, PARALLEL_MIN
 from loggers import get_logger
 from utils.api_errors import safe_validation_errors
@@ -303,6 +313,8 @@ class ChatThreadPatch(BaseModel):
 
 
 class ChatMessage(BaseModel):
+    model_config = ConfigDict(allow_inf_nan = False)
+
     id: str
     threadId: str
     parentId: Optional[str] = None
@@ -311,6 +323,15 @@ class ChatMessage(BaseModel):
     attachments: Optional[Any] = None
     metadata: Optional[dict[str, Any]] = None
     createdAt: int
+
+    @field_validator("content", "attachments", "metadata")
+    @classmethod
+    def _stored_json_is_rfc_json(cls, value: Any) -> Any:
+        try:
+            json.dumps(value, ensure_ascii = False, allow_nan = False).encode("utf-8", errors = "strict")
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise ValueError("Stored chat message fields must be RFC JSON") from exc
+        return value
 
 
 class ChatProject(BaseModel):
@@ -354,6 +375,62 @@ class ChatMessageSyncRequest(BaseModel):
     messages: list[ChatMessage]
     pruneMissing: bool = False
     deletedMessageIds: list[str] = Field(default_factory = list)
+
+
+class ManualCompactionPrepareRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    attemptId: str = Field(min_length = 1, max_length = 128)
+    commandMessageId: str = Field(min_length = 1, max_length = 128)
+    expectedHeadMessageId: str = Field(min_length = 1, max_length = 128)
+    messageIds: list[str] = Field(min_length = 2, max_length = 10_000)
+    messages: list[InferenceChatMessage] = Field(min_length = 2, max_length = 40_000)
+
+
+class ManualCompactionCommitRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    attemptId: str = Field(min_length = 1, max_length = 128)
+    commandMessageId: str = Field(min_length = 1, max_length = 128)
+    summaryMessageId: str = Field(min_length = 1, max_length = 128)
+    expectedHeadMessageId: str = Field(min_length = 1, max_length = 128)
+    expectedRevision: int = Field(ge = 1)
+    summaryHash: str = Field(pattern = r"^[0-9a-f]{64}$")
+
+
+class ManualCompactionCancelRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    attemptId: str = Field(min_length = 1, max_length = 128)
+    commandMessageId: str = Field(min_length = 1, max_length = 128)
+
+
+class ManualCompactionResponse(BaseModel):
+    attemptId: str
+    threadId: str
+    commandMessageId: str
+    sourceHeadMessageId: str
+    expectedHeadMessageId: str
+    sourceMessageIds: list[str]
+    effectiveSourceMessageIds: list[str]
+    sourceHash: str
+    requestHash: str
+    requestMessageCount: int
+    projectInstructionDigest: str
+    projectInstructionRevision: int
+    contextDigest: str
+    revision: int
+    state: Literal["pending", "running", "active", "cancelled", "failed"]
+    summaryMessageId: Optional[str] = None
+    summaryHash: Optional[str] = None
+    archiveStatus: str = "pending"
+    createdAt: int
+    startedAt: Optional[int] = None
+    leaseExpiresAt: Optional[int] = None
+    cancelledAt: Optional[int] = None
+    committedAt: Optional[int] = None
+    terminalReason: Optional[str] = None
+    finishedAt: Optional[int] = None
 
 
 class ChatDeleteRequest(BaseModel):
@@ -1282,6 +1359,81 @@ def get_thread_messages(thread_id: str, current_subject: str = Depends(get_curre
     )
 
 
+def _manual_compaction_http_error(exc: ManualCompactionError) -> HTTPException:
+    return HTTPException(status_code = exc.status_code, detail = str(exc))
+
+
+@router.post(
+    "/threads/{thread_id}/compactions:prepare",
+    response_model = ManualCompactionResponse,
+)
+def prepare_thread_manual_compaction(
+    thread_id: str,
+    payload: ManualCompactionPrepareRequest,
+    current_subject: str = Depends(get_current_subject),
+):
+    try:
+        return ManualCompactionResponse(
+            **prepare_manual_compaction(
+                thread_id,
+                attempt_id = payload.attemptId,
+                command_message_id = payload.commandMessageId,
+                expected_head_message_id = payload.expectedHeadMessageId,
+                message_ids = payload.messageIds,
+                request_messages = payload.messages,
+            )
+        )
+    except ManualCompactionError as exc:
+        raise _manual_compaction_http_error(exc) from exc
+
+
+@router.post(
+    "/threads/{thread_id}/compactions:commit",
+    response_model = ManualCompactionResponse,
+)
+def commit_thread_manual_compaction(
+    thread_id: str,
+    payload: ManualCompactionCommitRequest,
+    current_subject: str = Depends(get_current_subject),
+):
+    try:
+        result = commit_manual_compaction(
+            thread_id,
+            attempt_id = payload.attemptId,
+            command_message_id = payload.commandMessageId,
+            summary_message_id = payload.summaryMessageId,
+            expected_head_message_id = payload.expectedHeadMessageId,
+            expected_revision = payload.expectedRevision,
+            expected_summary_hash = payload.summaryHash,
+        )
+        if result["state"] == "active" and result["archiveStatus"] in ("pending", "failed"):
+            result["archiveStatus"] = archive_manual_compaction_best_effort(result)
+        return ManualCompactionResponse(**result)
+    except ManualCompactionError as exc:
+        raise _manual_compaction_http_error(exc) from exc
+
+
+@router.post(
+    "/threads/{thread_id}/compactions:cancel",
+    response_model = ManualCompactionResponse,
+)
+def cancel_thread_manual_compaction(
+    thread_id: str,
+    payload: ManualCompactionCancelRequest,
+    current_subject: str = Depends(get_current_subject),
+):
+    try:
+        return ManualCompactionResponse(
+            **cancel_manual_compaction(
+                thread_id,
+                attempt_id = payload.attemptId,
+                command_message_id = payload.commandMessageId,
+            )
+        )
+    except ManualCompactionError as exc:
+        raise _manual_compaction_http_error(exc) from exc
+
+
 @router.post("/messages:batch", response_model = ChatMessagesBatchResponse)
 def batch_thread_messages(
     payload: ChatMessagesBatchRequest, current_subject: str = Depends(get_current_subject)
@@ -1632,6 +1784,26 @@ def fork_thread(
         # threadpool lets run concurrently. Report it gone rather than as a server fault.
         raise HTTPException(status_code = 404, detail = f"Thread {thread_id} not found")
     messages = list_chat_messages(payload.newThreadId)
+    for message in messages:
+        metadata = message.get("metadata")
+        active = metadata.get("manualCompaction") if isinstance(metadata, dict) else None
+        attempt_id = active.get("attemptId") if isinstance(active, dict) else None
+        if not isinstance(attempt_id, str):
+            continue
+        try:
+            attempt = get_manual_compaction_attempt(attempt_id)
+            if (
+                attempt is not None
+                and attempt["state"] == "active"
+                and attempt["archiveStatus"] in ("pending", "failed")
+            ):
+                archive_manual_compaction_best_effort(attempt)
+        except Exception:  # noqa: BLE001 -- the fork committed before optional archive recovery
+            logger.warning(
+                "failed to recover forked manual compaction archive %s",
+                attempt_id,
+                exc_info = True,
+            )
     # Best-effort OpenAI container snapshot. Stub: a follow-up patch can
     # call /v1/containers list+download / create+upload here and patch
     # the new openaiCodeExecContainerId. For v1 we always start clean

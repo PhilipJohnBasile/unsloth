@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 import uuid
 from collections import deque
@@ -1723,6 +1725,36 @@ ContentPart = Annotated[
 # ── Messages ─────────────────────────────────────────────────────
 
 
+def stable_tool_call_id(
+    tool_name: Any, arguments: Any, assistant_ordinal: int, call_ordinal: int
+) -> str:
+    """Return the deterministic id used when a normal chat omits one."""
+    arguments_text = (
+        arguments
+        if isinstance(arguments, str)
+        else json.dumps(
+            arguments if arguments is not None else {},
+            ensure_ascii = False,
+            allow_nan = False,
+            sort_keys = True,
+            separators = (",", ":"),
+        )
+    )
+    encoded = json.dumps(
+        {
+            "name": tool_name if isinstance(tool_name, str) else "",
+            "arguments": arguments_text,
+            "assistantOrdinal": assistant_ordinal,
+            "callOrdinal": call_ordinal,
+        },
+        ensure_ascii = False,
+        allow_nan = False,
+        sort_keys = True,
+        separators = (",", ":"),
+    ).encode("utf-8")
+    return f"call_{hashlib.sha256(encoded).hexdigest()[:16]}"
+
+
 class ChatMessage(BaseModel):
     """Single message in a chat conversation.
 
@@ -1823,6 +1855,28 @@ def _normalize_permission_mode(value: Any) -> Any:
     if value not in _KNOWN_PERMISSION_MODES:
         return "ask"
     return value
+
+
+class ManualCompactionEnvelope(BaseModel):
+    """Branch and revision identity pinned by the manual compaction prepare endpoint."""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    attempt_id: str = Field(alias = "attemptId", min_length = 1, max_length = 128)
+    thread_id: str = Field(alias = "threadId", min_length = 1, max_length = 128)
+    command_message_id: str = Field(alias = "commandMessageId", min_length = 1, max_length = 128)
+    expected_head_message_id: str = Field(
+        alias = "expectedHeadMessageId", min_length = 1, max_length = 128
+    )
+    source_hash: str = Field(alias = "sourceHash", pattern = r"^[0-9a-f]{64}$")
+    request_hash: str = Field(alias = "requestHash", pattern = r"^[0-9a-f]{64}$")
+    request_message_count: int = Field(alias = "requestMessageCount", ge = 2, le = 40_000)
+    project_instruction_digest: str = Field(
+        alias = "projectInstructionDigest", pattern = r"^[0-9a-f]{64}$"
+    )
+    project_instruction_revision: int = Field(alias = "projectInstructionRevision", ge = 0)
+    context_digest: str = Field(alias = "contextDigest", pattern = r"^[0-9a-f]{64}$")
+    revision: int = Field(ge = 1)
 
 
 class ChatCompletionRequest(BaseModel):
@@ -2127,6 +2181,13 @@ class ChatCompletionRequest(BaseModel):
         None,
         description = "[x-unsloth] Conversation ID for scoping stateful tool sessions (e.g. stdio MCP); stays per-thread where session_id may be shared project-wide.",
     )
+    manual_compaction: Optional[ManualCompactionEnvelope] = Field(
+        None,
+        description = (
+            "[x-unsloth] Prepared manual /compact attempt. The backend revalidates the "
+            "stored branch before routing and forces a no-tools handoff-summary turn."
+        ),
+    )
     rag_scope: Optional[dict] = Field(
         None,
         description = (
@@ -2274,13 +2335,31 @@ class ChatCompletionRequest(BaseModel):
 
         OpenAI / Anthropic passthrough require the result id to match the
         assistant's tool_calls[].id. Prefer function.name match, else first
-        unconsumed tool_call; synth a random id only if none exists. A user
-        turn breaks the lookup.
+        unconsumed tool_call. Missing call ids use a stable transcript-derived
+        id so retries and manual-compaction integrity hashes see the same input.
+        A user turn breaks the lookup.
         """
         # Both passes below were a backwards rescan per tool result, O(n^2) for one assistant
         # with n calls. Each is now one forward pass with an index -- the same search, since
         # the backward walk never left the current user-delimited segment.
         messages = self.messages
+        assistant_ordinal = -1
+        for msg in messages:
+            if msg.role == "assistant":
+                assistant_ordinal += 1
+            if msg.role != "assistant" or not msg.tool_calls:
+                continue
+            for call_index, tool_call in enumerate(msg.tool_calls):
+                if not isinstance(tool_call, dict) or tool_call.get("id"):
+                    continue
+                function = tool_call.get("function")
+                function = function if isinstance(function, dict) else {}
+                tool_call["id"] = stable_tool_call_id(
+                    function.get("name"),
+                    function.get("arguments"),
+                    assistant_ordinal,
+                    call_index,
+                )
         # The first pass only feeds the second, so with every tool_call_id present there is
         # nothing to do (the common case).
         for msg in messages:
@@ -2372,8 +2451,18 @@ class ChatCompletionRequest(BaseModel):
                 picked = tool_calls[chosen].get("id")
                 break
             if picked is None:
-                import secrets as _secrets
-                picked = f"call_{_secrets.token_hex(8)}"
+                encoded = json.dumps(
+                    {
+                        "messageIndex": asst_idx,
+                        "name": msg.name,
+                        "content": msg.model_dump(exclude_none = True).get("content"),
+                    },
+                    ensure_ascii = False,
+                    allow_nan = False,
+                    sort_keys = True,
+                    separators = (",", ":"),
+                ).encode("utf-8")
+                picked = f"call_{hashlib.sha256(encoded).hexdigest()[:16]}"
             msg.tool_call_id = picked
         return self
 

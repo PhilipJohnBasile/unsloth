@@ -1478,6 +1478,59 @@ def has_archive(thread_id: str) -> bool:
                 pass
 
 
+def turns_archived(
+    thread_id: str,
+    turns: list[dict],
+    live: Optional[list[dict]] = None,
+    branch: Optional[list[dict]] = None,
+) -> bool:
+    """Whether every archivable turn already has a current, searchable document."""
+    if not thread_id or not turns or not enabled() or not can_archive(thread_id):
+        return False
+    from core.inference.context_window import group_turns
+
+    groups = [
+        archivable
+        for group, archivable in ((group, _archivable(group)) for group in group_turns(turns))
+        if archivable
+    ]
+    if not groups:
+        return False
+    conn = None
+    try:
+        model = config.effective_embedding_model()
+        identity = embeddings.embedding_identity(model)
+        scope = store.conversation_archive_scope(thread_id)
+        positions = _transcript_positions(thread_id, branch or live)
+        live_positions = _live_positions(live)
+        conn = rag_db.get_connection()
+        for group in groups:
+            text = render_turn(group)
+            if not text:
+                return False
+            digest = hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
+            seats = _occurrences(positions, group)
+            budget = _write_budget(positions, seats, live_positions, group)
+            if not _archived_under(
+                conn,
+                scope,
+                digest,
+                identity,
+                occurrences = budget,
+            ):
+                return False
+        return True
+    except Exception:
+        logger.debug("conversation_archive.verify_failed", exc_info = True)
+        return False
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
 def _normalise(text: str) -> str:
     """Probe text for comparison: trimmed at both ends, otherwise exactly as written.
 

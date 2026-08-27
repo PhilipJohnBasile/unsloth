@@ -104,6 +104,392 @@ _SQLITE_IN_CHUNK_SIZE = 900
 _PROJECT_WORKSPACE_SUBDIRS = ("sandbox",)
 _CHAT_ATTACHMENT_INVENTORY_VERSION = 1
 
+_MANUAL_COMPACTION_EMPTY_JSON_HASH = (
+    "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+)
+_MANUAL_COMPACTION_REQUIRED_COLUMNS = {
+    "attempt_id",
+    "thread_id",
+    "command_message_id",
+    "source_head_message_id",
+    "expected_head_message_id",
+    "source_message_ids_json",
+    "effective_source_message_ids_json",
+    "source_hash",
+    "request_hash",
+    "request_message_count",
+    "project_instruction_digest",
+    "project_instruction_revision",
+    "context_digest",
+    "archive_payload_json",
+    "archive_payload_hash",
+    "output_summary_hash",
+    "output_finish_reason",
+    "output_recorded_at",
+    "revision",
+    "state",
+    "summary_message_id",
+    "summary_hash",
+    "archive_status",
+    "created_at",
+    "started_at",
+    "lease_expires_at",
+    "cancelled_at",
+    "committed_at",
+    "terminal_reason",
+    "finished_at",
+}
+_MANUAL_COMPACTION_STATE_CHECK = "check(statein('pending','running','active','cancelled','failed'))"
+_MANUAL_COMPACTION_LIFECYCLE_CHECK = (
+    "check((state='pending'andstarted_atisnullandlease_expires_atisnull)"
+    "or(state='running'andstarted_atisnotnullandlease_expires_atisnotnull)"
+    "orstatein('active','cancelled','failed'))"
+)
+_MANUAL_COMPACTION_SUPPORTED_CHECKS = (
+    _MANUAL_COMPACTION_STATE_CHECK,
+    _MANUAL_COMPACTION_LIFECYCLE_CHECK,
+)
+
+
+def _quoted_sql_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _normalized_sql_checks(schema: str) -> list[str] | None:
+    normalized = "".join(schema.lower().split())
+    checks: list[str] = []
+    offset = 0
+    while True:
+        start = normalized.find("check(", offset)
+        if start < 0:
+            return checks
+        depth = 0
+        quote: str | None = None
+        index = start + len("check")
+        while index < len(normalized):
+            char = normalized[index]
+            if quote is not None:
+                if char == quote:
+                    if index + 1 < len(normalized) and normalized[index + 1] == quote:
+                        index += 2
+                        continue
+                    quote = None
+            elif char in ("'", '"'):
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    checks.append(normalized[start : index + 1])
+                    offset = index + 1
+                    break
+            index += 1
+        else:
+            return None
+
+
+def _manual_compactions_schema_is_compatible(columns: set[str], schema: str) -> bool:
+    normalized = "".join(schema.lower().split())
+    checks = _normalized_sql_checks(schema)
+    return bool(
+        columns >= _MANUAL_COMPACTION_REQUIRED_COLUMNS
+        and checks is not None
+        and sorted(checks) == sorted(_MANUAL_COMPACTION_SUPPORTED_CHECKS)
+        and "unique(thread_id,revision,command_message_id)" not in normalized
+    )
+
+
+def _create_manual_compactions_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS manual_compactions (
+            attempt_id TEXT NOT NULL PRIMARY KEY,
+            thread_id TEXT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+            command_message_id TEXT NOT NULL,
+            source_head_message_id TEXT NOT NULL,
+            expected_head_message_id TEXT NOT NULL,
+            source_message_ids_json TEXT NOT NULL,
+            effective_source_message_ids_json TEXT NOT NULL,
+            source_hash TEXT NOT NULL,
+            request_hash TEXT NOT NULL,
+            request_message_count INTEGER NOT NULL,
+            project_instruction_digest TEXT NOT NULL,
+            project_instruction_revision INTEGER NOT NULL,
+            context_digest TEXT NOT NULL,
+            archive_payload_json TEXT NOT NULL,
+            archive_payload_hash TEXT NOT NULL,
+            output_summary_hash TEXT,
+            output_finish_reason TEXT,
+            output_recorded_at INTEGER,
+            revision INTEGER NOT NULL,
+            state TEXT NOT NULL
+                CHECK(state IN ('pending', 'running', 'active', 'cancelled', 'failed')),
+            summary_message_id TEXT,
+            summary_hash TEXT,
+            archive_status TEXT NOT NULL DEFAULT 'pending',
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            lease_expires_at INTEGER,
+            cancelled_at INTEGER,
+            committed_at INTEGER,
+            terminal_reason TEXT,
+            finished_at INTEGER,
+            CHECK(
+                (state = 'pending' AND started_at IS NULL AND lease_expires_at IS NULL)
+                OR (state = 'running' AND started_at IS NOT NULL AND lease_expires_at IS NOT NULL)
+                OR state IN ('active', 'cancelled', 'failed')
+            )
+        )
+        """
+    )
+
+
+def _copy_manual_compaction_rows(
+    conn: sqlite3.Connection, source_table: str, source_columns: set[str]
+) -> None:
+    source = _quoted_sql_identifier(source_table)
+
+    json_columns = ["source_message_ids_json"]
+    if "effective_source_message_ids_json" in source_columns:
+        json_columns.append("effective_source_message_ids_json")
+    if "archive_payload_json" in source_columns:
+        json_columns.append("archive_payload_json")
+    selected = ", ".join(_quoted_sql_identifier(column) for column in json_columns)
+    for row in conn.execute(f"SELECT {selected} FROM {source}").fetchall():
+        for column in json_columns:
+            parsed = _strict_stored_json_loads(row[column])
+            _strict_stored_json_dumps(parsed)
+
+    def value(column: str, fallback: str) -> str:
+        return f"legacy.{_quoted_sql_identifier(column)}" if column in source_columns else fallback
+
+    zero_digest_sql = repr("0" * 64)
+    started = value("started_at", "NULL")
+    lease = value("lease_expires_at", "NULL")
+    state = value("state", "'failed'")
+    active_provenance_columns = {
+        "output_summary_hash",
+        "output_finish_reason",
+        "output_recorded_at",
+        "summary_message_id",
+        "summary_hash",
+        "committed_at",
+    }
+    active_is_complete = (
+        f"{value('output_summary_hash', 'NULL')} IS NOT NULL "
+        f"AND {value('output_finish_reason', 'NULL')} = 'stop' "
+        f"AND {value('output_recorded_at', 'NULL')} IS NOT NULL "
+        f"AND {value('summary_message_id', 'NULL')} IS NOT NULL "
+        f"AND {value('summary_hash', 'NULL')} = {value('output_summary_hash', 'NULL')} "
+        f"AND {value('committed_at', 'NULL')} IS NOT NULL"
+        if source_columns >= active_provenance_columns
+        else "0"
+    )
+    mapped_state = (
+        "CASE "
+        f"WHEN {state} = 'active' AND {active_is_complete} THEN 'active' "
+        f"WHEN {state} = 'running' AND {started} IS NOT NULL AND {lease} IS NOT NULL "
+        "THEN 'running' "
+        f"WHEN {state} = 'pending' THEN 'pending' "
+        f"WHEN {state} = 'cancelled' THEN 'cancelled' "
+        "ELSE 'failed' END"
+    )
+    raw_archive_status = value("archive_status", "'pending'")
+    archive_status = (
+        f"CASE WHEN {mapped_state} = 'active' AND {raw_archive_status} "
+        "IN ('pending', 'failed', 'skipped', 'archived') "
+        f"THEN {raw_archive_status} ELSE 'pending' END"
+    )
+    terminal_reason = (
+        f"CASE WHEN {mapped_state} = 'cancelled' THEN 'migrated_cancelled' "
+        f"WHEN {mapped_state} = 'failed' THEN 'migrated_failed' ELSE NULL END"
+    )
+    finished_at = (
+        f"CASE WHEN {mapped_state} IN ('cancelled', 'failed') THEN "
+        f"COALESCE({value('finished_at', 'NULL')}, {value('cancelled_at', 'NULL')}, "
+        f"{value('committed_at', 'NULL')}, {value('created_at', '1')}) ELSE NULL END"
+    )
+    conn.execute(
+        f"""
+        INSERT OR IGNORE INTO manual_compactions (
+            attempt_id, thread_id, command_message_id, source_head_message_id,
+            expected_head_message_id, source_message_ids_json,
+            effective_source_message_ids_json, source_hash, request_hash,
+            request_message_count, project_instruction_digest,
+            project_instruction_revision, context_digest, archive_payload_json,
+            archive_payload_hash, output_summary_hash, output_finish_reason,
+            output_recorded_at, revision, state, summary_message_id, summary_hash,
+            archive_status, created_at, started_at, lease_expires_at, cancelled_at,
+            committed_at, terminal_reason, finished_at
+        )
+        SELECT
+            legacy.attempt_id, legacy.thread_id, legacy.command_message_id,
+            legacy.source_head_message_id, legacy.expected_head_message_id,
+            legacy.source_message_ids_json,
+            {value("effective_source_message_ids_json", "legacy.source_message_ids_json")},
+            legacy.source_hash,
+            COALESCE({value("request_hash", "NULL")}, legacy.source_hash),
+            COALESCE({value("request_message_count", "NULL")}, 2),
+            COALESCE({value("project_instruction_digest", "NULL")}, {zero_digest_sql}),
+            COALESCE({value("project_instruction_revision", "NULL")}, 0),
+            COALESCE({value("context_digest", "NULL")}, {zero_digest_sql}),
+            {value("archive_payload_json", "'[]'")},
+            {value("archive_payload_hash", repr(_MANUAL_COMPACTION_EMPTY_JSON_HASH))},
+            CASE WHEN {mapped_state} = 'pending' THEN NULL
+                ELSE {value("output_summary_hash", "NULL")} END,
+            CASE WHEN {mapped_state} = 'pending' THEN NULL
+                ELSE {value("output_finish_reason", "NULL")} END,
+            CASE WHEN {mapped_state} = 'pending' THEN NULL
+                ELSE {value("output_recorded_at", "NULL")} END,
+            legacy.revision, {mapped_state},
+            CASE WHEN {mapped_state} = 'active'
+                THEN {value("summary_message_id", "NULL")} ELSE NULL END,
+            CASE WHEN {mapped_state} = 'active'
+                THEN {value("summary_hash", "NULL")} ELSE NULL END,
+            {archive_status}, legacy.created_at,
+            CASE WHEN {mapped_state} = 'pending' THEN NULL
+                WHEN {mapped_state} = 'active'
+                    THEN COALESCE({started}, {value("committed_at", "NULL")}, legacy.created_at)
+                ELSE {started} END,
+            CASE WHEN {mapped_state} = 'running' THEN {lease} ELSE NULL END,
+            CASE WHEN {mapped_state} = 'cancelled' THEN
+                COALESCE({value("cancelled_at", "NULL")}, {value("finished_at", "NULL")}, legacy.created_at)
+                ELSE NULL END,
+            CASE WHEN {mapped_state} = 'active' THEN {value("committed_at", "NULL")}
+                ELSE NULL END,
+            {terminal_reason}, {finished_at}
+        FROM {source} AS legacy
+        JOIN chat_threads AS thread ON thread.id = legacy.thread_id
+        """
+    )
+
+
+def _ensure_manual_compactions_schema(conn: sqlite3.Connection) -> None:
+    """Evolve manual compactions atomically and recover any legacy orphan left by old builds."""
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        tables = {
+            str(row["name"]): str(row["sql"] or "")
+            for row in conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+                "AND (name = 'manual_compactions' OR name LIKE 'manual_compactions%legacy%')"
+            ).fetchall()
+        }
+        current_columns = (
+            {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(manual_compactions)").fetchall()
+            }
+            if "manual_compactions" in tables
+            else set()
+        )
+        current_compatible = _manual_compactions_schema_is_compatible(
+            current_columns,
+            tables.get("manual_compactions", ""),
+        )
+        preserved_attempt_ids = (
+            {
+                str(row["attempt_id"])
+                for row in conn.execute("SELECT attempt_id FROM manual_compactions").fetchall()
+            }
+            if current_compatible
+            else set()
+        )
+        sources: dict[str, set[str]] = {}
+        if "manual_compactions" in tables and not current_compatible:
+            suffix = 0
+            while True:
+                candidate = "manual_compactions_lifecycle_legacy"
+                if suffix:
+                    candidate += f"_{suffix}"
+                if candidate not in tables:
+                    break
+                suffix += 1
+            conn.execute(
+                "ALTER TABLE manual_compactions RENAME TO " + _quoted_sql_identifier(candidate)
+            )
+            sources[candidate] = current_columns
+            tables[candidate] = tables.pop("manual_compactions")
+        for name in tables:
+            if name == "manual_compactions":
+                continue
+            sources.setdefault(
+                name,
+                {
+                    str(row["name"])
+                    for row in conn.execute(
+                        f"PRAGMA table_info({_quoted_sql_identifier(name)})"
+                    ).fetchall()
+                },
+            )
+
+        _create_manual_compactions_table(conn)
+        conn.execute("DROP INDEX IF EXISTS idx_manual_compactions_thread_state")
+        conn.execute("DROP INDEX IF EXISTS idx_manual_compactions_live_branch")
+        for name, columns in sorted(sources.items(), key = lambda item: len(item[1]), reverse = True):
+            _copy_manual_compaction_rows(conn, name, columns)
+        for name in sources:
+            conn.execute("DROP TABLE " + _quoted_sql_identifier(name))
+        duplicate_branches = conn.execute(
+            "SELECT thread_id, revision, command_message_id "
+            "FROM manual_compactions WHERE state IN ('pending', 'running', 'active') "
+            "GROUP BY thread_id, revision, command_message_id HAVING COUNT(*) > 1"
+        ).fetchall()
+        state_rank = {"active": 0, "running": 1, "pending": 2}
+        for duplicate in duplicate_branches:
+            rows = conn.execute(
+                "SELECT attempt_id, state, committed_at, started_at, created_at "
+                "FROM manual_compactions WHERE thread_id = ? AND revision = ? "
+                "AND command_message_id = ? AND state IN ('pending', 'running', 'active')",
+                (
+                    duplicate["thread_id"],
+                    duplicate["revision"],
+                    duplicate["command_message_id"],
+                ),
+            ).fetchall()
+            winner = min(
+                rows,
+                key = lambda row: (
+                    0 if str(row["attempt_id"]) in preserved_attempt_ids else 1,
+                    state_rank.get(str(row["state"]), 3),
+                    -int(row["committed_at"] or row["started_at"] or row["created_at"] or 0),
+                    str(row["attempt_id"]),
+                ),
+            )
+            for row in rows:
+                if row["attempt_id"] == winner["attempt_id"]:
+                    continue
+                conn.execute(
+                    "UPDATE manual_compactions SET state = 'failed', lease_expires_at = NULL, "
+                    "terminal_reason = 'migrated_duplicate_live_branch', "
+                    "finished_at = COALESCE(finished_at, created_at), "
+                    "archive_status = 'pending', "
+                    "source_message_ids_json = '[]', effective_source_message_ids_json = '[]', "
+                    "archive_payload_json = '[]', archive_payload_hash = ? "
+                    "WHERE attempt_id = ?",
+                    (_MANUAL_COMPACTION_EMPTY_JSON_HASH, row["attempt_id"]),
+                )
+        from core.manual_compaction import (
+            reconcile_all_manual_compaction_attempts_in_connection,
+        )
+
+        reconcile_all_manual_compaction_attempts_in_connection(conn)
+        conn.execute(
+            "CREATE INDEX idx_manual_compactions_thread_state "
+            "ON manual_compactions(thread_id, state, revision)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_manual_compactions_live_branch "
+            "ON manual_compactions(thread_id, revision, command_message_id) "
+            "WHERE state IN ('pending', 'running', 'active')"
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
 
 def _project_slug(name: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip()).strip(".-_")
@@ -336,8 +722,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_api_usage_events_created_at "
-        "ON api_usage_events(created_at)"
+        "CREATE INDEX IF NOT EXISTS idx_api_usage_events_created_at ON api_usage_events(created_at)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_api_usage_events_subject_created_at "
@@ -493,6 +878,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_manual_compactions_schema(conn)
     tombstone_schema = """
         CREATE TABLE chat_attachment_tombstones (
             thread_id TEXT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
@@ -1776,6 +2162,31 @@ def _json_loads(value: str | None, fallback):
         return fallback
 
 
+def _reject_non_rfc_json_constant(value: str) -> None:
+    raise ValueError(f"Non-RFC JSON constant {value!r}")
+
+
+def _strict_stored_json_loads(value: str) -> Any:
+    value.encode("utf-8", errors = "strict")
+    return json.loads(value, parse_constant = _reject_non_rfc_json_constant)
+
+
+def _strict_stored_json_dumps(value: Any, *, sort_keys: bool = False) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii = False,
+        allow_nan = False,
+        sort_keys = sort_keys,
+        separators = (",", ":"),
+    )
+
+
+def _strict_optional_stored_json_loads(value: str | None, fallback: Any) -> Any:
+    if value is None:
+        return fallback
+    return _strict_stored_json_loads(value)
+
+
 def _chat_thread_from_row(row: sqlite3.Row, include_settings: bool = True) -> dict:
     data = dict(row)
     thread = {
@@ -1823,11 +2234,11 @@ def _chat_message_from_row(row: sqlite3.Row) -> dict:
         "threadId": data["thread_id"],
         "parentId": data.get("parent_id"),
         "role": data["role"],
-        "content": _json_loads(data.get("content_json"), []),
+        "content": _strict_stored_json_loads(data["content_json"]),
         "createdAt": data["created_at"],
     }
-    attachments = _json_loads(data.get("attachments_json"), None)
-    metadata = _json_loads(data.get("metadata_json"), None)
+    attachments = _strict_optional_stored_json_loads(data.get("attachments_json"), None)
+    metadata = _strict_optional_stored_json_loads(data.get("metadata_json"), None)
     if attachments is not None:
         message["attachments"] = attachments
     if metadata is not None:
@@ -2920,6 +3331,80 @@ def _server_managed_message_ids(conn: sqlite3.Connection, thread_id: str) -> set
     return _research_message_ids(conn, thread_id) | _generation_message_ids(conn, thread_id)
 
 
+def _active_manual_compaction_message_ids(conn: sqlite3.Connection, thread_id: str) -> set[str]:
+    protected: set[str] = set()
+    for row in conn.execute(
+        "SELECT source_message_ids_json, command_message_id, summary_message_id "
+        "FROM manual_compactions WHERE thread_id = ? AND state = 'active'",
+        (thread_id,),
+    ).fetchall():
+        try:
+            source_ids = _strict_stored_json_loads(row["source_message_ids_json"])
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise ChatMessageProtectedError("active manual compaction ancestry is corrupt") from exc
+        if not isinstance(source_ids, list) or not all(
+            isinstance(message_id, str) and message_id for message_id in source_ids
+        ):
+            raise ChatMessageProtectedError("active manual compaction ancestry is corrupt")
+        protected.update(source_ids)
+        protected.add(str(row["command_message_id"]))
+        if row["summary_message_id"] is not None:
+            protected.add(str(row["summary_message_id"]))
+
+    rows = conn.execute(
+        "SELECT id, parent_id, metadata_json FROM chat_messages WHERE thread_id = ?",
+        (thread_id,),
+    ).fetchall()
+    parents = {
+        str(row["id"]): (str(row["parent_id"]) if row["parent_id"] else None) for row in rows
+    }
+    for row in rows:
+        try:
+            metadata = (
+                _strict_stored_json_loads(row["metadata_json"])
+                if row["metadata_json"] is not None
+                else None
+            )
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise ChatMessageProtectedError(
+                "manual compaction message metadata is corrupt"
+            ) from exc
+        active = metadata.get("manualCompaction") if isinstance(metadata, dict) else None
+        if not (
+            isinstance(active, dict)
+            and active.get("schemaVersion") == 1
+            and active.get("state") == "active"
+        ):
+            continue
+        summary_id = str(row["id"])
+        command_id = active.get("commandMessageId")
+        source_head_id = active.get("sourceHeadMessageId")
+        protected.add(summary_id)
+        if isinstance(command_id, str):
+            protected.add(command_id)
+        cursor = source_head_id if isinstance(source_head_id, str) else None
+        seen: set[str] = set()
+        while cursor is not None and cursor not in seen:
+            seen.add(cursor)
+            protected.add(cursor)
+            cursor = parents.get(cursor)
+    return protected
+
+
+def _guard_active_manual_compaction_messages(
+    conn: sqlite3.Connection, thread_id: str, messages: list[dict]
+) -> set[str]:
+    protected = _active_manual_compaction_message_ids(conn, thread_id)
+    for message in messages:
+        if str(message["id"]) in protected and _research_message_would_change(
+            conn, thread_id, message
+        ):
+            raise ChatMessageProtectedError(
+                "active manual compaction checkpoint messages cannot be edited"
+            )
+    return protected
+
+
 def _surviving_parent_id(
     conn: sqlite3.Connection, thread_id: str, message_id: str, pruned: set
 ) -> "str | None":
@@ -2967,7 +3452,7 @@ def _research_message_would_change(
         return False
 
     def canon(value: object) -> str | None:
-        return json.dumps(value, sort_keys = True) if value is not None else None
+        return _strict_stored_json_dumps(value, sort_keys = True) if value is not None else None
 
     stored_parent = row["parent_id"] or None
     sent_parent = message.get("parentId") or None
@@ -2982,11 +3467,11 @@ def _research_message_would_change(
     # unchanged body but a different timestamp and silently reorder the research prompt/response
     # pair. Absent createdAt defaults to the stored value (a no-op re-sync).
     return (
-        canon(message.get("content", [])) != canon(json.loads(row["content_json"] or "[]"))
+        canon(message.get("content", [])) != canon(_strict_stored_json_loads(row["content_json"]))
         or canon(message.get("metadata"))
-        != canon(json.loads(row["metadata_json"]) if row["metadata_json"] else None)
+        != canon(_strict_optional_stored_json_loads(row["metadata_json"], None))
         or canon(message.get("attachments"))
-        != canon(json.loads(row["attachments_json"]) if row["attachments_json"] else None)
+        != canon(_strict_optional_stored_json_loads(row["attachments_json"], None))
         or parent_changed
         or str(message.get("role")) != str(row["role"])
         or int(message.get("createdAt", row["created_at"])) != int(row["created_at"])
@@ -3018,14 +3503,14 @@ def _safe_generation_assistant_update(
     if int(message.get("createdAt", row["created_at"])) != int(row["created_at"]):
         return False
 
-    stored_attachments = json.loads(row["attachments_json"]) if row["attachments_json"] else None
-    if json.dumps(message.get("attachments"), sort_keys = True) != json.dumps(
-        stored_attachments, sort_keys = True
-    ):
+    stored_attachments = _strict_optional_stored_json_loads(row["attachments_json"], None)
+    if _strict_stored_json_dumps(
+        message.get("attachments"), sort_keys = True
+    ) != _strict_stored_json_dumps(stored_attachments, sort_keys = True):
         return False
 
     incoming = message.get("metadata")
-    stored = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
+    stored = _strict_optional_stored_json_loads(row["metadata_json"], {})
     if not isinstance(incoming, dict) or not isinstance(stored, dict):
         return False
     if incoming.get("serverManaged") is not True:
@@ -3044,9 +3529,9 @@ def _safe_generation_assistant_update(
         or incoming_seq > int(row["last_event_seq"])
     ):
         return False
-    if incoming_seq == stored_seq and json.dumps(
+    if incoming_seq == stored_seq and _strict_stored_json_dumps(
         message.get("content", []), sort_keys = True
-    ) != json.dumps(json.loads(row["content_json"] or "[]"), sort_keys = True):
+    ) != _strict_stored_json_dumps(_strict_stored_json_loads(row["content_json"]), sort_keys = True):
         return False
 
     # A settled terminal row is immutable. Repeated repository syncs may send
@@ -3135,7 +3620,7 @@ def _detach_terminal_generation_for_edit(
     ).fetchone()
     if row is None or str(row["run_status"]) not in _GENERATION_TERMINAL_STATUSES:
         return False
-    stored_metadata = json.loads(row["metadata_json"]) if row["metadata_json"] else {}
+    stored_metadata = _strict_optional_stored_json_loads(row["metadata_json"], {})
     incoming_metadata = message.get("metadata")
     if (
         not isinstance(stored_metadata, dict)
@@ -3149,10 +3634,10 @@ def _detach_terminal_generation_for_edit(
         or int(message.get("createdAt", row["created_at"])) != int(row["created_at"])
     ):
         return False
-    stored_attachments = json.loads(row["attachments_json"]) if row["attachments_json"] else None
-    if json.dumps(message.get("attachments"), sort_keys = True) != json.dumps(
-        stored_attachments, sort_keys = True
-    ):
+    stored_attachments = _strict_optional_stored_json_loads(row["attachments_json"], None)
+    if _strict_stored_json_dumps(
+        message.get("attachments"), sort_keys = True
+    ) != _strict_stored_json_dumps(stored_attachments, sort_keys = True):
         return False
     conn.execute("DELETE FROM chat_generation_runs WHERE id = ?", (row["run_id"],))
     return True
@@ -3195,10 +3680,8 @@ def _content_part_id(part: dict) -> Optional[str]:
     payload = _managed_content_part_payload(part)
     if payload is None:
         return None
-    canonical = json.dumps(
+    canonical = _strict_stored_json_dumps(
         payload,
-        ensure_ascii = False,
-        separators = (",", ":"),
         sort_keys = True,
     ).encode("utf-8")
     return f"{_CONTENT_PART_ID_PREFIX}{hashlib.sha256(canonical).hexdigest()}"
@@ -3267,7 +3750,7 @@ def _chat_attachment_inventory_entries(
     tombstones: Optional[set[str]] = None,
 ) -> list[dict]:
     tombstones = tombstones or set()
-    attachments = _json_loads(attachments_json, None)
+    attachments = _strict_optional_stored_json_loads(attachments_json, None)
     if not isinstance(attachments, list):
         attachments = []
     attachments = [
@@ -3462,6 +3945,7 @@ def upsert_chat_message(
             raise ChatMessageProtectedError(
                 "deleted server-managed generation messages cannot be restored"
             )
+        _guard_active_manual_compaction_messages(conn, message["threadId"], [message])
         if allow_generation_edit:
             _detach_terminal_generation_for_edit(conn, message["threadId"], message)
         _guard_server_managed_messages(
@@ -3484,9 +3968,9 @@ def upsert_chat_message(
             message,
             tombstones.get(message["id"], set()),
         )
-        content_json = json.dumps(reconciled.get("content", []))
+        content_json = _strict_stored_json_dumps(reconciled.get("content", []))
         attachments_json = (
-            json.dumps(reconciled.get("attachments"))
+            _strict_stored_json_dumps(reconciled.get("attachments"))
             if reconciled.get("attachments") is not None
             else None
         )
@@ -3511,7 +3995,7 @@ def upsert_chat_message(
                 reconciled["role"],
                 content_json,
                 attachments_json,
-                json.dumps(reconciled.get("metadata"))
+                _strict_stored_json_dumps(reconciled.get("metadata"))
                 if reconciled.get("metadata") is not None
                 else None,
                 int(reconciled["createdAt"]),
@@ -3567,6 +4051,11 @@ def sync_chat_messages(
         generation_ids = _generation_message_ids(conn, thread_id)
         managed_ids = research_ids | generation_ids
         requested_ids = {str(m["id"]) for m in messages}
+        active_compaction_ids = _guard_active_manual_compaction_messages(conn, thread_id, messages)
+        if prune_missing and active_compaction_ids - requested_ids:
+            raise ChatMessageProtectedError(
+                "active manual compaction checkpoint messages cannot be pruned"
+            )
         # Snapshot pruning is not delete intent: terminal generation messages may be absent from
         # a stale client snapshot and must survive unless the delete flow names them explicitly.
         explicitly_deleted_ids = {str(message_id) for message_id in deleted_message_ids}
@@ -3635,8 +4124,10 @@ def sync_chat_messages(
         serialized_messages = [
             (
                 m,
-                json.dumps(m.get("content", [])),
-                json.dumps(m.get("attachments")) if m.get("attachments") is not None else None,
+                _strict_stored_json_dumps(m.get("content", [])),
+                _strict_stored_json_dumps(m.get("attachments"))
+                if m.get("attachments") is not None
+                else None,
             )
             for m in reconciled_messages
         ]
@@ -3662,7 +4153,9 @@ def sync_chat_messages(
                     m["role"],
                     content_json,
                     attachments_json,
-                    json.dumps(m.get("metadata")) if m.get("metadata") is not None else None,
+                    _strict_stored_json_dumps(m.get("metadata"))
+                    if m.get("metadata") is not None
+                    else None,
                     int(m["createdAt"]),
                 )
                 for m, content_json, attachments_json in serialized_messages
@@ -3760,8 +4253,8 @@ _SERVER_MANAGED_LINK_KEYS = _RESEARCH_LINK_KEYS | {
 def _detach_research_message_json(
     content_json: str, metadata_json: str | None
 ) -> tuple[str, str | None]:
-    content = _json_loads(content_json, [])
-    metadata = _json_loads(metadata_json, None)
+    content = _strict_stored_json_loads(content_json)
+    metadata = _strict_optional_stored_json_loads(metadata_json, None)
     custom = metadata.get("custom") if isinstance(metadata, dict) else None
     linked = (
         isinstance(metadata, dict)
@@ -3794,8 +4287,8 @@ def _detach_research_message_json(
                 key: value for key, value in custom.items() if key not in _SERVER_MANAGED_LINK_KEYS
             }
     return (
-        json.dumps(content, ensure_ascii = False),
-        json.dumps(metadata, ensure_ascii = False) if metadata is not None else None,
+        json.dumps(content, ensure_ascii = False, allow_nan = False),
+        json.dumps(metadata, ensure_ascii = False, allow_nan = False) if metadata is not None else None,
     )
 
 
@@ -3852,6 +4345,19 @@ def fork_chat_thread(
         ancestry.reverse()  # root .. branch msg
         # Map old msg id -> new msg id for parent_id rewriting.
         id_map: dict[str, str] = {row["id"]: id_factory() for row in ancestry}
+        # Active manual summaries carry message ids and a hash of the cloned ancestry.
+        # Re-key both or a fork looks like it belongs to the source thread and its next
+        # compaction either reuses the wrong revision or fails hash validation.
+        from core.manual_compaction import (
+            _attempt_from_row,
+            rewrite_forked_manual_compaction_metadata,
+        )
+
+        rewritten_compaction_metadata = rewrite_forked_manual_compaction_metadata(
+            source_rows = ancestry,
+            id_map = id_map,
+            new_thread_id = new_thread_id,
+        )
         src_dict = dict(src)
         conn.execute(
             """
@@ -3880,6 +4386,11 @@ def fork_chat_thread(
             content_json, metadata_json = _detach_research_message_json(
                 row["content_json"], row["metadata_json"]
             )
+            attachments = _strict_optional_stored_json_loads(row["attachments_json"], None)
+            attachments_json = (
+                _strict_stored_json_dumps(attachments) if attachments is not None else None
+            )
+            metadata_json = rewritten_compaction_metadata.get(row["id"], metadata_json)
             fork_messages.append(
                 (
                     id_map[row["id"]],
@@ -3887,7 +4398,7 @@ def fork_chat_thread(
                     id_map.get(row["parent_id"]) if row["parent_id"] else None,
                     row["role"],
                     content_json,
-                    row["attachments_json"],
+                    attachments_json,
                     metadata_json,
                     int(row["created_at"]),
                 )
@@ -3901,6 +4412,76 @@ def fork_chat_thread(
             """,
             fork_messages,
         )
+        for old_summary_id, rewritten_json in rewritten_compaction_metadata.items():
+            old_summary = next(row for row in ancestry if row["id"] == old_summary_id)
+            old_metadata = _strict_optional_stored_json_loads(old_summary["metadata_json"], {})
+            old_active = old_metadata.get("manualCompaction")
+            new_metadata = _strict_stored_json_loads(rewritten_json)
+            new_active = new_metadata.get("manualCompaction")
+            if not isinstance(old_active, dict) or not isinstance(new_active, dict):
+                raise ChatMessageProtectedError("forked manual compaction metadata is invalid")
+            old_attempt = conn.execute(
+                "SELECT * FROM manual_compactions WHERE attempt_id = ? AND state = 'active'",
+                (old_active.get("attemptId"),),
+            ).fetchone()
+            if old_attempt is None:
+                raise ChatMessageProtectedError("forked manual compaction attempt is missing")
+            old_attempt_data = _attempt_from_row(old_attempt)
+            old_source_ids = old_attempt_data["sourceMessageIds"]
+            old_effective_ids = old_attempt_data["effectiveSourceMessageIds"]
+            if not (
+                isinstance(old_source_ids, list)
+                and isinstance(old_effective_ids, list)
+                and all(str(message_id) in id_map for message_id in old_source_ids)
+                and all(str(message_id) in id_map for message_id in old_effective_ids)
+            ):
+                raise ChatMessageProtectedError("forked manual compaction ancestry is incomplete")
+            conn.execute(
+                """
+                INSERT INTO manual_compactions (
+                    attempt_id, thread_id, command_message_id, source_head_message_id,
+                    expected_head_message_id, source_message_ids_json,
+                    effective_source_message_ids_json, source_hash, request_hash,
+                    request_message_count, project_instruction_digest,
+                    project_instruction_revision, context_digest, archive_payload_json,
+                    archive_payload_hash, output_summary_hash, output_finish_reason,
+                    output_recorded_at, revision, state,
+                    summary_message_id, summary_hash, archive_status, created_at,
+                    started_at, committed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    new_active["attemptId"],
+                    new_thread_id,
+                    new_active["commandMessageId"],
+                    new_active["sourceHeadMessageId"],
+                    id_map[str(old_attempt["expected_head_message_id"])],
+                    _strict_stored_json_dumps(
+                        [id_map[str(message_id)] for message_id in old_source_ids]
+                    ),
+                    _strict_stored_json_dumps(
+                        [id_map[str(message_id)] for message_id in old_effective_ids]
+                    ),
+                    new_active["sourceHash"],
+                    old_attempt_data["requestHash"],
+                    old_attempt_data["requestMessageCount"],
+                    old_attempt_data["projectInstructionDigest"],
+                    old_attempt_data["projectInstructionRevision"],
+                    old_attempt_data["contextDigest"],
+                    _strict_stored_json_dumps(old_attempt_data["archivePayload"], sort_keys = True),
+                    old_attempt_data["archivePayloadHash"],
+                    old_attempt_data["outputSummaryHash"],
+                    old_attempt_data["outputFinishReason"],
+                    old_attempt_data["outputRecordedAt"],
+                    new_active["revision"],
+                    new_active["summaryMessageId"],
+                    new_active["summaryHash"],
+                    "pending",
+                    old_attempt_data["createdAt"],
+                    old_attempt_data["startedAt"],
+                    old_attempt_data["committedAt"],
+                ),
+            )
         for row in ancestry:
             _replace_chat_attachment_inventory(
                 conn,
@@ -4050,7 +4631,7 @@ def _content_part_attachments(content_json: Optional[str]) -> list[dict]:
     Exact duplicate blobs intentionally share one inventory id. Deleting that
     id removes every identical copy, avoiding ambiguous index-based addressing.
     """
-    content = _json_loads(content_json, None)
+    content = _strict_optional_stored_json_loads(content_json, None)
     if not isinstance(content, list):
         return []
     out: list[dict] = []
@@ -4164,7 +4745,7 @@ def get_chat_attachment(message_id: str, attachment_id: str) -> Optional[dict]:
         conn.close()
     if row is None or row["tombstoned"]:
         return None
-    attachments = _json_loads(row["attachments_json"], None)
+    attachments = _strict_optional_stored_json_loads(row["attachments_json"], None)
     if isinstance(attachments, list):
         for attachment in attachments:
             if isinstance(attachment, dict) and str(attachment.get("id") or "") == attachment_id:
@@ -4221,13 +4802,14 @@ def delete_chat_attachment(message_id: str, attachment_id: str) -> bool:
         protected_message_ids = _server_managed_message_ids(
             conn, str(row["thread_id"])
         ) - _terminal_generation_message_ids(conn, str(row["thread_id"]))
+        protected_message_ids |= _active_manual_compaction_message_ids(conn, str(row["thread_id"]))
         if str(message_id) in protected_message_ids:
             conn.rollback()
             raise ChatMessageProtectedError(
                 "Research prompts and responses are server-managed and cannot be edited"
             )
 
-        attachments = _json_loads(row["attachments_json"], None)
+        attachments = _strict_optional_stored_json_loads(row["attachments_json"], None)
         updated_attachments_json = row["attachments_json"]
         deleted_attachment = False
         if isinstance(attachments, list):
@@ -4241,9 +4823,9 @@ def delete_chat_attachment(message_id: str, attachment_id: str) -> bool:
             ]
             deleted_attachment = len(remaining_attachments) != len(attachments)
             if deleted_attachment:
-                updated_attachments_json = json.dumps(remaining_attachments)
+                updated_attachments_json = _strict_stored_json_dumps(remaining_attachments)
 
-        content = _json_loads(row["content_json"], None)
+        content = _strict_stored_json_loads(row["content_json"])
         updated_content_json = row["content_json"]
         deleted_content = False
         if attachment_id.startswith(_CONTENT_PART_ID_PREFIX) and isinstance(content, list):
@@ -4254,7 +4836,7 @@ def delete_chat_attachment(message_id: str, attachment_id: str) -> bool:
             ]
             deleted_content = len(remaining_content) != len(content)
             if deleted_content:
-                updated_content_json = json.dumps(remaining_content)
+                updated_content_json = _strict_stored_json_dumps(remaining_content)
 
         if not deleted_attachment and not deleted_content:
             conn.rollback()

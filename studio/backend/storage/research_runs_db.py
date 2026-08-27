@@ -45,6 +45,21 @@ def _loads(value: str | None, fallback: Any) -> Any:
         return fallback
 
 
+def _reject_non_rfc_json_constant(value: str) -> None:
+    raise ValueError(f"Non-RFC JSON constant {value!r}")
+
+
+def _strict_message_loads(value: str | None, fallback: Any) -> Any:
+    if value is None:
+        return fallback
+    value.encode("utf-8", errors = "strict")
+    return json.loads(value, parse_constant = _reject_non_rfc_json_constant)
+
+
+def _strict_message_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii = False, allow_nan = False)
+
+
 def _event_locked(conn: sqlite3.Connection, run_id: str, event_type: str, data: dict) -> int:
     row = conn.execute(
         "SELECT next_event_seq, retry_count FROM research_runs WHERE id = ?", (run_id,)
@@ -159,7 +174,7 @@ def _bind_assistant_locked(
                 assistant_message_id,
                 thread_id,
                 user_message_id,
-                json.dumps(metadata, ensure_ascii = False),
+                _strict_message_dumps(metadata),
                 created,
             ),
         )
@@ -168,7 +183,7 @@ def _bind_assistant_locked(
             (created, thread_id),
         )
         return
-    existing_metadata = _loads(message["metadata_json"], {})
+    existing_metadata = _strict_message_loads(message["metadata_json"], {})
     existing_run_id = (
         existing_metadata.get("researchRunId") if isinstance(existing_metadata, dict) else None
     )
@@ -182,7 +197,7 @@ def _bind_assistant_locked(
             or part.get("type") == "source"
         )
         and part.get("researchRunId") is None
-        for part in _loads(message["content_json"], [])
+        for part in _strict_message_loads(message["content_json"], [])
     )
     if (
         message["thread_id"] != thread_id
@@ -196,7 +211,7 @@ def _bind_assistant_locked(
     merged_metadata.update(metadata)
     conn.execute(
         "UPDATE chat_messages SET metadata_json=? WHERE id=?",
-        (json.dumps(merged_metadata, ensure_ascii = False), assistant_message_id),
+        (_strict_message_dumps(merged_metadata), assistant_message_id),
     )
 
 
@@ -280,14 +295,14 @@ def _unbind_assistant_locked(
     ).fetchone()
     if row is None:
         return
-    metadata = _loads(row["metadata_json"], {})
+    metadata = _strict_message_loads(row["metadata_json"], {})
     if not isinstance(metadata, dict):
         return
     for key in ("researchRunId", "researchStatus", "researchPlanRevision", "serverManaged"):
         metadata.pop(key, None)
     conn.execute(
         "UPDATE chat_messages SET metadata_json=? WHERE id=?",
-        (json.dumps(metadata, ensure_ascii = False), previous_id),
+        (_strict_message_dumps(metadata), previous_id),
     )
 
 
@@ -520,7 +535,7 @@ def _discover_assistant_locked(conn: sqlite3.Connection, run: sqlite3.Row) -> st
         (run["thread_id"], run["user_message_id"]),
     ).fetchall()
     for message in rows:
-        metadata = _loads(message["metadata_json"], {})
+        metadata = _strict_message_loads(message["metadata_json"], {})
         if isinstance(metadata, dict) and metadata.get("researchRunId") == run["id"]:
             message_id = str(message["id"])
             conn.execute(
@@ -618,8 +633,8 @@ def create_and_bind_terminal_fallback(
                 message_id,
                 run["thread_id"],
                 run["user_message_id"],
-                json.dumps(parts, ensure_ascii = False),
-                json.dumps(metadata, ensure_ascii = False),
+                _strict_message_dumps(parts),
+                _strict_message_dumps(metadata),
                 created,
             ),
         )

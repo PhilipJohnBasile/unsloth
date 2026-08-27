@@ -49,7 +49,16 @@ test("a tool call is left to the wire shape, not counted as payload up front", (
 });
 
 test("a turn that finished on reasoning alone keeps its prompt", () => {
-  assert.match(adapter, /function assistantTurnEndedEarly\(/);
+  const start = adapter.indexOf("function serializeAssistantReplayMessages(");
+  const end = adapter.indexOf("function toOpenAIMessages(");
+  assert.ok(start > 0 && end > start);
+  const serializer = adapter.slice(start, end);
+  assert.match(
+    serializer,
+    /content: hasContent\s*\? buildReplayContent\([\s\S]*?\)\s*: ""/,
+  );
+  assert.match(serializer, /if \(!hasContent\) \{\s*assistantMessage\.content = null/);
+  assert.match(serializer, /assistantMessage\.reasoning_content = reasoningContent/);
   assert.match(adapter, /!assistantTurnEndedEarly\(message\) &&/);
 });
 
