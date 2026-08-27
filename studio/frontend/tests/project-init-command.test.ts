@@ -213,6 +213,10 @@ test("guidance panel keeps successful sections when one refresh fails", async ()
   assert.doesNotMatch(panel, /setInstructions\(null\)/);
   assert.doesNotMatch(panel, /setSkills\(null\)/);
   assert.doesNotMatch(panel, /setRules\(null\)/);
+  assert.ok(
+    panel.indexOf("{unavailable ? (") <
+      panel.indexOf("rules && rules.rules.length > 0"),
+  );
 });
 
 test("adapter intercepts init before inference and token counts carry workspace identity", async () => {

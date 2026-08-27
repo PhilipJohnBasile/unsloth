@@ -304,9 +304,13 @@ function RulesCard({
   return (
     <div className="rounded-xl bg-background/70 px-3 py-2">
       <p className="text-xs font-medium text-foreground">
-        Command rules{rules ? ` (${rules.rules.length})` : ""}
+        Command rules{!unavailable && rules ? ` (${rules.rules.length})` : ""}
       </p>
-      {rules && rules.rules.length > 0 ? (
+      {unavailable ? (
+        <p className="mt-1 text-xs text-muted-foreground">
+          Command policy unavailable. Full access terminal commands are blocked.
+        </p>
+      ) : rules && rules.rules.length > 0 ? (
         <div className="mt-2 space-y-2">
           {rules.rules.map((rule) => (
             <div key={rule.id}>
@@ -343,11 +347,9 @@ function RulesCard({
         </div>
       ) : (
         <p className="mt-1 text-xs text-muted-foreground">
-          {unavailable
-            ? "Command policy unavailable. Full access terminal commands are blocked."
-            : loading
-              ? "Resolving command policy..."
-              : "No .codex/rules files found."}
+          {loading
+            ? "Resolving command policy..."
+            : "No .codex/rules files found."}
         </p>
       )}
       <p className="mt-2 text-[10px] text-muted-foreground">
