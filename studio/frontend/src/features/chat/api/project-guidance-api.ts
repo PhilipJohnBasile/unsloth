@@ -36,6 +36,29 @@ export interface ProjectSkills {
   truncated: boolean;
 }
 
+export interface ProjectCommandRule {
+  id: string;
+  path: string;
+  line: number;
+  pattern: Array<string | string[]>;
+  decision: "allow" | "prompt" | "forbidden";
+  justification: string | null;
+  match: string[];
+  notMatch: string[];
+}
+
+export interface ProjectCommandRules {
+  trusted: boolean;
+  rules: ProjectCommandRule[];
+  files: Array<{
+    path: string;
+    bytes: number;
+    sha256: string;
+    ruleCount: number;
+  }>;
+  bytesRead: number;
+}
+
 export interface ProjectInitResult {
   status: "created" | "already_exists";
   created: boolean;
@@ -48,7 +71,7 @@ export const PROJECT_GUIDANCE_UPDATED_EVENT =
 
 function projectGuidancePath(
   projectId: string,
-  resource: "instructions" | "skills" | "init",
+  resource: "instructions" | "skills" | "rules" | "init",
 ): string {
   return `/api/agent/projects/${encodeURIComponent(projectId)}/${resource}`;
 }
@@ -110,6 +133,12 @@ export function getProjectInstructions(
 
 export function getProjectSkills(projectId: string): Promise<ProjectSkills> {
   return request(projectGuidancePath(projectId, "skills"));
+}
+
+export function getProjectCommandRules(
+  projectId: string,
+): Promise<ProjectCommandRules> {
+  return request(projectGuidancePath(projectId, "rules"));
 }
 
 export async function initializeProjectAgents(

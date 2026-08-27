@@ -7875,6 +7875,50 @@ def _sandboxed_command_execution_error(*, disable_sandbox: bool) -> str | None:
     return None
 
 
+def project_terminal_rule_policy(
+    session_id: "str | None", command: str, *, outside_sandbox: bool
+) -> dict | None:
+    """Resolve trusted project rules for one command that will leave the sandbox."""
+    if (
+        not outside_sandbox
+        or not session_id
+        or not session_id.startswith(_PROJECT_SESSION_PREFIX)
+        or _thread_exists(session_id)
+    ):
+        return None
+    project_id = session_id[len(_PROJECT_SESSION_PREFIX) :]
+    if not project_id:
+        return None
+    try:
+        from core.agent_workspace.common import project_workspace_access
+        from core.agent_workspace.rules import (
+            discover_project_command_rules,
+            evaluate_terminal_command_rules,
+            secure_command_rule_traversal_supported,
+        )
+
+        # Windows cannot yet inspect `.codex/rules` without following path
+        # strings. Keep Full access usable while making the missing policy
+        # capability visible in the project panel.
+        if not secure_command_rule_traversal_supported():
+            return None
+        with project_workspace_access(project_id) as workspace:
+            discovered = discover_project_command_rules(
+                workspace.root,
+                expected_identity = (workspace.device_id, workspace.file_id),
+                project_trusted = True,
+            )
+        return evaluate_terminal_command_rules(discovered, command)
+    except Exception as exc:
+        logger.warning("Project command policy could not be resolved", exc_info = True)
+        return {
+            "decision": "forbidden",
+            "commands": [],
+            "matchedRules": [],
+            "error": f"Project command policy is invalid or unavailable: {exc}",
+        }
+
+
 def _tracks_workspace_artifacts(session_id: "str | None") -> bool:
     """Whether file-card diffing is safe and useful for this workspace."""
     if not session_id or not session_id.startswith(_PROJECT_SESSION_PREFIX):
@@ -16489,6 +16533,19 @@ def _bash_exec(
     capability_error = _sandboxed_command_execution_error(disable_sandbox = disable_sandbox)
     if capability_error is not None:
         return capability_error
+    project_policy = project_terminal_rule_policy(
+        session_id,
+        command,
+        outside_sandbox = disable_sandbox,
+    )
+    if project_policy is not None and project_policy.get("decision") == "forbidden":
+        reason = project_policy.get("error")
+        if not reason:
+            matched = project_policy.get("matchedRules") or []
+            reasons = [str(rule.get("justification") or "").strip() for rule in matched]
+            reason = next((value for value in reversed(reasons) if value), None)
+        suffix = f" {reason}" if reason else ""
+        return _truncate(f"Blocked by project command rules.{suffix}")
 
     # Block dangerous commands (skipped when the sandbox is disabled)
     if not disable_sandbox:

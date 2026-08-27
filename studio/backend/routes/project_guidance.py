@@ -11,6 +11,7 @@ from auth.authentication import get_current_subject
 from core.agent_workspace.common import AgentWorkspaceError, project_workspace_access
 from core.agent_workspace.initialization import initialize_project_agents
 from core.agent_workspace.instructions import resolve_agents_instructions
+from core.agent_workspace.rules import discover_project_command_rules
 from core.agent_workspace.skills import discover_project_skills
 from storage.studio_db import get_chat_project
 
@@ -74,6 +75,20 @@ def project_skills(project_id: str, _current_subject: str = Depends(get_current_
                 for skill in result["skills"]
             ],
         }
+    except AgentWorkspaceError as exc:
+        raise _workspace_http_error(exc) from exc
+
+
+@router.get("/projects/{project_id}/rules")
+def project_rules(project_id: str, _current_subject: str = Depends(get_current_subject)):
+    _project(project_id)
+    try:
+        with project_workspace_access(project_id) as workspace:
+            return discover_project_command_rules(
+                workspace.root,
+                expected_identity = (workspace.device_id, workspace.file_id),
+                project_trusted = True,
+            )
     except AgentWorkspaceError as exc:
         raise _workspace_http_error(exc) from exc
 

@@ -158,6 +158,9 @@ test("project guidance client uses scoped endpoints and create-only POST", async
     if (input.endsWith("/skills")) {
       return response({ skills: [], issues: [], truncated: false });
     }
+    if (input.endsWith("/rules")) {
+      return response({ trusted: true, rules: [], files: [], bytesRead: 0 });
+    }
     return response({
       status: "already_exists",
       created: false,
@@ -175,6 +178,7 @@ test("project guidance client uses scoped endpoints and create-only POST", async
 
   await guidanceApi.getProjectInstructions("project one");
   await guidanceApi.getProjectSkills("project one");
+  await guidanceApi.getProjectCommandRules("project one");
   const initialized = await guidanceApi.initializeProjectAgents("project one");
 
   assert.equal(initialized.created, false);
@@ -184,8 +188,27 @@ test("project guidance client uses scoped endpoints and create-only POST", async
       method: "GET",
     },
     { input: "/api/agent/projects/project%20one/skills", method: "GET" },
+    { input: "/api/agent/projects/project%20one/rules", method: "GET" },
     { input: "/api/agent/projects/project%20one/init", method: "POST" },
   ]);
+});
+
+test("guidance panel keeps successful sections when one refresh fails", async () => {
+  const panel = await readFile(
+    new URL(
+      "../src/features/chat/components/project-guidance-panel.tsx",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+
+  assert.match(panel, /Promise\.allSettled\(\[/);
+  assert.match(panel, /nextInstructions\.status === "fulfilled"/);
+  assert.match(panel, /nextSkills\.status === "fulfilled"/);
+  assert.match(panel, /nextRules\.status === "fulfilled"/);
+  assert.doesNotMatch(panel, /setInstructions\(null\)/);
+  assert.doesNotMatch(panel, /setSkills\(null\)/);
+  assert.doesNotMatch(panel, /setRules\(null\)/);
 });
 
 test("adapter intercepts init before inference and token counts carry workspace identity", async () => {

@@ -58,6 +58,7 @@ def _tool(name: str, description: str = "") -> dict:
 
 WEB = _tool("web_search")
 PY = _tool("python")
+TERMINAL = _tool("terminal")
 
 
 class FakeTransport:
@@ -597,6 +598,58 @@ def test_full_access_disables_the_sandbox_at_execution(executed):
     )
     _run(transport, tools = [PY], bypass_permissions = True)
 
+    assert executed[0]["disable_sandbox"] is True
+
+
+def test_project_prompt_rule_restores_confirmation_in_full_access(executed, monkeypatch):
+    slots: list[str] = []
+    monkeypatch.setattr(
+        loop_mod,
+        "project_terminal_rule_policy",
+        lambda *_args, **_kwargs: {"decision": "prompt", "matchedRules": []},
+    )
+    monkeypatch.setattr(
+        loop_mod,
+        "begin_tool_decision",
+        lambda _session, approval: slots.append(approval) or object(),
+    )
+    monkeypatch.setattr(loop_mod, "wait_tool_decision", lambda *_args, **_kwargs: "allow")
+    monkeypatch.setattr(loop_mod, "abort_tool_decision", lambda *_args: None)
+    monkeypatch.setattr(loop_mod, "new_approval_id", lambda: "project-rule")
+    transport = FakeTransport(
+        [
+            [
+                _sse(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "c1",
+                                "function": {
+                                    "name": "terminal",
+                                    "arguments": '{"command":"gh pr view 17"}',
+                                },
+                            }
+                        ]
+                    }
+                ),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "ok"}), _sse(finish = "stop"), _DONE],
+        ]
+    )
+
+    lines = _run(
+        transport,
+        tools = [TERMINAL],
+        bypass_permissions = True,
+        permission_mode = "full",
+        confirm_calls = True,
+    )
+
+    assert slots == ["project-rule"]
+    assert _events(lines, "tool_start")[0]["awaiting_confirmation"] is True
     assert executed[0]["disable_sandbox"] is True
 
 

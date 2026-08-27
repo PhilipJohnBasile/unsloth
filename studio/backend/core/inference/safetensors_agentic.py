@@ -1240,6 +1240,17 @@ def run_safetensors_tool_loop(
             if needs_confirm and permission_mode == "auto":
                 from core.inference.tools import is_high_risk_tool_call
                 needs_confirm = is_high_risk_tool_call(decision.tool_name, decision.arguments)
+            if decision.tool_name == "terminal":
+                from core.inference.tools import project_terminal_rule_policy
+                project_rule = project_terminal_rule_policy(
+                    session_id,
+                    str(decision.arguments.get("command") or ""),
+                    outside_sandbox = bypass_permissions,
+                )
+                if project_rule is not None and project_rule.get("decision") == "prompt":
+                    needs_confirm = True
+                elif project_rule is not None and project_rule.get("decision") == "forbidden":
+                    needs_confirm = False
             approval_id = new_approval_id() if needs_confirm else ""
             decision_slot = begin_tool_decision(session_id, approval_id) if needs_confirm else None
             start_event = decision.tool_start_event()
