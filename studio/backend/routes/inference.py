@@ -27,8 +27,19 @@ from fastapi import (
 )
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse, JSONResponse, PlainTextResponse, Response
+from starlette.background import BackgroundTask
 from starlette.requests import ClientDisconnect
-from typing import Any, Callable, Collection, List, NamedTuple, Optional, TYPE_CHECKING, Union
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Iterable,
+    List,
+    NamedTuple,
+    Optional,
+    TYPE_CHECKING,
+    Union,
+)
 import functools
 import json
 import httpx
@@ -2755,6 +2766,13 @@ from core.inference.anthropic_compat import (
     AnthropicStreamEmitter,
     AnthropicPassthroughEmitter,
 )
+from core.agent_workspace.guidance import (
+    ProjectGuidanceUnavailable,
+    latest_user_query,
+    resolve_project_guidance,
+    strip_server_project_guidance,
+)
+from core.agent_workspace.lease import ProjectWorkspaceRequestLease
 from auth import storage as auth_storage
 from auth.authentication import API_KEY_PREFIX, get_current_subject
 from state import active_generations
@@ -18024,7 +18042,67 @@ def _chat_cancel_event(request: Request) -> threading.Event:
     return event if event is not None else threading.Event()
 
 
+def _attach_project_workspace_lease(
+    response: StreamingResponse, lease: ProjectWorkspaceRequestLease
+) -> None:
+    iterator = response.body_iterator
+
+    async def leased_iterator():
+        try:
+            async for chunk in iterator:
+                yield chunk
+        finally:
+            await lease.release()
+
+    response.body_iterator = leased_iterator()
+
+    prior_background = response.background
+
+    async def leased_background() -> None:
+        try:
+            if prior_background is not None:
+                await prior_background()
+        finally:
+            await lease.release()
+
+    response.background = BackgroundTask(leased_background)
+
+    if isinstance(response, _SameTaskStreamingResponse):
+        prior_cleanup = getattr(response, "_unstarted_cleanup", None)
+
+        async def leased_unstarted_cleanup() -> None:
+            try:
+                if prior_cleanup is not None:
+                    await prior_cleanup()
+            finally:
+                await lease.release()
+
+        response._unstarted_cleanup = leased_unstarted_cleanup
+
+
+def _hold_project_workspace_for_request(handler):
+    @functools.wraps(handler)
+    async def wrapped(payload, *args, **kwargs):
+        lease = await ProjectWorkspaceRequestLease.acquire(getattr(payload, "session_id", None))
+        try:
+            result = await handler(payload, *args, **kwargs)
+        except BaseException:
+            if lease is not None:
+                await lease.release()
+            raise
+        if lease is None:
+            return result
+        if isinstance(result, StreamingResponse):
+            _attach_project_workspace_lease(result, lease)
+        else:
+            await lease.release()
+        return result
+
+    return wrapped
+
+
 @router.post("/chat/completions")
+@_hold_project_workspace_for_request
 async def openai_chat_completions(
     payload: ChatCompletionRequest,
     request: Request,
@@ -18052,6 +18130,7 @@ async def produce_openai_chat_completions(
     current_subject: str,
     *,
     cancel_on_disconnect: bool,
+    project_guidance_resolved: bool = False,
 ):
     """
     OpenAI-compatible chat completions endpoint.
@@ -18080,7 +18159,6 @@ async def produce_openai_chat_completions(
     for _m in payload.messages:
         if _m.role == "developer":
             _m.role = "system"
-
     if payload.logprobs:
         _raise_unsupported_openai_parameter(
             "logprobs", "logprobs is not supported for chat completions."
@@ -18115,6 +18193,11 @@ async def produce_openai_chat_completions(
             raise HTTPException(
                 status_code = 400,
                 detail = "Video input is only supported on a local GGUF model with video support.",
+            )
+        if not project_guidance_resolved:
+            payload.messages = await _with_project_guidance_messages_async(
+                payload.messages,
+                payload.session_id,
             )
         return await _proxy_to_external_provider(payload, request, current_subject)
 
@@ -18282,6 +18365,12 @@ async def produce_openai_chat_completions(
             _, _video_rejection = _video_b64_rejection(payload.video_base64)
             if _video_rejection is not None:
                 raise HTTPException(status_code = _video_rejection[0], detail = _video_rejection[1])
+
+    if not project_guidance_resolved:
+        payload.messages = await _with_project_guidance_messages_async(
+            payload.messages,
+            payload.session_id,
+        )
 
     # Defer the resident claim: chat has several post-switch capability checks that can still
     # reject (Whisper without audio, n>1 on a non-GGUF backend, tool or response_format
@@ -23456,6 +23545,12 @@ def _build_chat_request(
         messages = messages,
         stream = stream,
     )
+    if payload.session_id is not None:
+        chat_kwargs["session_id"] = payload.session_id
+    if payload.thread_id is not None:
+        chat_kwargs["thread_id"] = payload.thread_id
+    if payload.cancel_id is not None:
+        chat_kwargs["cancel_id"] = payload.cancel_id
     # Only forward an explicitly set model so an omitted Responses model stays
     # reload-only when openai_chat_completions re-checks on the non-streaming path.
     if "model" in payload.model_fields_set:
@@ -23587,7 +23682,13 @@ async def _responses_non_streaming(
     try:
         _sink_token = _monitor_perf_sink.set(inner_perf if monitor_id else None)
         try:
-            result = await openai_chat_completions(chat_req, request)
+            result = await produce_openai_chat_completions(
+                chat_req,
+                request,
+                current_subject or "",
+                cancel_on_disconnect = True,
+                project_guidance_resolved = True,
+            )
         finally:
             _monitor_perf_sink.reset(_sink_token)
 
@@ -24791,6 +24892,7 @@ async def _responses_stream(
 
 
 @router.post("/responses")
+@_hold_project_workspace_for_request
 async def openai_responses(
     payload: ResponsesRequest,
     request: Request,
@@ -24845,6 +24947,10 @@ async def openai_responses(
                     param = "tool_choice",
                 ),
             )
+    messages = await _with_project_guidance_messages_async(
+        messages,
+        payload.session_id,
+    )
     # After input validation so a 400 never triggers a load. Switches the
     # streaming path; non-streaming re-checks via the idempotent chat handler.
     # require_vision rejects a swap to a text-only target before it runs, so an
@@ -25087,7 +25193,156 @@ def _append_to_system_message(messages: list[dict], addition: str) -> list[dict]
     return [{"role": "system", "content": addition}, *copied]
 
 
+def _project_guidance_http_exception(
+    exc: ProjectGuidanceUnavailable, *, anthropic: bool = False
+) -> HTTPException:
+    message = str(exc)
+    detail = (
+        anthropic_error_body(message, status = 409)
+        if anthropic
+        else openai_error_body(
+            message,
+            status = 409,
+            code = "project_workspace_unavailable",
+            param = "session_id",
+        )
+    )
+    return HTTPException(status_code = 409, detail = detail)
+
+
+def _with_project_guidance_messages(messages: list[Any], session_id: Optional[str]) -> list[Any]:
+    """Place current server-owned project guidance after caller instructions."""
+    try:
+        resolved = resolve_project_guidance(
+            session_id,
+            query = latest_user_query(messages),
+        )
+    except ProjectGuidanceUnavailable as exc:
+        raise _project_guidance_http_exception(exc) from exc
+    if resolved is None:
+        return messages
+
+    copied = [
+        dict(message) if isinstance(message, dict) else message.model_copy(deep = True)
+        for message in messages
+    ]
+    conversation_started = False
+    for message in copied:
+        role = message.get("role") if isinstance(message, dict) else message.role
+        if role not in ("system", "developer"):
+            conversation_started = True
+            continue
+        if conversation_started:
+            raise HTTPException(
+                status_code = 400,
+                detail = openai_error_body(
+                    "Project chats require system and developer messages to precede the conversation.",
+                    status = 400,
+                    code = "invalid_value",
+                    param = "messages",
+                ),
+            )
+        content = message.get("content") if isinstance(message, dict) else message.content
+        if isinstance(content, str):
+            replacement = strip_server_project_guidance(content)
+            if isinstance(message, dict):
+                message["content"] = replacement
+            else:
+                message.content = replacement
+        elif isinstance(content, list):
+            cleaned = []
+            for part in content:
+                kind = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+                text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+                if kind != "text" or not isinstance(text, str):
+                    cleaned.append(part)
+                    continue
+                replacement = strip_server_project_guidance(text)
+                if isinstance(part, dict):
+                    cleaned.append({**part, "text": replacement})
+                else:
+                    cloned = part.model_copy(deep = True)
+                    cloned.text = replacement
+                    cleaned.append(cloned)
+            if isinstance(message, dict):
+                message["content"] = cleaned
+            else:
+                message.content = cleaned
+    authoritative = []
+    if resolved.addition:
+        authoritative.append(
+            {"role": "system", "content": resolved.addition}
+            if copied and isinstance(copied[0], dict)
+            else ChatMessage(role = "system", content = resolved.addition)
+        )
+    prefix_end = 0
+    while prefix_end < len(copied):
+        message = copied[prefix_end]
+        role = message.get("role") if isinstance(message, dict) else message.role
+        if role not in ("system", "developer"):
+            break
+        prefix_end += 1
+    return [*copied[:prefix_end], *authoritative, *copied[prefix_end:]]
+
+
+async def _with_project_guidance_messages_async(
+    messages: list[Any], session_id: Optional[str]
+) -> list[Any]:
+    return await asyncio.to_thread(_with_project_guidance_messages, messages, session_id)
+
+
+def _with_anthropic_project_guidance(
+    system: Any, session_id: Optional[str], *, messages: Iterable[Any]
+) -> Any:
+    try:
+        resolved = resolve_project_guidance(
+            session_id,
+            query = latest_user_query(messages),
+        )
+    except ProjectGuidanceUnavailable as exc:
+        raise _project_guidance_http_exception(exc, anthropic = True) from exc
+    if resolved is None:
+        return system
+    if system is None:
+        return resolved.addition or None
+    if isinstance(system, str):
+        base = strip_server_project_guidance(system)
+        return "\n\n".join(part for part in (base, resolved.addition) if part)
+    if isinstance(system, list):
+        cleaned = []
+        for part in system:
+            if isinstance(part, str):
+                cleaned.append(strip_server_project_guidance(part))
+                continue
+            kind = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+            text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+            if kind != "text" or not isinstance(text, str):
+                cleaned.append(part)
+            elif isinstance(part, dict):
+                cleaned.append({**part, "text": strip_server_project_guidance(text)})
+            else:
+                cloned = part.model_copy(deep = True)
+                cloned.text = strip_server_project_guidance(text)
+                cleaned.append(cloned)
+        if resolved.addition:
+            cleaned.append({"type": "text", "text": resolved.addition})
+        return cleaned
+    return system
+
+
+async def _with_anthropic_project_guidance_async(
+    system: Any, session_id: Optional[str], *, messages: Iterable[Any]
+) -> Any:
+    return await asyncio.to_thread(
+        _with_anthropic_project_guidance,
+        system,
+        session_id,
+        messages = messages,
+    )
+
+
 @router.post("/chat/count_tokens")
+@_hold_project_workspace_for_request
 async def chat_count_tokens(
     payload: ChatCountTokensRequest, current_subject: str = Depends(get_current_subject)
 ):
@@ -25134,6 +25389,11 @@ async def chat_count_tokens(
             status_code = 503,
             detail = _no_model_loaded_detail("No GGUF model loaded. Load a GGUF model first."),
         )
+
+    payload.messages = await _with_project_guidance_messages_async(
+        payload.messages,
+        payload.session_id,
+    )
 
     # Same sanitization the GGUF chat path runs before generation. Route FIRST: the passthrough
     # does not merge adjacent user turns, so coalescing here would price a prompt it never sends
@@ -25295,6 +25555,7 @@ async def chat_count_tokens(
 
 
 @router.post("/messages/count_tokens")
+@_hold_project_workspace_for_request
 async def anthropic_count_tokens(
     payload: AnthropicMessagesRequest,
     request: Request,
@@ -25310,6 +25571,11 @@ async def anthropic_count_tokens(
     # Reject malformed tools before the switch, like /messages, so an invalid
     # count request can't evict the loaded model.
     _validate_anthropic_client_tools(payload.tools)
+    payload.system = await _with_anthropic_project_guidance_async(
+        payload.system,
+        payload.session_id,
+        messages = payload.messages,
+    )
     # Count with the requested model's tokenizer, like the sibling /messages.
     # Carry the vision guard too: an image count naming a text-only GGUF must not
     # evict a loaded vision model for a swap that can't serve the request.
@@ -25394,6 +25660,7 @@ def _set_or_prepend_system_message(
 
 
 @router.post("/messages")
+@_hold_project_workspace_for_request
 async def anthropic_messages(
     payload: AnthropicMessagesRequest,
     request: Request,
@@ -25514,6 +25781,12 @@ async def anthropic_messages(
                     err_type = "invalid_request_error",
                 ),
             )
+
+    payload.system = await _with_anthropic_project_guidance_async(
+        payload.system,
+        payload.session_id,
+        messages = payload.messages,
+    )
 
     # require_vision rejects a swap to a text-only target before it runs, so an
     # image request can't evict the resident vision model only to hit the vision

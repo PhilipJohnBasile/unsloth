@@ -7394,6 +7394,13 @@ def finish_project_workspace_change(project_id: str) -> None:
         _sessions_free.notify_all()
 
 
+@contextlib.contextmanager
+def project_workspace_in_flight(project_id: str):
+    """Keep one project's workspace identity stable for a bounded operation."""
+    with _session_in_flight(project_session_id(project_id)):
+        yield
+
+
 def invalidate_project_workdir(project_id: str) -> None:
     """Drop the cached cwd after a committed workspace identity change."""
     _workdirs.pop(project_session_id(project_id), None)

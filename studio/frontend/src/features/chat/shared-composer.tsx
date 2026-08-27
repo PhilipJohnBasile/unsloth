@@ -57,6 +57,10 @@ import { pasteClipboardFiles } from "./utils/clipboard-files";
 import { confirmStopRunningChatsIfNeeded } from "./utils/confirm-stop-running-chats";
 import { requestLocalPromptQueueStop } from "./utils/prompt-queue-boundary";
 import { cancelPreStreamRunReservations } from "./utils/pre-stream-run-reservation";
+import {
+  interceptCompareProjectSlashCommand,
+  parseProjectSlashCommand,
+} from "./utils/slash-commands";
 import type { ModelLifecycleLease } from "./utils/model-lifecycle-gate";
 import { useAui } from "@assistant-ui/react";
 import {
@@ -122,7 +126,11 @@ import {
   loadModel,
   validateModel,
 } from "./api/chat-api";
-import { resolveFitMaxSeqLength, resolveExplicitCtxPin } from "./presets/preset-policy";
+import { executeLocalProjectSlashCommand } from "./api/chat-adapter";
+import {
+  resolveExplicitCtxPin,
+  resolveFitMaxSeqLength,
+} from "./presets/preset-policy";
 import { ensureGpuDeviceCache } from "@/hooks/use-gpu-info";
 import {
   parseExternalModelId,
@@ -187,6 +195,8 @@ export interface CompareHandle {
   append: (content: CompareMessagePart[]) => void;
   /** Append a user message without triggering generation. */
   appendMessage: (content: CompareMessagePart[]) => void;
+  /** Append a deterministic local response without starting inference. */
+  appendAssistantMessage: (text: string) => void;
   /** Trigger generation on the current thread (after appendMessage). */
   startRun: () => void;
   cancel: () => void;
@@ -403,6 +413,15 @@ export function RegisterCompareHandle({
             createdAt: new Date(),
             startRun: false,
           } as never),
+      appendAssistantMessage: (text) =>
+        aui
+          .thread()
+          .append({
+            role: "assistant",
+            content: [{ type: "text", text }],
+            createdAt: new Date(),
+            startRun: false,
+          } as never),
       startRun: () => {
         const msgs = aui.thread().getState().messages;
         const lastId = msgs.length > 0 ? msgs[msgs.length - 1].id : null;
@@ -596,6 +615,7 @@ export function SharedComposer({
   const prevRunningRef = useRef(false);
   const prevComparingRef = useRef(false);
   const compareStepSucceededRef = useRef(false);
+  const localCommandRunningRef = useRef(false);
   const sendRef = useRef<(() => void) | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const composingRef = useRef(false);
@@ -1064,6 +1084,10 @@ export function SharedComposer({
       resetPromptQueue();
       return;
     }
+    if (localCommandRunningRef.current) {
+      resetPromptQueue();
+      return;
+    }
     const submittedText = text;
     const submittedImages = pendingImages;
     const submittedAudio = pendingAudio;
@@ -1078,6 +1102,91 @@ export function SharedComposer({
     );
     const isGeneralizedCompare =
       hasCompareHandles && Boolean(model1?.id && model2?.id);
+
+    const content: CompareMessagePart[] = [];
+    for (const { file } of submittedImages) {
+      try {
+        const image = await fileToBase64DataURL(file);
+        content.push({ type: "image", image });
+      } catch {
+        // skip failed image
+      }
+    }
+    if (submittedAudio) {
+      content.push({
+        type: "audio",
+        name: submittedAudio.name,
+        audio: `data:${submittedAudio.contentType};base64,${submittedAudio.base64}`,
+      });
+    }
+    if (msg) content.push({ type: "text", text: msg });
+    if (content.length === 0) {
+      resetPromptQueue();
+      return;
+    }
+
+    const clearSubmittedDraft = () => {
+      setText("");
+      setPendingImages([]);
+      setPendingAudio(null);
+      clearPendingAudioStore();
+      textareaRef.current?.focus();
+    };
+
+    const compareSlashCommand = hasCompareHandles
+      ? parseProjectSlashCommand(msg)
+      : null;
+    const compareCommandHandles = Object.values(handlesRef.current);
+    if (compareSlashCommand && compareCommandHandles.length !== 2) {
+      toast.info("Comparison is still opening", {
+        description:
+          "Wait for both panes to finish opening, then retry the command.",
+      });
+      resetPromptQueue();
+      return;
+    }
+    if (compareSlashCommand) {
+      const [firstHandle, secondHandle] = compareCommandHandles;
+      const composerProjectIdAtSend =
+        useChatRuntimeStore.getState().activeProjectId ?? null;
+      let commandIntercepted = false;
+      try {
+        commandIntercepted = await interceptCompareProjectSlashCommand({
+          input: msg,
+          userContent: content,
+          panes: [
+            {
+              appendUserMessage: firstHandle.appendMessage,
+              appendAssistantMessage: firstHandle.appendAssistantMessage,
+            },
+            {
+              appendUserMessage: secondHandle.appendMessage,
+              appendAssistantMessage: secondHandle.appendAssistantMessage,
+            },
+          ],
+          onIntercept: () => {
+            localCommandRunningRef.current = true;
+            setComparing(true);
+            clearSubmittedDraft();
+          },
+          execute: (command) =>
+            executeLocalProjectSlashCommand(command, {
+              threadId: model1ThreadId ?? model2ThreadId,
+              composerProjectId: composerProjectIdAtSend,
+            }),
+        });
+      } finally {
+        if (localCommandRunningRef.current) {
+          compareStepSucceededRef.current = commandIntercepted;
+          localCommandRunningRef.current = false;
+          setComparing(false);
+        }
+      }
+      if (commandIntercepted) {
+        resetPromptQueue();
+        return;
+      }
+    }
 
     // Generalized compare requires both panes to have a model. A half-
     // selected send either races to an empty bubble with bogus tok/s (#5569)
@@ -1103,30 +1212,6 @@ export function SharedComposer({
       // for its side, and the chat-adapter's pre-stream gate runs per-side
       // against that fresh state.
       toast.error(imageUnavailableReason);
-      resetPromptQueue();
-      return;
-    }
-
-    const content: CompareMessagePart[] = [];
-    for (const { file } of submittedImages) {
-      try {
-        const image = await fileToBase64DataURL(file);
-        content.push({ type: "image", image });
-      } catch {
-        // skip failed image
-      }
-    }
-    if (submittedAudio) {
-      content.push({
-        type: "audio",
-        name: submittedAudio.name,
-        audio: `data:${submittedAudio.contentType};base64,${submittedAudio.base64}`,
-      });
-    }
-    if (msg) {
-      content.push({ type: "text", text: msg });
-    }
-    if (content.length === 0) {
       resetPromptQueue();
       return;
     }
@@ -1173,14 +1258,6 @@ export function SharedComposer({
         description: "Your updated draft was kept. Send it again when ready.",
       });
     };
-    const clearSubmittedDraft = () => {
-      setText("");
-      setPendingImages([]);
-      setPendingAudio(null);
-      clearPendingAudioStore();
-      textareaRef.current?.focus();
-    };
-
     let compareStopDecision: Awaited<
       ReturnType<typeof confirmStopRunningChatsIfNeeded>
     > | null = null;
