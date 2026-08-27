@@ -269,7 +269,6 @@ def test_full_access_terminal_rejects_policy_change_between_approval_and_spawn(
     )
     monkeypatch.setattr(tools, "_harden_parent_against_proc_env_leak", lambda: True)
     monkeypatch.setattr(tools, "_get_workdir", lambda _session_id: str(tmp_path))
-    monkeypatch.setattr(tools, "_project_execution_boundary", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(tools, "_tracks_workspace_artifacts", lambda _session_id: False)
     monkeypatch.setattr(tools, "_build_bypass_env", lambda _workdir: {})
     monkeypatch.setattr(tools, "_call_started", lambda _workdir: "call")
@@ -291,6 +290,67 @@ def test_full_access_terminal_rejects_policy_change_between_approval_and_spawn(
 
     assert "Blocked by project command rules" in result
     assert "changed or was not reviewed" in result
+
+
+def test_full_access_terminal_rechecks_policy_immediately_before_legacy_popen(
+    tmp_path, monkeypatch
+):
+    events = []
+    policy = {
+        "decision": "allow",
+        "matchedRules": [],
+        "policyHash": "a" * 64,
+    }
+
+    def resolve_policy(*_args, **_kwargs):
+        events.append("preflight_policy" if not events else "late_policy")
+        return dict(policy)
+
+    def resolve_workdir(_session_id):
+        events.append("workdir")
+        return str(tmp_path)
+
+    def start_call(_workdir):
+        events.append("call_started")
+        return "call"
+
+    def build_environment(_workdir):
+        events.append("environment")
+        return {}
+
+    def popen(*_args, **_kwargs):
+        events.append("popen")
+        raise OSError("popen reached")
+
+    def finish_call(_token):
+        events.append("call_finished")
+
+    monkeypatch.setattr(tools, "project_terminal_rule_policy", resolve_policy)
+    monkeypatch.setattr(tools, "_harden_parent_against_proc_env_leak", lambda: True)
+    monkeypatch.setattr(tools, "_get_workdir", resolve_workdir)
+    monkeypatch.setattr(tools, "_tracks_workspace_artifacts", lambda _session_id: False)
+    monkeypatch.setattr(tools, "_build_bypass_env", build_environment)
+    monkeypatch.setattr(tools, "_call_started", start_call)
+    monkeypatch.setattr(tools, "_call_finished", finish_call)
+    monkeypatch.setattr(tools.subprocess, "Popen", popen)
+
+    result = tools._bash_exec(
+        "git status",
+        session_id = "project-example",
+        disable_sandbox = True,
+        project_rule_proof = {"policyHash": policy["policyHash"], "approved": False},
+    )
+
+    assert "Execution error: popen reached" in result
+    assert events == [
+        "preflight_policy",
+        "workdir",
+        "call_started",
+        "environment",
+        "late_policy",
+        "popen",
+        "call_finished",
+    ]
 
 
 def test_execute_tool_forwards_policy_proof_only_to_terminal(monkeypatch):
