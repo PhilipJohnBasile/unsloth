@@ -7836,13 +7836,14 @@ def _get_project_workdir(session_id: str) -> str | None:
     return sandbox_real
 
 
-def _project_execution_boundary(session_id: "str | None", workdir: str, *, disable_sandbox: bool):
-    """Open the OS command boundary for a real project-backed session.
+def _project_execution_id(
+    session_id: "str | None", workdir: str, *, disable_sandbox: bool
+) -> "str | None":
+    """Return the persisted project id for a sandboxed project tool call.
 
-    Full access remains the explicit escape hatch. Every other permission mode
-    uses a kernel-enforced boundary and fails closed when this host has no
-    supported backend, including Windows until a filesystem boundary is
-    available.
+    Root identity, leasing, the mutation slot, and process containment are
+    resolved by the supervisor. This helper only distinguishes a real project
+    session from an ordinary chat whose caller-chosen id shares the prefix.
     """
     if disable_sandbox or not session_id or not session_id.startswith(_PROJECT_SESSION_PREFIX):
         return None
@@ -7851,14 +7852,7 @@ def _project_execution_boundary(session_id: "str | None", workdir: str, *, disab
         return None
     if os.path.realpath(project_workdir) != os.path.realpath(workdir):
         raise RuntimeError("the project workspace changed before execution")
-    project_id = session_id[len(_PROJECT_SESSION_PREFIX) :]
-    from core.agent_workspace.common import project_workspace
-    from core.agent_workspace.execution import ProjectExecutionBoundary
-
-    workspace = project_workspace(project_id)
-    if os.path.realpath(workspace.root) != os.path.realpath(workdir):
-        raise RuntimeError("the project workspace changed before execution")
-    return ProjectExecutionBoundary.open(workspace)
+    return session_id[len(_PROJECT_SESSION_PREFIX) :]
 
 
 _WINDOWS_SANDBOXED_COMMAND_ERROR = (
@@ -16257,6 +16251,59 @@ def _created_file_sentinels(
     return out
 
 
+def _render_supervised_project_result(
+    supervised,
+    *,
+    timeout,
+    workdir: str,
+    spill_dir: "str | None",
+    spill_scope: "str | None",
+    before: dict,
+    session_id: "str | None",
+    track_workspace_artifacts: bool,
+    call_token: "dict | None",
+) -> str:
+    """Render a supervised result through the existing tool and artifact contract."""
+    truncation_notice = str(getattr(supervised, "truncation_notice", "") or "")
+    if supervised.output_truncated and not truncation_notice:
+        retained_bytes = len((supervised.output or "").encode("utf-8"))
+        truncation_notice = (
+            f"\n[Process produced {supervised.output_bytes} bytes. Only the bounded "
+            f"{retained_bytes}-byte prefix was retained.]\n"
+        )
+    if supervised.status == "timed_out":
+        rendered = _truncate(f"Execution timed out after {timeout} seconds.{truncation_notice}")
+        return rendered + (
+            _created_file_sentinels(workdir, before, None, call_token)
+            if session_id and track_workspace_artifacts
+            else ""
+        )
+    if supervised.status == "cancelled":
+        return f"Execution cancelled.{truncation_notice}" + (
+            _created_file_sentinels(workdir, before, None, call_token)
+            if session_id and track_workspace_artifacts
+            else ""
+        )
+
+    result = supervised.output or ""
+    if truncation_notice:
+        if result.endswith(truncation_notice):
+            result = result[: -len(truncation_notice)]
+        result = f"{truncation_notice.strip()}\n{result}"
+    if supervised.exit_code not in (None, 0):
+        result = f"Exit code {supervised.exit_code}:\n{result}"
+    hint = _missing_path_hint(result, workdir)
+    result = _defuse_sentinels(result)
+    result = (
+        _truncate(result, workdir = spill_dir, scope = spill_scope, hint = hint)
+        if result.strip()
+        else "(no output)" + hint
+    )
+    if session_id and track_workspace_artifacts:
+        result += _created_file_sentinels(workdir, before, None, call_token)
+    return result
+
+
 def _python_exec(
     code: str,
     cancel_event = None,
@@ -16303,7 +16350,6 @@ def _python_exec(
 
     tmp_path = None
     _scratch_name = None
-    execution_boundary = None
     workdir = None
     spill_scope = None
     spill_dir = None
@@ -16312,15 +16358,11 @@ def _python_exec(
     _before = {}
     try:
         workdir = _get_workdir(session_id)
-        execution_boundary = _project_execution_boundary(
+        project_id = _project_execution_id(
             session_id,
             workdir,
             disable_sandbox = disable_sandbox,
         )
-        if execution_boundary is not None and not execution_boundary.acquire_execution_slot(
-            cancel_event
-        ):
-            return "Execution cancelled."
         # `_get_workdir(None)` is the shared `_default` sandbox, and a project's chats share
         # one session by design. Retaining a result in either, under a path the next chat can
         # list, would leave behind output that existed only in this call's own response. See
@@ -16331,10 +16373,33 @@ def _python_exec(
         # Snapshot mtimes to detect new and overwritten files.
         track_workspace_artifacts = _tracks_workspace_artifacts(session_id)
         _before = _snapshot_workdir_files(workdir) if track_workspace_artifacts else {}
+        if project_id is not None:
+            from core.agent_workspace.supervisor import (
+                MAX_OUTPUT_LIMIT_BYTES,
+                run_project_python,
+            )
+            supervised = run_project_python(
+                project_id,
+                code,
+                timeout_seconds = timeout,
+                output_limit_bytes = MAX_OUTPUT_LIMIT_BYTES,
+                cancel_event = cancel_event,
+                output_callback = output_callback,
+            )
+            return _render_supervised_project_result(
+                supervised,
+                timeout = timeout,
+                workdir = workdir,
+                spill_dir = spill_dir,
+                spill_scope = spill_scope,
+                before = _before,
+                session_id = session_id,
+                track_workspace_artifacts = track_workspace_artifacts,
+                call_token = call_token,
+            )
         # In the workdir: Python puts it on sys.path[0], so an earlier call's
         # helper.py stays importable and __file__ resolves inside the sandbox.
-        script_dir = str(execution_boundary.scratch) if execution_boundary is not None else workdir
-        fd, tmp_path = tempfile.mkstemp(suffix = ".py", prefix = "studio_exec_", dir = script_dir)
+        fd, tmp_path = tempfile.mkstemp(suffix = ".py", prefix = "studio_exec_", dir = workdir)
         # utf-8 so non-ASCII in model-written code survives the OS default codec
         # (Windows cp1252 would otherwise raise UnicodeEncodeError).
         _scratch_name = os.path.basename(tmp_path)
@@ -16344,11 +16409,6 @@ def _python_exec(
             f.write(code)
 
         safe_env = _build_bypass_env(workdir) if disable_sandbox else _build_safe_env(workdir)
-        if execution_boundary is not None:
-            safe_env = execution_boundary.apply_environment(safe_env)
-            safe_env["PYTHONPATH"] = os.pathsep.join(
-                part for part in (workdir, safe_env.get("PYTHONPATH", "")) if part
-            )
         if disable_sandbox:
             # Match the sandboxed Python path without changing bypass shell I/O.
             safe_env = dict(safe_env)
@@ -16364,14 +16424,8 @@ def _python_exec(
             env = safe_env,
         )
         preexec = _bypass_preexec if disable_sandbox else _sandbox_preexec
-        executable = (
-            os.path.realpath(sys.executable) if execution_boundary is not None else sys.executable
-        )
-        argv = [executable, "-u", tmp_path]
-        if execution_boundary is not None:
-            argv = execution_boundary.wrap_argv(argv)
-            popen_kwargs.update(execution_boundary.popen_kwargs(preexec))
-        elif sys.platform != "win32":
+        argv = [sys.executable, "-u", tmp_path]
+        if sys.platform != "win32":
             popen_kwargs["cwd"] = workdir
             popen_kwargs["preexec_fn"] = preexec
         else:
@@ -16464,8 +16518,6 @@ def _python_exec(
                 os.unlink(tmp_path)
             except OSError:
                 pass
-        if execution_boundary is not None:
-            execution_boundary.close()
 
 
 def _bash_exec(
@@ -16514,18 +16566,13 @@ def _bash_exec(
     spill_dir = None
     spill_scope = None
     call_token = None
-    execution_boundary = None
     try:
         workdir = _get_workdir(session_id)
-        execution_boundary = _project_execution_boundary(
+        project_id = _project_execution_id(
             session_id,
             workdir,
             disable_sandbox = disable_sandbox,
         )
-        if execution_boundary is not None and not execution_boundary.acquire_execution_slot(
-            cancel_event
-        ):
-            return "Execution cancelled."
         # Same scoping as _python_exec: nothing is retained in a sandbox that is shared.
         spill_scope = _spill_scope(session_id, thread_id)
         spill_dir = workdir if session_id else None
@@ -16534,9 +16581,31 @@ def _bash_exec(
         # to produce "(no output)" and no other trace anywhere in the product.
         track_workspace_artifacts = _tracks_workspace_artifacts(session_id)
         _before = _snapshot_workdir_files(workdir) if track_workspace_artifacts else {}
+        if project_id is not None:
+            from core.agent_workspace.supervisor import (
+                MAX_OUTPUT_LIMIT_BYTES,
+                run_project_process,
+            )
+            supervised = run_project_process(
+                project_id,
+                _get_shell_cmd(command),
+                timeout_seconds = timeout,
+                output_limit_bytes = MAX_OUTPUT_LIMIT_BYTES,
+                cancel_event = cancel_event,
+                output_callback = output_callback,
+            )
+            return _render_supervised_project_result(
+                supervised,
+                timeout = timeout,
+                workdir = workdir,
+                spill_dir = spill_dir,
+                spill_scope = spill_scope,
+                before = _before,
+                session_id = session_id,
+                track_workspace_artifacts = track_workspace_artifacts,
+                call_token = call_token,
+            )
         safe_env = _build_bypass_env(workdir) if disable_sandbox else _build_safe_env(workdir)
-        if execution_boundary is not None:
-            safe_env = execution_boundary.apply_environment(safe_env)
         popen_kwargs = dict(
             stdout = subprocess.PIPE,
             stderr = subprocess.STDOUT,
@@ -16550,10 +16619,7 @@ def _bash_exec(
         )
         preexec = _bypass_preexec if disable_sandbox else _sandbox_preexec
         argv = _get_shell_cmd(command)
-        if execution_boundary is not None:
-            argv = execution_boundary.wrap_argv(argv)
-            popen_kwargs.update(execution_boundary.popen_kwargs(preexec))
-        elif sys.platform != "win32":
+        if sys.platform != "win32":
             popen_kwargs["cwd"] = workdir
             popen_kwargs["preexec_fn"] = preexec
         else:
@@ -16621,5 +16687,3 @@ def _bash_exec(
     finally:
         _call_finished(call_token)
         _forget_tool_pid(locals().get("proc"))
-        if execution_boundary is not None:
-            execution_boundary.close()

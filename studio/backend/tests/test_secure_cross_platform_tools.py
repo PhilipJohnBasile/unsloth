@@ -10,7 +10,9 @@ runs the same contract on native Linux, macOS, and Windows filesystems.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import shlex
 import subprocess
 import sys
 import threading
@@ -18,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from core.agent_workspace import common, execution, mutation
+from core.agent_workspace import common, execution, mutation, supervisor
 from core.agent_workspace.common import AgentWorkspaceError, ProjectWorkspace
 from core.agent_workspace.execution import (
     ExecutionBoundaryStatus,
@@ -53,6 +55,13 @@ def _bind_project(
     monkeypatch.setattr(tools, "_get_project_workdir", lambda _session_id: str(root))
     monkeypatch.setattr(tools, "_get_workdir", lambda _session_id = None: str(root))
     monkeypatch.setattr(common, "project_workspace", lambda _project_id: workspace)
+
+    @contextlib.contextmanager
+    def access(received_project_id):
+        assert received_project_id == project_id
+        yield workspace
+
+    monkeypatch.setattr(common, "project_workspace_access", access)
     return session_id
 
 
@@ -72,62 +81,38 @@ def test_native_windows_project_commands_are_fail_closed():
     assert status.backend is None
 
 
-def test_project_execution_boundary_forwards_persisted_root_identity(tmp_path, monkeypatch):
+def test_project_execution_id_routes_real_project_without_opening_a_boundary(tmp_path, monkeypatch):
     root = tmp_path / "repository"
     root.mkdir()
     session_id = _bind_project(monkeypatch, root)
-    opened = object()
-    observed = {}
-
-    def fake_open(workspace):
-        observed["workspace"] = workspace
-        return opened
-
-    monkeypatch.setattr(execution.ProjectExecutionBoundary, "open", fake_open)
-
-    assert (
-        tools._project_execution_boundary(
-            session_id,
-            str(root),
-            disable_sandbox = False,
-        )
-        is opened
+    monkeypatch.setattr(
+        execution.ProjectExecutionBoundary,
+        "open",
+        lambda *_args, **_kwargs: pytest.fail("tools.py opened its own process boundary"),
     )
-    metadata = root.stat(follow_symlinks = False)
-    assert observed["workspace"].root == root
-    assert (
-        observed["workspace"].device_id,
-        observed["workspace"].file_id,
-    ) == (int(metadata.st_dev), int(metadata.st_ino))
+
+    assert tools._project_execution_id(session_id, str(root), disable_sandbox = False) == (
+        "secure-tools"
+    )
 
 
-def test_project_execution_boundary_rejects_a_changed_workspace_before_open(tmp_path, monkeypatch):
+def test_project_execution_id_rejects_a_changed_workspace(tmp_path, monkeypatch):
     root = tmp_path / "repository"
     replacement = tmp_path / "replacement"
     root.mkdir()
     replacement.mkdir()
     session_id = tools.project_session_id("secure-tools")
     monkeypatch.setattr(tools, "_get_project_workdir", lambda _session_id: str(root))
-    monkeypatch.setattr(
-        common,
-        "project_workspace",
-        lambda _project_id: _workspace(replacement),
-    )
-    monkeypatch.setattr(
-        execution.ProjectExecutionBoundary,
-        "open",
-        lambda *_args, **_kwargs: pytest.fail("opened a changed project root"),
-    )
 
     with pytest.raises(RuntimeError, match = "workspace changed"):
-        tools._project_execution_boundary(
+        tools._project_execution_id(
             session_id,
-            str(root),
+            str(replacement),
             disable_sandbox = False,
         )
 
 
-def test_full_access_skips_project_boundary_resolution(tmp_path, monkeypatch):
+def test_full_access_skips_project_supervisor_resolution(tmp_path, monkeypatch):
     root = tmp_path / "repository"
     root.mkdir()
     monkeypatch.setattr(
@@ -137,7 +122,7 @@ def test_full_access_skips_project_boundary_resolution(tmp_path, monkeypatch):
     )
 
     assert (
-        tools._project_execution_boundary(
+        tools._project_execution_id(
             tools.project_session_id("secure-tools"),
             str(root),
             disable_sandbox = True,
@@ -154,7 +139,7 @@ def test_windows_project_commands_fail_before_popen(tool_name, tmp_path, monkeyp
     monkeypatch.setattr(
         execution,
         "execution_boundary_status",
-        lambda: ExecutionBoundaryStatus(
+        lambda probe = True: ExecutionBoundaryStatus(
             False,
             None,
             "Project command execution is disabled on Windows.",
@@ -198,6 +183,27 @@ def test_portable_windows_command_gate_returns_before_workspace_or_popen(tool_na
     assert "did not run" in result
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason = "native macOS process containment")
+@pytest.mark.parametrize("tool_name", ["python", "terminal"])
+def test_native_macos_project_tools_fail_before_popen(tool_name, tmp_path, monkeypatch):
+    root = tmp_path / "repository"
+    root.mkdir()
+    session_id = _bind_project(monkeypatch, root)
+    monkeypatch.setattr(
+        tools.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("spawned under insufficient process containment"),
+    )
+
+    if tool_name == "python":
+        result = tools._python_exec("print('unsafe')", session_id = session_id)
+    else:
+        result = tools._bash_exec("echo unsafe", session_id = session_id)
+
+    assert "Execution error" in result
+    assert "detached descendants" in result
+
+
 @pytest.mark.parametrize("tool_name", ["python", "terminal"])
 def test_full_access_project_commands_keep_the_explicit_escape_hatch(
     tool_name, tmp_path, monkeypatch
@@ -228,57 +234,129 @@ def test_full_access_project_commands_keep_the_explicit_escape_hatch(
     assert "Execution error: popen reached" in result
 
 
-class _BoundaryDouble:
-    def __init__(self, root: Path, scratch: Path):
-        self.root = root
-        self.scratch = scratch
-        self.closed = False
-
-    def acquire_execution_slot(self, _cancel_event):
-        return True
-
-    def apply_environment(self, environment):
-        return dict(environment)
-
-    def wrap_argv(self, argv):
-        return list(argv)
-
-    def popen_kwargs(self, _preexec):
-        return {"cwd": str(self.root)}
-
-    def close(self):
-        self.closed = True
-
-
 @pytest.mark.parametrize("tool_name", ["python", "terminal"])
-def test_project_boundary_closes_when_spawn_fails(tool_name, tmp_path, monkeypatch):
+def test_project_tools_dispatch_through_supervisor_with_streaming(tool_name, tmp_path, monkeypatch):
     root = tmp_path / "repository"
-    scratch = tmp_path / "scratch"
     root.mkdir()
-    scratch.mkdir()
-    boundary = _BoundaryDouble(root, scratch)
-    monkeypatch.setattr(tools, "_get_workdir", lambda _session_id = None: str(root))
-    monkeypatch.setattr(tools, "_project_execution_boundary", lambda *_args, **_kwargs: boundary)
+    session_id = _bind_project(monkeypatch, root)
+    observed = {}
+    streamed = []
+
+    def fake_python(project_id, source, **kwargs):
+        observed.update(project_id = project_id, payload = source, kwargs = kwargs)
+        kwargs["output_callback"]("supervised\n")
+        return supervisor.ProjectProcessResult("passed", 0, "supervised\n", 11, False)
+
+    def fake_terminal(project_id, argv, **kwargs):
+        observed.update(project_id = project_id, payload = argv, kwargs = kwargs)
+        kwargs["output_callback"]("supervised\n")
+        return supervisor.ProjectProcessResult("passed", 0, "supervised\n", 11, False)
+
+    monkeypatch.setattr(supervisor, "run_project_python", fake_python)
+    monkeypatch.setattr(supervisor, "run_project_process", fake_terminal)
     monkeypatch.setattr(
         tools.subprocess,
         "Popen",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("spawn failed")),
+        lambda *_args, **_kwargs: pytest.fail("tools.py spawned outside the supervisor"),
     )
 
     if tool_name == "python":
         result = tools._python_exec(
             "print('bounded')",
-            session_id = tools.project_session_id("secure-tools"),
+            session_id = session_id,
+            output_callback = streamed.append,
         )
+        assert observed["payload"] == "print('bounded')"
     else:
         result = tools._bash_exec(
             "echo bounded",
-            session_id = tools.project_session_id("secure-tools"),
+            session_id = session_id,
+            output_callback = streamed.append,
+        )
+        assert observed["payload"][-2:] == ["-c", "echo bounded"]
+
+    assert result == "supervised\n"
+    assert streamed == ["supervised\n"]
+    assert observed["project_id"] == "secure-tools"
+    assert observed["kwargs"]["cancel_event"] is None
+    assert observed["kwargs"]["timeout_seconds"] == 300
+
+
+@pytest.mark.parametrize("tool_name", ["python", "terminal"])
+def test_project_supervisor_results_keep_artifact_cards(tool_name, tmp_path, monkeypatch):
+    root = tmp_path / "repository"
+    root.mkdir()
+    session_id = _bind_project(monkeypatch, root)
+
+    def write_artifact(*_args, **_kwargs):
+        (root / "report.csv").write_text("a,b\n1,2\n", encoding = "utf-8")
+        return supervisor.ProjectProcessResult("passed", 0, "", 0, False)
+
+    monkeypatch.setattr(supervisor, "run_project_python", write_artifact)
+    monkeypatch.setattr(supervisor, "run_project_process", write_artifact)
+
+    if tool_name == "python":
+        result = tools._python_exec("print('ignored')", session_id = session_id)
+    else:
+        result = tools._bash_exec("echo ignored", session_id = session_id)
+
+    assert result.startswith("(no output)")
+    assert '__FILES__:[{"name": "report.csv", "size": 8}]' in result
+
+
+@pytest.mark.parametrize("tool_name", ["python", "terminal"])
+def test_project_supervisor_reports_bounded_output_honestly(tool_name, tmp_path, monkeypatch):
+    root = tmp_path / "repository"
+    root.mkdir()
+    session_id = _bind_project(monkeypatch, root)
+
+    def bounded_result(*_args, **_kwargs):
+        return supervisor.ProjectProcessResult("passed", 0, "prefix", 8192, True)
+
+    monkeypatch.setattr(supervisor, "run_project_python", bounded_result)
+    monkeypatch.setattr(supervisor, "run_project_process", bounded_result)
+
+    if tool_name == "python":
+        result = tools._python_exec("print('ignored')", session_id = session_id)
+    else:
+        result = tools._bash_exec("echo ignored", session_id = session_id)
+
+    assert result.startswith("[Process produced 8192 bytes. Only the bounded 6-byte prefix")
+    assert result.endswith("prefix")
+
+
+@pytest.mark.parametrize("tool_name", ["python", "terminal"])
+@pytest.mark.parametrize("status", ["timed_out", "cancelled"])
+def test_project_supervisor_keeps_truncation_notice_on_early_stop(
+    tool_name, status, tmp_path, monkeypatch
+):
+    root = tmp_path / "repository"
+    root.mkdir()
+    session_id = _bind_project(monkeypatch, root)
+    notice = "\n[Process output was truncated. The capture limit was 1024 bytes.]\n"
+
+    def stopped_result(*_args, **_kwargs):
+        return supervisor.ProjectProcessResult(
+            status,
+            None,
+            f"prefix{notice}",
+            8192,
+            True,
+            notice,
         )
 
-    assert "Execution error: spawn failed" in result
-    assert boundary.closed is True
-    assert not list(scratch.glob("studio_exec_*.py"))
+    monkeypatch.setattr(supervisor, "run_project_python", stopped_result)
+    monkeypatch.setattr(supervisor, "run_project_process", stopped_result)
+
+    if tool_name == "python":
+        result = tools._python_exec("print('ignored')", session_id = session_id)
+    else:
+        result = tools._bash_exec("echo ignored", session_id = session_id)
+
+    expected = "Execution timed out" if status == "timed_out" else "Execution cancelled."
+    assert result.startswith(expected)
+    assert result.count(notice.strip()) == 1
+    assert "prefix" not in result
 
 
 def test_boundary_open_rejects_an_unavailable_backend_without_touching_the_root(
@@ -335,7 +413,6 @@ def test_native_posix_boundary_allows_project_write_and_denies_sibling_write(tmp
     source = """
 import sys
 from pathlib import Path
-
 Path("inside.txt").write_text("inside", encoding="utf-8")
 try:
     Path(sys.argv[1]).write_text("escaped", encoding="utf-8")
@@ -380,21 +457,26 @@ else:
     assert not outside.exists()
 
 
-@pytest.mark.skipif(os.name != "posix", reason = "native POSIX command boundary")
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason = "native Linux supervisor")
 def test_native_project_python_entrypoint_confines_writes(tmp_path, monkeypatch):
-    status = execution_boundary_status()
+    status = supervisor.supervised_process_status()
     if not status.available:
         if os.environ.get("UNSLOTH_SECURE_BOUNDARY_REQUIRED") == "1":
-            pytest.fail(status.reason or "the required project command boundary is unavailable")
-        pytest.skip(status.reason or "project command boundary is unavailable")
+            pytest.fail(status.reason or "the required project process supervisor is unavailable")
+        pytest.skip(status.reason or "project process supervisor is unavailable")
 
     root = tmp_path / "repository"
     root.mkdir()
+    (root / "helper.py").write_text("VALUE = 42\n", encoding = "utf-8")
     outside = tmp_path / "outside.txt"
     session_id = _bind_project(monkeypatch, root)
     source = f"""
 from pathlib import Path
+import helper
 
+print(Path.cwd())
+print(helper.VALUE)
+print(Path(__file__).name)
 Path("inside.txt").write_text("inside", encoding="utf-8")
 try:
     Path({str(outside)!r}).write_text("escaped", encoding="utf-8")
@@ -414,11 +496,78 @@ else:
     result = tools._python_exec(source, session_id = session_id)
 
     lines = result.splitlines()
-    assert lines[0] == "outside denied"
-    if status.backend == "bubblewrap":
-        assert lines[1] == "host read denied"
+    assert lines[0] == str(root)
+    assert lines[1] == "42"
+    assert lines[2].startswith("studio_exec_") and lines[2].endswith(".py")
+    assert lines[3] == "outside denied"
+    assert lines[4] == "host read denied"
     assert (root / "inside.txt").read_text(encoding = "utf-8") == "inside"
     assert not outside.exists()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason = "native Linux supervisor")
+@pytest.mark.parametrize("tool_name", ["python", "terminal"])
+def test_native_project_tools_kill_detached_descendants_before_lease_and_slot_release(
+    tool_name, tmp_path, monkeypatch
+):
+    status = supervisor.supervised_process_status()
+    if not status.available:
+        if os.environ.get("UNSLOTH_SECURE_BOUNDARY_REQUIRED") == "1":
+            pytest.fail(status.reason or "the required project process supervisor is unavailable")
+        pytest.skip(status.reason or "project process supervisor is unavailable")
+
+    root = tmp_path / "repository"
+    root.mkdir()
+    session_id = _bind_project(monkeypatch, root)
+    workspace = _workspace(root)
+    lease_released = root / "lease-released.txt"
+    slot_released = root / "slot-released.txt"
+    escaped = root / "escaped.txt"
+
+    @contextlib.contextmanager
+    def access(project_id):
+        assert project_id == workspace.project_id
+        try:
+            yield workspace
+        finally:
+            lease_released.write_text("released", encoding = "utf-8")
+
+    monkeypatch.setattr(common, "project_workspace_access", access)
+    child_code = (
+        "import time; from pathlib import Path; "
+        f"lease=Path({str(lease_released)!r}); slot=Path({str(slot_released)!r}); "
+        f"escaped=Path({str(escaped)!r}); deadline=time.monotonic()+10; "
+        'exec("while time.monotonic() < deadline and not lease.exists() and not slot.exists():\\n'
+        '    time.sleep(0.005)"); '
+        "escaped.write_text('survived', encoding='utf-8') "
+        "if lease.exists() or slot.exists() else None"
+    )
+    if tool_name == "python":
+        source = (
+            "import subprocess, sys, time; "
+            f"child=subprocess.Popen([sys.executable, '-c', {child_code!r}], "
+            "start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+            "print(child.pid, flush=True); time.sleep(30)"
+        )
+        result = tools._python_exec(source, session_id = session_id, timeout = 0.2)
+    else:
+        command = (
+            f"setsid {shlex.quote(sys.executable)} -c {shlex.quote(child_code)} "
+            ">/dev/null 2>&1 & echo $!; sleep 30"
+        )
+        result = tools._bash_exec(command, session_id = session_id, timeout = 0.2)
+
+    identity = (int(workspace.device_id), int(workspace.file_id))
+    assert mutation.acquire_workspace_mutation_slot(identity) is True
+    try:
+        slot_released.write_text("released", encoding = "utf-8")
+    finally:
+        mutation.release_workspace_mutation_slot(identity)
+    time.sleep(0.5)
+
+    assert result.startswith("Execution timed out after 0.2 seconds."), result
+    assert lease_released.exists()
+    assert not escaped.exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason = "POSIX descriptor mutation")
