@@ -54,12 +54,18 @@ export {
   type Preset,
 } from "./chat-settings-sheet";
 export { useChatRuntimeStore } from "./stores/chat-runtime-store";
+export { restoreSideConversationParentSettings } from "./stores/chat-runtime-store";
 export {
   hydrateModelDisclaimerPreference,
   refreshModelDisclaimerPreference,
   saveModelDisclaimerPreference,
 } from "./sync-model-disclaimer-preference";
 export { useChatActive, useInComparePane } from "./runtime-provider";
+export {
+  useSideComposerMountedRef,
+  useSideConversationPendingPromptSubmission,
+  useSideConversationUnmountCleanup,
+} from "./hooks/use-side-conversation-lifecycle";
 export {
   CHAT_RAG_CAPTION_KEY,
   CHAT_RAG_OCR_KEY,
@@ -126,10 +132,13 @@ export {
   notifyPromptQueueRunFailed,
   PROMPT_QUEUE_RUN_FAILED_EVENT,
   PROMPT_QUEUE_STOP_EVENT,
+  requestPromptQueueStop,
   requestLocalPromptQueueStop,
+  requestTemporaryPromptQueueStop,
   type PromptQueueRunFailedEventDetail,
   type PromptQueueStopEventDetail,
 } from "./utils/prompt-queue-boundary";
+export { cancelPendingPromptQueueFactoriesForStop } from "./utils/pending-prompt-queue-stop";
 export {
   adoptPreStreamRunReservation,
   cancelPreStreamRunReservations,
@@ -247,11 +256,40 @@ export {
   deleteStoredChatThreads,
   ensureStoredChatThread,
   getStoredChatThread,
+  forgetThreadIncognito,
   isThreadIncognito,
   listStoredChatMessages,
   listStoredChatThreads,
   markThreadIncognito,
 } from "./utils/chat-history-storage";
+export {
+  activateSideConversationAfterInitialization,
+  beginSideConversationLaunch,
+  cancelSideConversationLaunch,
+  claimSideConversationLaunchThread,
+  completeSideConversationCleanup,
+  createSideConversationLaunchDeadline,
+  disposeSideConversation,
+  endSideConversation,
+  finishSideConversationLaunch,
+  getActiveSideConversation,
+  getSideConversationSession,
+  isSideConversationOwner,
+  parseSideCommand,
+  requestSideConversationCleanup,
+  sideConversationBlocksModelLifecycle,
+  sideConversationForThread,
+  snapshotStableSideHistory,
+  subscribeSideConversation,
+  takeSideConversationParentSettingsForRestore,
+  takeSideConversationPendingPrompt,
+  waitForSideConversationCleanup,
+  type ClaimedSideConversation,
+  type SideConversation,
+  type SideConversationDisposalActions,
+  type SideConversationDisposalOptions,
+  type SideConversationSession,
+} from "./utils/side-conversation";
 export { allRecordedSandboxSessionIds } from "./utils/recorded-sandbox-session";
 export {
   markChatThreadDeleted,

@@ -229,6 +229,7 @@ import {
 } from "./utils/chat-history-storage";
 import { attachmentsSample } from "./utils/pasted-text";
 import { requestTemporaryPromptQueueStop } from "./utils/prompt-queue-boundary";
+import { sideConversationBlocksModelLifecycle } from "./utils/side-conversation";
 import { isAssistantLocalThreadId } from "./utils/thread-ids";
 import {
   consumeProjectSourcesPending,
@@ -2955,13 +2956,20 @@ export function ChatPage({
     [stageOrLoad],
   );
   const handleNativeModelDropAutoLoad = useCallback(
-    (intent: NativeIntent) =>
-      loadNativeModelIntent(
+    (intent: NativeIntent) => {
+      if (sideConversationBlocksModelLifecycle()) {
+        toast.error("Model switching is unavailable in side chat", {
+          description: "Return to the parent chat before changing models.",
+        });
+        return Promise.resolve();
+      }
+      return loadNativeModelIntent(
         intent,
         hasActiveModel
           ? "Replacing with dropped local GGUF model."
           : "Loading dropped local GGUF model.",
-      ),
+      );
+    },
     [hasActiveModel, loadNativeModelIntent],
   );
   // Dropped documents go to the thread bar, which owns the RAG upload and can
@@ -3025,6 +3033,12 @@ export function ChatPage({
       // Partial: the switch-back carries only what the resolver cannot recover.
       meta?: Partial<ModelSelectorChangeMeta>,
     ) => {
+      if (sideConversationBlocksModelLifecycle()) {
+        toast.error("Model switching is unavailable in side chat", {
+          description: "Return to the parent chat before changing models.",
+        });
+        return;
+      }
       const store = useChatRuntimeStore.getState();
       const currentCheckpoint = store.params.checkpoint;
       const currentVariant = store.activeGgufVariant;

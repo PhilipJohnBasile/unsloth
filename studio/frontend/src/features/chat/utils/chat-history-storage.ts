@@ -54,6 +54,11 @@ export function markThreadIncognito(threadId: string): void {
   incognitoThreadIds.add(threadId);
 }
 
+/** Release a temporary thread tag only after its runtime and server resources are gone. */
+export function forgetThreadIncognito(threadId: string): void {
+  incognitoThreadIds.delete(threadId);
+}
+
 /** True for a temporary-session thread, which is deliberately never persisted. */
 export function isThreadIncognito(threadId: string): boolean {
   return incognitoThreadIds.has(threadId);

@@ -115,6 +115,16 @@ export function discardQueuedChatRunSettings(id: number): void {
   }
 }
 
+export function updateQueuedChatRunSettings(
+  id: number,
+  settings: QueuedChatRunSettings,
+): boolean {
+  const entry = pendingSettings.find((candidate) => candidate.id === id);
+  if (!entry) return false;
+  entry.settings = settings;
+  return true;
+}
+
 export function discardQueuedChatRunSettingsForThread(
   threadId?: string | null,
 ): void {

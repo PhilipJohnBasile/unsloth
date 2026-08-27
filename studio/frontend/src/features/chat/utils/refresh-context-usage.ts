@@ -15,6 +15,11 @@ import { isExternalModelId } from "../external-providers";
 import { useChatRuntimeStore } from "../stores/chat-runtime-store";
 import type { MessageRecord } from "../types";
 import { listStoredChatMessages } from "./chat-history-storage";
+import {
+  sideConversationForThread,
+  sideConversationMessagesForRun,
+  sideConversationVisibleThreadId,
+} from "./side-conversation";
 
 // Per thread, not per module: in compare mode a hidden pane's history load would otherwise
 // invalidate the visible thread's count, blanking the bar.
@@ -163,7 +168,10 @@ function branchSignature(messages: readonly ThreadMessage[]): string {
 }
 
 /** The branch the mounted runtime is showing for the thread the store calls active. */
-type ActiveBranchReader = () => readonly ThreadMessage[] | null;
+type ActiveBranchReader = {
+  threadId: string;
+  read: () => readonly ThreadMessage[] | null;
+};
 
 let readActiveBranch: ActiveBranchReader | null = null;
 
@@ -188,7 +196,11 @@ export async function refreshContextUsage(
   options?: RefreshOptions,
 ): Promise<void> {
   const store = useChatRuntimeStore.getState();
-  const threadId = options?.threadId ?? store.activeThreadId;
+  const requestedThreadId = options?.threadId ?? store.activeThreadId;
+  const threadId = sideConversationVisibleThreadId(
+    requestedThreadId,
+    readActiveBranch?.threadId,
+  );
   const checkpoint = store.params.checkpoint;
 
   if (
@@ -216,6 +228,13 @@ export async function refreshContextUsage(
 
   const capturedThreadId = threadId ?? null;
   const capturedCheckpoint = checkpoint;
+  const capturedIsSide = sideConversationForThread(capturedThreadId) !== null;
+
+  const threadIsVisible = (): boolean =>
+    capturedIsSide
+      ? readActiveBranch?.threadId === capturedThreadId &&
+        sideConversationForThread(capturedThreadId) !== null
+      : useChatRuntimeStore.getState().activeThreadId === capturedThreadId;
 
   if (countsInFlight.has(capturedThreadId)) {
     retryAfterInFlight.set(capturedThreadId, options);
@@ -229,7 +248,8 @@ export async function refreshContextUsage(
   // supersedes this one; publishing after either puts another model's number on the bar.
   const stale = (): boolean =>
     superseded(capturedThreadId, generation) ||
-    useChatRuntimeStore.getState().params.checkpoint !== capturedCheckpoint;
+    useChatRuntimeStore.getState().params.checkpoint !== capturedCheckpoint ||
+    !threadIsVisible();
 
   countsInFlight.add(capturedThreadId);
   let published = false;
@@ -240,8 +260,8 @@ export async function refreshContextUsage(
     // until switchToNewThread() settles, so null === null would price it into the empty chat.
     const readOwnBranch = (): readonly ThreadMessage[] | null =>
       capturedThreadId != null &&
-      useChatRuntimeStore.getState().activeThreadId === capturedThreadId
-        ? (readActiveBranch?.() ?? null)
+      readActiveBranch?.threadId === capturedThreadId
+        ? (readActiveBranch.read() ?? null)
         : null;
 
     const liveBranch = readOwnBranch();
@@ -262,15 +282,19 @@ export async function refreshContextUsage(
         storedMessageToRunMessage,
       );
     }
+    const effectiveRunMessages = sideConversationMessagesForRun(
+      threadId,
+      runMessages,
+    );
 
     // /chat/count_tokens always 503s on images: /apply-template swaps each for a marker. Declining
     // before the hash below keeps the base64 out of it and out of a request body that can reach
     // megabytes, both synchronous on the UI thread.
-    if (messagesContainImage(runMessages)) return;
+    if (messagesContainImage(effectiveRunMessages)) return;
 
     // The real request replays the newest user audio as audio_base64 but toOpenAIMessages has
     // no audio branch, so counting would price a text-only prompt. Decline as images do.
-    if (findLatestUserAudioBase64(runMessages)) return;
+    if (findLatestUserAudioBase64(effectiveRunMessages)) return;
 
     // Same for video, and more so: the real request replays the clip as
     // video_base64 and llama-server expands it into frames, while
@@ -279,7 +303,7 @@ export async function refreshContextUsage(
     // /chat/count_tokens 503s on video for the same reason. Declining here also
     // keeps up to 85 MB of base64 out of branchSignature's JSON.stringify,
     // which is the synchronous main-thread cost the image bail above exists for.
-    if (findLatestUserVideoBase64(runMessages)) return;
+    if (findLatestUserVideoBase64(effectiveRunMessages)) return;
 
     if (fromLiveBranch) {
       countedBranch = branchSignature(runMessages);
@@ -321,7 +345,7 @@ export async function refreshContextUsage(
       return;
     }
     // Compared even when null: a count started with no thread must not land on one since opened.
-    if (useChatRuntimeStore.getState().activeThreadId !== capturedThreadId) {
+    if (!threadIsVisible()) {
       return;
     }
     if (useChatRuntimeStore.getState().contextUsage !== usageBeforeCount) {
@@ -336,7 +360,7 @@ export async function refreshContextUsage(
     // emitting any leaves it equal and the branch is the only witness. An empty current branch is
     // a mismatch: deleting the sole exchange mid-count would leave the old total on the thread.
     if (countedBranch != null) {
-      const current = readActiveBranch?.();
+      const current = readActiveBranch?.read();
       if (current != null && branchSignature(current) !== countedBranch) {
         return;
       }
@@ -354,13 +378,20 @@ export async function refreshContextUsage(
       }
     }
 
-    useChatRuntimeStore.getState().setContextUsage({
+    const usage = {
       promptTokens: inputTokens,
       completionTokens: 0,
       totalTokens: inputTokens,
       cachedTokens: 0,
       cacheWriteTokens: 0,
-    });
+    };
+    if (capturedThreadId !== null) {
+      useChatRuntimeStore
+        .getState()
+        .setThreadContextUsage(capturedThreadId, usage, { visible: true });
+    } else {
+      useChatRuntimeStore.getState().setContextUsage(usage);
+    }
     published = true;
   } catch {
     // Background recount should not interrupt chat; saved usage stays visible.

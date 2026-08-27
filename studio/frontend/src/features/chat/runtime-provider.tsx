@@ -32,6 +32,7 @@ import {
   useEffect,
   useMemo,
   useRef,
+  useSyncExternalStore,
 } from "react";
 import { toast } from "sonner";
 import { StudioDictationAdapter } from "./adapters/studio-dictation-adapter";
@@ -164,6 +165,12 @@ import {
   type RunCheckpointScheduler,
   createRunCheckpointScheduler,
 } from "./utils/run-checkpoint-scheduler";
+import {
+  getSideConversationSession,
+  isSideConversationThread,
+  sideConversationOwnsRuntimeSwitch,
+  subscribeSideConversation,
+} from "./utils/side-conversation";
 import { isAssistantLocalThreadId } from "./utils/thread-ids";
 import { sanitizeThreadScopedSettings } from "./utils/thread-scoped-settings";
 import { VideoAttachmentAdapter } from "./video-attachment-adapter";
@@ -1912,14 +1919,19 @@ function useStudioRuntimeAdapters(
             !backgroundedRef?.current &&
             !switchInFlight
           ) {
-            const store = useChatRuntimeStore.getState();
-            const visibleThreadId = aui.threads().getState().mainThreadId;
             if (
-              (visibleThreadId === localThreadId ||
-                visibleThreadId === remoteId) &&
-              store.activeThreadId !== remoteId
+              !isSideConversationThread(localThreadId) &&
+              !isSideConversationThread(remoteId)
             ) {
-              store.setActiveThreadId(remoteId);
+              const store = useChatRuntimeStore.getState();
+              const visibleThreadId = aui.threads().getState().mainThreadId;
+              if (
+                (visibleThreadId === localThreadId ||
+                  visibleThreadId === remoteId) &&
+                store.activeThreadId !== remoteId
+              ) {
+                store.setActiveThreadId(remoteId);
+              }
             }
           }
           // One point read: the model run waits on this write.
@@ -2152,7 +2164,10 @@ function ThreadAutoSwitch({
       return;
     }
     newThreadSwitchStateRef.current.activeNonce = null;
-    if (mainThreadId !== threadId) {
+    if (
+      mainThreadId !== threadId &&
+      !sideConversationOwnsRuntimeSwitch(threadId, mainThreadId)
+    ) {
       // Bumped, not read: this resolves asynchronously into a shared provider, so a newer
       // switch of EITHER kind must supersede it. Sharing one token across two saved
       // switches let a late rejection detach the chat already on screen.
@@ -2774,21 +2789,25 @@ function ActiveBranchRegistrar({
   enabled,
 }: { enabled: boolean }): ReactElement | null {
   const aui = useAui();
+  const threadId = useAuiState(({ threadListItem }) => threadListItem.id);
 
   useEffect(() => {
     if (!enabled) {
       return;
     }
-    setActiveBranchReader(() => {
-      try {
-        return aui.thread().getState().messages;
-      } catch {
-        // No thread mounted yet; the recount falls back to the stored records.
-        return null;
-      }
+    setActiveBranchReader({
+      threadId,
+      read: () => {
+        try {
+          return aui.thread().getState().messages;
+        } catch {
+          // No thread mounted yet; the recount falls back to the stored records.
+          return null;
+        }
+      },
     });
     return () => setActiveBranchReader(null);
-  }, [aui, enabled]);
+  }, [aui, enabled, threadId]);
 
   return null;
 }
@@ -2801,6 +2820,13 @@ function ThreadContextUsageRecount({
   enabled,
 }: { enabled: boolean }): ReactElement | null {
   const activeThreadId = useChatRuntimeStore((s) => s.activeThreadId);
+  const activeSideConversation = useSyncExternalStore(
+    subscribeSideConversation,
+    getSideConversationSession,
+    getSideConversationSession,
+  );
+  const contextThreadId =
+    activeSideConversation?.sideThreadId ?? activeThreadId;
   const checkpoint = useChatRuntimeStore((s) => s.params.checkpoint);
   const ggufContextLength = useChatRuntimeStore((s) => s.ggufContextLength);
   const modelLoading = useChatRuntimeStore((s) => s.modelLoading);
@@ -2814,7 +2840,7 @@ function ThreadContextUsageRecount({
   useEffect(() => {
     if (
       !enabled ||
-      !activeThreadId ||
+      !contextThreadId ||
       modelLoading ||
       runActive ||
       !checkpoint ||
@@ -2823,11 +2849,16 @@ function ThreadContextUsageRecount({
       return;
     }
     // Only into a blank bar: restored or completion-written usage is exact, this is an estimate.
-    if (useChatRuntimeStore.getState().contextUsage != null) return;
-    void refreshContextUsage({ threadId: activeThreadId });
+    if (
+      useChatRuntimeStore.getState().contextUsageByThreadId[contextThreadId] !=
+      null
+    ) {
+      return;
+    }
+    void refreshContextUsage({ threadId: contextThreadId });
   }, [
-    activeThreadId,
     checkpoint,
+    contextThreadId,
     enabled,
     ggufContextLength,
     runActive,
@@ -2969,10 +3000,15 @@ function ThreadBackendAutosave({
         !backgroundedRef.current &&
         !switchInFlight
       ) {
-        const store = useChatRuntimeStore.getState();
-        const activeThreadId = runtime.threads.getState().mainThreadId;
-        if (activeThreadId === threadId && store.activeThreadId !== remoteId) {
-          store.setActiveThreadId(remoteId);
+        if (
+          !isSideConversationThread(threadId) &&
+          !isSideConversationThread(remoteId)
+        ) {
+          const store = useChatRuntimeStore.getState();
+          const activeThreadId = runtime.threads.getState().mainThreadId;
+          if (activeThreadId === threadId && store.activeThreadId !== remoteId) {
+            store.setActiveThreadId(remoteId);
+          }
         }
       }
     },

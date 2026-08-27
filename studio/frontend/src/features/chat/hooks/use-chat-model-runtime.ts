@@ -95,6 +95,7 @@ import { recordLastLocalModelLoad } from "../utils/last-local-model-load";
 import { loadFallbackNotice } from "../utils/mmproj-fallback";
 import { resolveQwenThinkingParams } from "../utils/qwen-params";
 import { refreshContextUsage } from "../utils/refresh-context-usage";
+import { sideConversationBlocksModelLifecycle } from "../utils/side-conversation";
 import { ensureGpuDeviceCache } from "@/hooks/use-gpu-info";
 import {
   type CpuFallbackReason,
@@ -400,6 +401,7 @@ async function syncInferenceStatusToStore(options?: {
   includeLoras?: boolean;
   preserveIdleUnloaded?: boolean;
 }): Promise<void> {
+  if (sideConversationBlocksModelLifecycle()) return;
   const signal = options?.signal;
   const includeLoras = options?.includeLoras ?? true;
   // Last issued wins: it read the freshest status, whichever answers first.
@@ -423,6 +425,7 @@ async function syncInferenceStatusToStore(options?: {
     // Same for a refresh that a later one has already superseded: its answer
     // describes a moment that has passed.
     if (signal?.aborted || superseded()) return;
+    if (sideConversationBlocksModelLifecycle()) return;
 
     setModels(listRes.models.map(toChatModelRow));
     if (lorasRes) {
@@ -514,6 +517,7 @@ async function syncInferenceStatusToStore(options?: {
       }
     }
   } catch (error) {
+    if (sideConversationBlocksModelLifecycle()) return;
     // A superseded refresh reports nothing, or a stale failure would raise a
     // toast about a read whose answer would have been discarded anyway.
     if (signal?.aborted || superseded()) return;
@@ -539,6 +543,7 @@ async function syncInferenceStatusToStore(options?: {
  * the refresh below leaves it intact.
  */
 export async function resyncInferenceStatusAfterServerModelChange(): Promise<void> {
+  if (sideConversationBlocksModelLifecycle()) return;
   // Both llama.cpp update paths land here, and an update replaces the binary whose
   // --help the flag catalogue describes.
   invalidateLlamaFlagCatalog();
@@ -752,6 +757,17 @@ export function useChatModelRuntime() {
         restorePreviousConfig();
         return;
       }
+      const rejectSideModelChange = (): boolean => {
+        if (!sideConversationBlocksModelLifecycle()) return false;
+        restorePreviousConfig();
+        const message = "Model changes are unavailable while a side chat is open.";
+        toast.info("Model changes are unavailable in side chat", {
+          description: "Return to the parent chat first.",
+        });
+        if (throwOnError) throw new Error(message);
+        return true;
+      };
+      if (rejectSideModelChange()) return;
       // A load is already in flight. If it's this exact pick (id + variant + token),
       // ignore the duplicate click. If it's a DIFFERENT model (including a different
       // GGUF variant of the same repo, which the old id+token guard wrongly treated
@@ -917,6 +933,7 @@ export function useChatModelRuntime() {
           // verdict that no longer holds, falls through to /load, where a real
           // disagreement belongs.
           const confirmedStatus = await getInferenceStatus().catch(() => null);
+          if (rejectSideModelChange()) return;
           if (confirmedStatus && adoptable(confirmedStatus)) {
             // Same window as the confirm below: a rival load may have started during that GET,
             // and it owns the resident model now.
@@ -986,6 +1003,7 @@ export function useChatModelRuntime() {
       // Block queue materialization before taking the cancellation snapshot.
       // A queue that appears while the dialog is open must not be stopped
       // without having been included in the user's confirmation.
+      if (rejectSideModelChange()) return;
       const lifecycleLease = useChatRuntimeStore
         .getState()
         .beginModelLoading();
@@ -2441,6 +2459,12 @@ export function useChatModelRuntime() {
 
   const ejectModel = useCallback(async (): Promise<boolean> => {
     if (!params.checkpoint) {
+      return false;
+    }
+    if (sideConversationBlocksModelLifecycle()) {
+      toast.info("Model changes are unavailable in side chat", {
+        description: "Return to the parent chat first.",
+      });
       return false;
     }
     const bailIfLoading = (): boolean => {

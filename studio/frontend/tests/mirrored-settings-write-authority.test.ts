@@ -57,7 +57,7 @@ test("selecting a Codex checkpoint keeps deep research", () => {
   }
   assert.match(
     body,
-    /if \(clampsDeepResearch\) \{\s*saveBool\(CHAT_DEEP_RESEARCH_ENABLED_KEY, false\);/,
+    /if \(clampsDeepResearch && persistForConversation\) \{\s*saveBool\(CHAT_DEEP_RESEARCH_ENABLED_KEY, false\);/,
   );
   assert.match(body, /const nextDeepResearchEnabled = clampsDeepResearch/);
   assert.match(

@@ -54,6 +54,7 @@ import { isMultimodalResponse } from "./types/api";
 import { getImageInputUnavailableReason } from "./utils/image-input-support";
 import { CONVERSATION_MARKDOWN_LABEL } from "./utils/conversation-markdown";
 import { pasteClipboardFiles } from "./utils/clipboard-files";
+import { parseSideCommand } from "./utils/side-conversation";
 import { confirmStopRunningChatsIfNeeded } from "./utils/confirm-stop-running-chats";
 import { requestLocalPromptQueueStop } from "./utils/prompt-queue-boundary";
 import { cancelPreStreamRunReservations } from "./utils/pre-stream-run-reservation";
@@ -1069,6 +1070,13 @@ export function SharedComposer({
     const submittedAudio = pendingAudio;
     const msg = submittedText.trim();
     if (!msg && submittedImages.length === 0 && !submittedAudio) {
+      resetPromptQueue();
+      return;
+    }
+    if (parseSideCommand(submittedText).matched) {
+      toast.error("Side chat is unavailable in Compare", {
+        description: "Return to a single saved chat, then use /side.",
+      });
       resetPromptQueue();
       return;
     }

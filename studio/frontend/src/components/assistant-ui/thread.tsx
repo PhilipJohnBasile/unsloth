@@ -174,6 +174,7 @@ import {
   addQueuedChatRunSettingsThreadIds,
   adoptPreStreamRunReservation,
   chatHistoryClearBoundary,
+  cancelPendingPromptQueueFactoriesForStop,
   deleteStoredChatThreads,
   discardQueuedChatRunSettings,
   discardQueuedChatRunSettingsForThread,
@@ -195,6 +196,8 @@ import {
   pastedTextOf,
   readPasteDraft,
   writePasteDraft,
+  forgetThreadIncognito,
+  isThreadIncognito,
   markThreadIncognito,
   markChatThreadDeleted,
   type PromptQueueRunFailedEventDetail,
@@ -212,6 +215,28 @@ import {
   type PlusMenuItemId,
   usePlusMenuPrefsStore,
   writeComposerDraft,
+  requestPromptQueueStop,
+  activateSideConversationAfterInitialization,
+  beginSideConversationLaunch,
+  claimSideConversationLaunchThread,
+  createSideConversationLaunchDeadline,
+  disposeSideConversation,
+  getSideConversationSession,
+  isSideConversationOwner,
+  parseSideCommand,
+  requestSideConversationCleanup,
+  restoreSideConversationParentSettings,
+  sideConversationForThread,
+  snapshotStableSideHistory,
+  subscribeSideConversation,
+  takeSideConversationParentSettingsForRestore,
+  waitForSideConversationCleanup,
+  type ClaimedSideConversation,
+  type SideConversation,
+  type SideConversationSession,
+  useSideComposerMountedRef,
+  useSideConversationPendingPromptSubmission,
+  useSideConversationUnmountCleanup,
 } from "@/features/chat";
 import {
   applySentTextGuard,
@@ -288,6 +313,7 @@ import { HugeiconsIcon } from "@hugeicons/react";
 import { useNavigate } from "@tanstack/react-router";
 import {
   ArrowDownIcon,
+  ArrowLeftIcon,
   ArrowUpIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
@@ -324,6 +350,7 @@ import {
   useContext,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   useSyncExternalStore,
@@ -1387,35 +1414,6 @@ function retainPendingPromptQueueItemsAfterFailure(run: PromptQueueRun) {
   return true;
 }
 
-function cancelPendingPromptQueueFactoriesForStop<
-  T extends { temporary: boolean; cancelled: boolean },
->(
-  pendingFactories: Map<string, T>,
-  aliases: string[],
-  detail: PromptQueueStopEventDetail,
-) {
-  const { threadIds, temporaryOnly, localOnly } = detail;
-  if (localOnly) {
-    // Advancing the model boundary invalidates local factories once hydrated.
-    // External factories must remain intact.
-    return;
-  }
-  if (
-    threadIds &&
-    threadIds.length > 0 &&
-    !threadIds.some((threadId) => aliases.includes(threadId))
-  ) {
-    return;
-  }
-  for (const [key, reservation] of pendingFactories) {
-    if (temporaryOnly && !reservation.temporary) {
-      continue;
-    }
-    reservation.cancelled = true;
-    pendingFactories.delete(key);
-  }
-}
-
 function stopAllPromptQueueRuns() {
   const activeRuns = Array.from(promptQueueRuns.values()).map((run) => ({
     activeItem: getActivePromptQueueItem(run),
@@ -1526,6 +1524,69 @@ const ThreadMessage: FC = () => {
 // inline arrow changes identity each time, invalidating the memo that keeps the message array from
 // being rebuilt, and the bail-out below it would never get to run.
 const renderThreadMessage = proplessSlot(ThreadMessage);
+const subscribeToNothing = () => () => undefined;
+
+const SideConversationBanner: FC<{
+  conversation: ClaimedSideConversation;
+  returning: boolean;
+  onReturn: () => void;
+}> = ({ conversation, returning, onReturn }) => {
+  const aui = useAui();
+  const threadListRuntime =
+    aui.threads().__internal_getAssistantRuntime?.()?.threads ?? null;
+  const parentRuntime = useMemo(() => {
+    try {
+      return threadListRuntime?.getById(conversation.parentThreadId) ?? null;
+    } catch {
+      return null;
+    }
+  }, [conversation.parentThreadId, threadListRuntime]);
+  const parentStatusCode = useSyncExternalStore(
+    parentRuntime ? parentRuntime.subscribe : subscribeToNothing,
+    () => {
+      try {
+        return parentRuntime?.getState().isRunning ? 1 : 0;
+      } catch {
+        return -1;
+      }
+    },
+    () => 0,
+  );
+  const parentAvailable = parentRuntime !== null && parentStatusCode !== -1;
+  const parentRunning = parentStatusCode === 1;
+
+  const parentStatus = !parentAvailable
+    ? "Parent unavailable"
+    : parentRunning
+      ? "Parent is still running"
+      : "Parent is ready";
+
+  return (
+    <div className="absolute inset-x-5 top-[calc(var(--studio-content-top-inset,0px)+52px)] z-30 mx-auto flex max-w-[46rem] items-center justify-between gap-3 rounded-xl border border-primary/20 bg-background/95 px-3 py-2 shadow-sm backdrop-blur-sm">
+      <div className="min-w-0">
+        <p className="text-xs font-semibold text-foreground">Side chat</p>
+        <p className="truncate text-ui-11 text-muted-foreground">
+          {parentStatus}
+        </p>
+      </div>
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        disabled={returning}
+        onClick={onReturn}
+        className="shrink-0 gap-1.5"
+      >
+        {returning ? (
+          <Loader2Icon className="size-3.5 animate-spin" />
+        ) : (
+          <ArrowLeftIcon className="size-3.5" />
+        )}
+        Return to parent
+      </Button>
+    </div>
+  );
+};
 
 // Memoized: chat-page renders this inline in a store-subscribing component, so a parent render
 // would otherwise reconcile the whole message list.
@@ -1540,16 +1601,188 @@ export const Thread: FC<{
   const { ref: viewportRef, context: autoScrollContext } =
     useIntentAwareAutoScroll();
 
-  const isComposerAttachPending = useAuiState(({ threads }) =>
-    targetThreadId ? threads.mainThreadId !== targetThreadId : false,
-  );
   const runtimeThreadId = useAuiState(
     ({ threadListItem }) => threadListItem.id,
   );
+  const sideSession = useSyncExternalStore(
+    subscribeSideConversation,
+    getSideConversationSession,
+    getSideConversationSession,
+  );
+  const activeSideConversation =
+    sideSession?.phase === "active"
+      ? (sideSession as SideConversation)
+      : null;
+  const sideConversation = sideConversationForThread(runtimeThreadId);
+  const effectiveTargetThreadId = sideConversation
+    ? undefined
+    : targetThreadId;
+  const isComposerAttachPending = useAuiState(({ threads }) =>
+    effectiveTargetThreadId
+      ? threads.mainThreadId !== effectiveTargetThreadId
+      : false,
+  );
   const activeThreadId = useChatRuntimeStore((s) => s.activeThreadId);
-  const threadId = targetThreadId ?? activeThreadId ?? null;
+  const threadId =
+    sideConversation?.sideThreadId ??
+    effectiveTargetThreadId ??
+    activeThreadId ??
+    null;
   const aui = useAui();
   useThreadForkCounts();
+  const [returningToParent, setReturningToParent] = useState(false);
+  const returningSideRef = useRef<string | null>(null);
+  const cleanupPromisesRef = useRef(new Map<number, Promise<void>>());
+  const cleanupRetryTimersRef = useRef(
+    new Map<number, ReturnType<typeof setTimeout>>(),
+  );
+  const discardSideRuntimeRef = useRef<
+    (
+      conversation: SideConversationSession,
+      showError: boolean,
+    ) => Promise<void>
+  >(() => Promise.resolve());
+
+  useEffect(() => {
+    if (!activeSideConversation) return;
+    const store = useChatRuntimeStore.getState();
+    useChatRuntimeStore.setState({
+      contextUsage:
+        store.contextUsageByThreadId[activeSideConversation.sideThreadId] ??
+        null,
+    });
+  }, [activeSideConversation]);
+
+  const restoreParentPresentation = useCallback(
+    (conversation: SideConversationSession) => {
+      const store = useChatRuntimeStore.getState();
+      if (store.activeThreadId !== conversation.parentRemoteId) return;
+      const settings = takeSideConversationParentSettingsForRestore(
+        conversation.owner,
+      );
+      if (!settings) return;
+      restoreSideConversationParentSettings(settings);
+      useChatRuntimeStore.setState({
+        contextUsage:
+          store.contextUsageByThreadId[conversation.parentRemoteId] ?? null,
+      });
+    },
+    [],
+  );
+
+  const discardSideRuntime = useCallback(
+    (conversation: SideConversationSession, showError: boolean) => {
+      const existing = cleanupPromisesRef.current.get(conversation.owner);
+      if (existing) return existing;
+      const cleanupSession = requestSideConversationCleanup(
+        conversation.owner,
+      );
+      if (!cleanupSession?.sideThreadId) {
+        return Promise.resolve();
+      }
+      const sideThreadId = cleanupSession.sideThreadId;
+      const threadListRuntime =
+        aui.threads().__internal_getAssistantRuntime?.()?.threads;
+      const cleanup = (async () => {
+        try {
+          if (!threadListRuntime) {
+            throw new Error("The chat runtime is unavailable.");
+          }
+          await disposeSideConversation(cleanupSession.owner, {
+            currentThreadId: () => threadListRuntime.getState().mainThreadId,
+            cancelSideRun: (threadId) => {
+              try {
+                threadListRuntime.getById(threadId).cancelRun();
+              } catch {
+                // The run already ended or the runtime was already removed.
+              }
+            },
+            stopSideQueues: (threadId) => requestPromptQueueStop([threadId]),
+            abortPendingSideTransition: async (threadId) => {
+              if (threadListRuntime.getState().mainThreadId === threadId) return;
+              const item = threadListRuntime.getItemById(threadId);
+              if (item.getState().status === "regular") {
+                await (item.detach() as unknown as Promise<void>);
+              }
+            },
+            switchToParent: (threadId) =>
+              threadListRuntime.switchToThread(threadId),
+            restoreParentPresentation,
+            disposeSide: async (threadId) => {
+              const item = threadListRuntime.getItemById(threadId);
+              const status = item.getState().status;
+              if (status === "new" || status === "deleted") return;
+              await item.delete();
+            },
+            clearSideUsage: (threadId) =>
+              useChatRuntimeStore.getState().clearThreadContextUsage(threadId),
+          });
+          const retryTimer = cleanupRetryTimersRef.current.get(
+            cleanupSession.owner,
+          );
+          if (retryTimer) clearTimeout(retryTimer);
+          cleanupRetryTimersRef.current.delete(cleanupSession.owner);
+          forgetThreadIncognito(sideThreadId);
+          if (returningSideRef.current === sideThreadId) {
+            returningSideRef.current = null;
+            setReturningToParent(false);
+          }
+        } catch (error) {
+          if (showError) {
+            toast.error("Side chat cleanup failed", {
+              description:
+                error instanceof Error ? error.message : "Unknown error",
+            });
+          }
+          if (
+            isSideConversationOwner(cleanupSession.owner) &&
+            !cleanupRetryTimersRef.current.has(cleanupSession.owner)
+          ) {
+            const timer = setTimeout(() => {
+              cleanupRetryTimersRef.current.delete(cleanupSession.owner);
+              void discardSideRuntimeRef.current(cleanupSession, false);
+            }, 500);
+            cleanupRetryTimersRef.current.set(cleanupSession.owner, timer);
+          }
+        } finally {
+          cleanupPromisesRef.current.delete(cleanupSession.owner);
+        }
+      })();
+      cleanupPromisesRef.current.set(cleanupSession.owner, cleanup);
+      return cleanup;
+    },
+    [aui, restoreParentPresentation],
+  );
+  useEffect(() => {
+    discardSideRuntimeRef.current = discardSideRuntime;
+  }, [discardSideRuntime]);
+  useSideConversationUnmountCleanup(runtimeThreadId, discardSideRuntime);
+
+  const returnToParent = useCallback(() => {
+    const conversation = sideConversationForThread(runtimeThreadId);
+    if (!conversation || returningSideRef.current) return;
+    returningSideRef.current = conversation.sideThreadId;
+    setReturningToParent(true);
+    void discardSideRuntime(conversation, true);
+  }, [discardSideRuntime, runtimeThreadId]);
+
+  useEffect(() => {
+    if (!sideSession) {
+      return;
+    }
+    if (sideSession.phase === "cleanup") {
+      void discardSideRuntime(sideSession, true);
+      return;
+    }
+    if (
+      runtimeThreadId === sideSession.parentThreadId ||
+      runtimeThreadId === sideSession.sideThreadId ||
+      returningSideRef.current === sideSession.sideThreadId
+    ) {
+      return;
+    }
+    void discardSideRuntime(sideSession, true);
+  }, [discardSideRuntime, runtimeThreadId, sideSession]);
 
   // Measured height of the floating composer dock (null until measured).
   // Drives the bottom spacer and the scroll-to-bottom footer offset.
@@ -1768,6 +2001,13 @@ export const Thread: FC<{
         onDragLeave={onDragLeave}
         onDrop={onDrop}
       >
+        {sideConversation ? (
+          <SideConversationBanner
+            conversation={sideConversation}
+            returning={returningToParent}
+            onReturn={returnToParent}
+          />
+        ) : null}
         <IntentAwareScrollProvider value={autoScrollContext}>
           <ThreadPrimitive.Viewport
             ref={composedViewportRef}
@@ -1782,7 +2022,9 @@ export const Thread: FC<{
                 : // + the chat-model notice, which is an opaque absolute bar
                   // directly under the header. 0px whenever it is not showing,
                   // so every other surface keeps the padding it had.
-                  "pt-[calc(var(--studio-content-top-inset,0px)+48px+var(--studio-chat-notice-height,0px))]",
+                  sideConversation
+                  ? "pt-[calc(var(--studio-content-top-inset,0px)+104px+var(--studio-chat-notice-height,0px))]"
+                  : "pt-[calc(var(--studio-content-top-inset,0px)+48px+var(--studio-chat-notice-height,0px))]",
             )}
           >
             {!hideWelcome && (
@@ -2273,6 +2515,7 @@ const Composer: FC<{
   const deepResearchEnabled = useChatRuntimeStore(
     (s) => s.deepResearchEnabled,
   );
+  const incognito = useChatRuntimeStore((s) => s.incognito);
   const activeThreadId = useChatRuntimeStore((s) => s.activeThreadId);
   const researchThreadId = threadId ?? activeThreadId ?? null;
   const researchThreadClaimed = useResearchRunStore((state) =>
@@ -3147,7 +3390,9 @@ const Composer: FC<{
   // navigation or reload. Cleared once empty (i.e. after a send). Setting the
   // text even when no draft exists keeps a thread from inheriting the
   // previous thread's composer contents.
-  const draftThreadId = referenceThreadId;
+  const draftThreadId = sideConversationForThread(threadListItemId)
+    ? null
+    : referenceThreadId;
   const draftKey = draftThreadId ? composerDraftKey(draftThreadId) : null;
   // A pasted attachment is a File held in memory only, so without its own slot
   // an unsent paste is the one draft a reload throws away.
@@ -3390,6 +3635,9 @@ const Composer: FC<{
   const threadScopedSettingsPending = useChatRuntimeStore(
     (s) => s.threadScopedSettingsPending,
   );
+  const sideModelLoading = useChatRuntimeStore((s) => s.modelLoading);
+  const sideLoadingModelPick = useChatRuntimeStore((s) => s.loadingModelPick);
+  const sideCheckpoint = useChatRuntimeStore((s) => s.params.checkpoint);
 
   const handleIndexingChange = useCallback((active: boolean) => {
     indexingActiveRef.current = active;
@@ -4440,6 +4688,221 @@ const Composer: FC<{
     formRef.current?.requestSubmit();
   }, [isDictating, aui, composerIdentity, dictationBlocked, composerText]);
 
+  const sideLaunchInFlightRef = useRef(false);
+  const sideLaunchDeadlineRef = useRef<(() => void) | null>(null);
+  const sideComposerMountedRef = useSideComposerMountedRef();
+  useSideConversationPendingPromptSubmission({
+    runtimeThreadId: threadListItemId,
+    canDeliverPrompt: () => formRef.current !== null,
+    deliverPrompt: (pendingPrompt) => {
+      flushResourcesSync(() => {
+        aui.composer().setText(pendingPrompt);
+      });
+      formRef.current?.requestSubmit();
+    },
+    scheduleFrame: requestAnimationFrame,
+    cancelFrame: cancelAnimationFrame,
+  });
+  const startSideConversation = useCallback(
+    (commandText: string, prompt: string) => {
+      if (sideLaunchInFlightRef.current) return;
+      if (getSideConversationSession()) {
+        toast.error("Nested side chats are unavailable", {
+          description: "Return to the parent chat before starting another side chat.",
+        });
+        return;
+      }
+      if (sideModelLoading || sideLoadingModelPick) {
+        toast.error("Wait for the model to finish loading before starting a side chat");
+        return;
+      }
+      if (!sideCheckpoint) {
+        toast.error("Load a model before starting a side chat");
+        return;
+      }
+      if (!threadListItemId || !threadListItemRemoteId) {
+        toast.error("Save this chat before starting a side chat", {
+          description: "Send a message in the parent chat first, then use /side.",
+        });
+        return;
+      }
+      if (
+        incognito ||
+        isThreadIncognito(threadListItemId) ||
+        isThreadIncognito(threadListItemRemoteId)
+      ) {
+        toast.error("Side chat is unavailable in temporary chat");
+        return;
+      }
+      if (threadScopedSettingsPending) {
+        toast.error("Wait for this chat's settings to finish loading");
+        return;
+      }
+      if (
+        overlay ||
+        hasAttachments ||
+        hasPendingAudio ||
+        hasPendingAttachments ||
+        hasMaterializingImageAttachments ||
+        hasMaterializingAudioAttachments ||
+        hasMaterializingVideoAttachments
+      ) {
+        toast.error("Side chat does not support attachments", {
+          description: "Remove the attachments or image edit, then try /side again.",
+        });
+        return;
+      }
+      const threadListRuntime =
+        aui.threads().__internal_getAssistantRuntime?.()?.threads;
+      if (!threadListRuntime) {
+        toast.error("Could not start side chat", {
+          description: "The chat runtime is unavailable.",
+        });
+        return;
+      }
+
+      const inheritedMessages = snapshotStableSideHistory(
+        aui.thread().getState().messages,
+      );
+      const parentThreadId = threadListItemId;
+      const parentRemoteId = threadListItemRemoteId;
+      const parentDraftKey = draftKeyRef.current;
+      const parentSettings = snapshotQueuedChatRunSettings(
+        useChatRuntimeStore.getState(),
+      );
+      sideLaunchInFlightRef.current = true;
+      let launchOwner: number;
+      try {
+        launchOwner = beginSideConversationLaunch({
+          parentThreadId,
+          parentRemoteId,
+          inheritedMessages,
+          parentSettings,
+          pendingPrompt: prompt,
+        });
+      } catch (error) {
+        sideLaunchInFlightRef.current = false;
+        toast.error("Could not start side chat", {
+          description: error instanceof Error ? error.message : "Unknown error",
+        });
+        return;
+      }
+      const restoreCommandIfStillOwned = () => {
+        if (!sideComposerMountedRef.current) return;
+        const mainThreadId = threadListRuntime.getState().mainThreadId;
+        if (mainThreadId !== parentThreadId) return;
+        flushResourcesSync(() => {
+          aui.composer().setText(commandText);
+        });
+        if (parentDraftKey) writeComposerDraft(parentDraftKey, commandText);
+      };
+      sideLaunchDeadlineRef.current = createSideConversationLaunchDeadline(
+        launchOwner,
+        10_000,
+        (cleanupSession) => {
+          sideLaunchInFlightRef.current = false;
+          sideLaunchDeadlineRef.current = null;
+          if (!sideComposerMountedRef.current) return;
+          toast.error("Could not start side chat", {
+            description: "The side chat launch timed out.",
+          });
+          if (!cleanupSession?.sideThreadId) {
+            restoreCommandIfStillOwned();
+            return;
+          }
+          void waitForSideConversationCleanup(launchOwner).then(
+            restoreCommandIfStillOwned,
+          );
+        },
+      );
+
+      clearStoredDraft();
+      flushResourcesSync(() => {
+        aui.composer().setText("");
+      });
+
+      let claimedSideThreadId: string | null = null;
+      void threadListRuntime
+        .getItemById(parentThreadId)
+        .initialize()
+        .then(() => {
+          if (!isSideConversationOwner(launchOwner)) {
+            throw new DOMException("Side launch cancelled", "AbortError");
+          }
+          const switchToSide = threadListRuntime.switchToNewThread();
+          claimedSideThreadId = threadListRuntime.getState().newThreadId ?? null;
+          if (!claimedSideThreadId || claimedSideThreadId === parentThreadId) {
+            void switchToSide.catch(() => undefined);
+            throw new Error("The side thread could not be reserved.");
+          }
+          markThreadIncognito(claimedSideThreadId);
+          claimSideConversationLaunchThread(
+            launchOwner,
+            claimedSideThreadId,
+          );
+          return activateSideConversationAfterInitialization(
+            launchOwner,
+            claimedSideThreadId,
+            () => threadListRuntime.getItemById(claimedSideThreadId!).initialize(),
+            async () => {
+              await switchToSide;
+              if (
+                threadListRuntime.getState().mainThreadId !==
+                claimedSideThreadId
+              ) {
+                throw new Error("The side thread did not open.");
+              }
+            },
+          );
+        })
+        .then(() => {
+          sideLaunchDeadlineRef.current?.();
+          sideLaunchDeadlineRef.current = null;
+          sideLaunchInFlightRef.current = false;
+        })
+        .catch((error) => {
+          const launch = getSideConversationSession();
+          if (!launch || launch.owner !== launchOwner) return;
+          if (launch.phase === "cleanup") return;
+          sideLaunchDeadlineRef.current?.();
+          sideLaunchDeadlineRef.current = null;
+          requestSideConversationCleanup(launchOwner);
+          sideLaunchInFlightRef.current = false;
+          const restore = () => {
+            if (!sideComposerMountedRef.current) return;
+            flushResourcesSync(() => {
+              aui.composer().setText(commandText);
+            });
+            if (parentDraftKey) writeComposerDraft(parentDraftKey, commandText);
+            toast.error("Could not start side chat", {
+              description:
+                error instanceof Error ? error.message : "Unknown error",
+            });
+          };
+          void waitForSideConversationCleanup(launchOwner).then(restore);
+        });
+    },
+    [
+      aui,
+      clearStoredDraft,
+      hasAttachments,
+      hasMaterializingAudioAttachments,
+      hasMaterializingImageAttachments,
+      hasMaterializingVideoAttachments,
+      hasPendingAttachments,
+      hasPendingAudio,
+      incognito,
+      overlay,
+      sideCheckpoint,
+      sideComposerMountedRef,
+      sideLoadingModelPick,
+      sideModelLoading,
+      threadScopedSettingsPending,
+      threadListItemId,
+      threadListItemRemoteId,
+    ],
+  );
+
   const handleSubmit = useCallback(
     (event: {
       preventDefault: () => void;
@@ -4448,6 +4911,12 @@ const Composer: FC<{
       // Read once per submit: a rejected send must not leave it armed.
       const forceQueue = forceQueueRef.current;
       forceQueueRef.current = false;
+      const sideCommand = parseSideCommand(composerText);
+      if (sideCommand.matched) {
+        event.preventDefault();
+        startSideConversation(composerText, sideCommand.prompt);
+        return;
+      }
       if (isResearchActive) {
         event.preventDefault();
         return;
@@ -4635,6 +5104,7 @@ const Composer: FC<{
       setPendingImageEditReference,
       sendReservedComposer,
       shouldBlockSend,
+      startSideConversation,
       threadIsRunning,
     ],
   );

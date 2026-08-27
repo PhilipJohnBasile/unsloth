@@ -343,10 +343,12 @@ test("the recount declines a video turn, as it already declines image and audio"
   // priced as text-only while the real request sends video_base64 and
   // llama-server expands it into frames. /chat/count_tokens 503s on video for
   // the same reason, so without this bail the bar shows room that is not there.
-  assert.ok(recountSource.includes("messagesContainImage(runMessages)"));
-  assert.ok(recountSource.includes("findLatestUserAudioBase64(runMessages)"));
+  assert.ok(recountSource.includes("messagesContainImage(effectiveRunMessages)"));
   assert.ok(
-    recountSource.includes("findLatestUserVideoBase64(runMessages)"),
+    recountSource.includes("findLatestUserAudioBase64(effectiveRunMessages)"),
+  );
+  assert.ok(
+    recountSource.includes("findLatestUserVideoBase64(effectiveRunMessages)"),
     "refresh-context-usage.ts must decline a turn carrying a video",
   );
 });
@@ -355,7 +357,9 @@ test("the video bail is paid before the branch signature hashes the base64", () 
   // branchSignature JSON.stringifies every part on the UI thread; the image
   // bail's own comment says it exists to keep base64 out of that hash, and a
   // 64 MB clip is ~85 MB of base64.
-  const bail = recountSource.indexOf("findLatestUserVideoBase64(runMessages)");
+  const bail = recountSource.indexOf(
+    "findLatestUserVideoBase64(effectiveRunMessages)",
+  );
   const hash = recountSource.indexOf("countedBranch = branchSignature(");
   assert.ok(bail >= 0 && hash >= 0);
   assert.ok(bail < hash, "the video bail must run before branchSignature");

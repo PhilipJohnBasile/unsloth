@@ -79,6 +79,12 @@ import {
   mergeQueuedModelCapabilities,
   type QueuedModelCapabilities,
 } from "../utils/queued-model-capabilities";
+import {
+  getSideConversationSession,
+  sideConversationAuthorityThreadId,
+  sideConversationEffectiveMessagesForRun,
+  sideConversationInstructionForThread,
+} from "../utils/side-conversation";
 import type { MessageTiming, ToolCallMessagePart } from "@assistant-ui/core";
 import type { ChatModelAdapter } from "@assistant-ui/react";
 import { parsePartialJsonObject } from "assistant-stream/utils";
@@ -1797,7 +1803,12 @@ export async function buildLocalTokenCountHistory(
   studio_tool_history?: true;
 }> {
   const survivingMessages = pruneOutboundHistory(messages, true);
-  const outboundMessages = survivingMessages
+  const effectiveSurvivingMessages = sideConversationEffectiveMessagesForRun(
+    threadId,
+    survivingMessages,
+    (withInherited) => pruneOutboundHistory(withInherited, true),
+  );
+  const outboundMessages = effectiveSurvivingMessages
     .flatMap((message) => toOpenAIMessages(message, true))
     .filter((message): message is NonNullable<typeof message> =>
       Boolean(message),
@@ -1820,6 +1831,7 @@ export async function buildLocalTokenCountHistory(
       ? `<project_instructions>\n${projectInstructions}\n</project_instructions>`
       : "",
     safeSystemPrompt.trim(),
+    sideConversationInstructionForThread(threadId),
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -1852,7 +1864,7 @@ export async function buildLocalTokenCountHistory(
   return {
     messages: outboundMessages as OpenAIChatMessage[],
     ...studioToolHistoryRequestFieldsAfterReplay(
-      survivingMessages as unknown as ToolHistoryMessage[],
+      effectiveSurvivingMessages as unknown as ToolHistoryMessage[],
     ),
   };
 }
@@ -2087,6 +2099,21 @@ export async function resolveProjectId(
   // screen when it polls rather than the one it is waiting for.
   opts?: { rethrowReadFailure?: boolean; composerProjectId?: string | null },
 ): Promise<string | null> {
+  const authorityThreadId = sideConversationAuthorityThreadId(threadId);
+  if (threadId && authorityThreadId && authorityThreadId !== threadId) {
+    try {
+      // The injected reader is scoped to `threadId`, which is the incognito
+      // side thread and intentionally has no row. Read the saved parent by its
+      // captured remote id instead. Missing or unreadable parent authority
+      // fails closed and never adopts the project currently on screen.
+      const parentThread = await getStoredChatThread(authorityThreadId);
+      return parentThread?.projectId ?? null;
+    } catch (error) {
+      if (opts?.rethrowReadFailure) throw error;
+      return null;
+    }
+  }
+
   // Read before the await: a send survives navigation, so a store read after the
   // lookup could hand this request the project the user moved to.
   const composerProjectId =
@@ -2129,7 +2156,10 @@ async function resolveSandboxSessionId(
   readThreadRecord?: ThreadRecordReader,
 ): Promise<string | undefined> {
   const projectId = await resolveProjectId(threadId, readThreadRecord);
-  return sandboxSessionIdFor(threadId, projectId);
+  return sandboxSessionIdFor(
+    sideConversationAuthorityThreadId(threadId),
+    projectId,
+  );
 }
 
 /** Wait for an in-progress model load to finish (polls store every 500ms). */
@@ -4733,10 +4763,17 @@ export function createOpenAIStreamAdapter(
         messages,
         !isExternalRequest,
       );
+      const effectiveSurvivingMessages =
+        sideConversationEffectiveMessagesForRun(
+          resolvedThreadId,
+          survivingMessages,
+          (withInherited) =>
+            pruneOutboundHistory(withInherited, !isExternalRequest),
+        );
       // toOpenAIMessages emits assistant tool_calls + role="tool"
       // follow-ups; the backend Gemini translator rebuilds the
       // functionCall / functionResponse parts (with thoughtSignature).
-      const outboundMessages = survivingMessages
+      const outboundMessages = effectiveSurvivingMessages
         .flatMap((message) => toOpenAIMessages(message, !isExternalRequest))
         .filter((message): message is NonNullable<typeof message> =>
           Boolean(message),
@@ -4793,12 +4830,18 @@ export function createOpenAIStreamAdapter(
         }
       }
 
-      const combinedSystemPrompt = await resolveChatInstructions(
+      const resolvedChatInstructions = await resolveChatInstructions(
         resolvedThreadId,
         params.systemPrompt,
         params.systemVariables,
         readThreadRecord,
       );
+      const combinedSystemPrompt = [
+        resolvedChatInstructions,
+        sideConversationInstructionForThread(resolvedThreadId),
+      ]
+        .filter(Boolean)
+        .join("\n\n");
       if (combinedSystemPrompt) {
         outboundMessages.unshift({
           role: "system",
@@ -4894,14 +4937,18 @@ export function createOpenAIStreamAdapter(
 
       // Scan post-prune history so a refused user turn's image/audio
       // doesn't gate or mis-attribute the next turn.
-      const imageBase64 = findLatestUserImageBase64(survivingMessages);
+      const imageBase64 = findLatestUserImageBase64(
+        effectiveSurvivingMessages,
+      );
       // A continuation resumes the turn as it was sent: picking up a clip staged in the
       // composer since would switch it onto the audio path, which cannot be continued.
       const audioBase64 = findLatestUserAudioBase64(
-        survivingMessages,
+        effectiveSurvivingMessages,
         !queuedRunSettings && !continuation,
       );
-      const videoBase64 = findLatestUserVideoBase64(survivingMessages);
+      const videoBase64 = findLatestUserVideoBase64(
+        effectiveSurvivingMessages,
+      );
       const hasOutboundImage = Boolean(imageBase64);
 
       // Keep render_html local-only and mirror the backend image-turn gate.
@@ -4968,7 +5015,7 @@ export function createOpenAIStreamAdapter(
       if (audioBase64 && !queuedRunSettings) {
         const audioName = runtime.pendingAudioName;
         if (audioName) {
-          const lastUserMsg = [...survivingMessages]
+          const lastUserMsg = [...effectiveSurvivingMessages]
             .reverse()
             .find((m) => m.role === "user");
           if (lastUserMsg) sentAudioNames.set(lastUserMsg.id, audioName);
@@ -5015,7 +5062,7 @@ export function createOpenAIStreamAdapter(
       const activeModel = runtime.models.find(
         (m) => m.id === params.checkpoint,
       );
-      const generationUserMessage = [...survivingMessages]
+      const generationUserMessage = [...effectiveSurvivingMessages]
         .reverse()
         .find((message) => message.role === "user");
       const generationCandidate = Boolean(
@@ -5926,7 +5973,7 @@ export function createOpenAIStreamAdapter(
             stream: true,
             ...(continuation ? { continue_final_message: true } : {}),
             ...studioToolHistoryRequestFieldsAfterReplay(
-              survivingMessages as unknown as ToolHistoryMessage[],
+              effectiveSurvivingMessages as unknown as ToolHistoryMessage[],
             ),
             // Opt into the trailing usage chunk so the context-usage bar
             // and tok/s readout populate (backend gates it on include_usage).
@@ -7299,9 +7346,11 @@ export function createOpenAIStreamAdapter(
         // adopted key, or the run stays "unresolved" for life and the bar stays blank.
         const usageKey = liveThreadKey(serverCancel);
         const usageThreadKey = usageKey === "__default" ? null : usageKey;
+        const visibleThreadId =
+          getSideConversationSession()?.sideThreadId ??
+          useChatRuntimeStore.getState().activeThreadId;
         const usageThreadIsVisible =
-          useChatRuntimeStore.getState().activeThreadId ===
-          (usageThreadKey ?? activeThreadIdAtRunStart);
+          visibleThreadId === (usageThreadKey ?? activeThreadIdAtRunStart);
         if (
           meta?.usage &&
           typeof meta.usage.prompt_tokens === "number" &&
@@ -7317,16 +7366,16 @@ export function createOpenAIStreamAdapter(
           };
           // File it under this run's own thread even when the gate below blocks the visible
           // write, so switching back re-applies it.
-          if (usageThreadKey !== null) {
-            useChatRuntimeStore
-              .getState()
-              .setThreadContextUsage(usageThreadKey, usage);
-          }
-          if (
-            usageThreadIsVisible &&
+          const usageModelIsVisible =
             useChatRuntimeStore.getState().params.checkpoint ===
-              params.checkpoint
-          ) {
+            params.checkpoint;
+          if (usageThreadKey !== null) {
+            useChatRuntimeStore.getState().setThreadContextUsage(
+              usageThreadKey,
+              usage,
+              { visible: usageThreadIsVisible && usageModelIsVisible },
+            );
+          } else if (usageThreadIsVisible && usageModelIsVisible) {
             useChatRuntimeStore.getState().setContextUsage(usage);
           }
         }
@@ -7358,7 +7407,7 @@ export function createOpenAIStreamAdapter(
         const answerUsedPrivateDocs =
           ragEnabled ||
           projectRagEnabled ||
-          messagesUsePrivateContent(messages) ||
+          messagesUsePrivateContent(effectiveSurvivingMessages) ||
           toolCallParts.some((part) => part.toolName === "search_knowledge_base");
         // This run's own values, destructured from the runtime it started with,
         // not the store as it stands now. Both are per-chat, and a run finishing

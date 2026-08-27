@@ -32,6 +32,7 @@ import { resolveBatchSizeSeed } from "./resolve-batch-size-seed";
 import { resolveChatTemplateSeed } from "./resolve-chat-template-seed";
 import { resolveCtxPinSeed } from "./resolve-ctx-pin-seed";
 import { shouldSeedVisionSwitch } from "./resolve-vision-switch-seed";
+import { sideConversationBlocksModelLifecycle } from "../utils/side-conversation";
 
 type LocalReasoningEffort = Extract<ReasoningEffort, "low" | "medium" | "high">;
 
@@ -142,6 +143,7 @@ export function applyActiveModelStatusToStore(
   status: InferenceStatusResponse,
   options: ApplyInferenceStatusOptions = {},
 ): void {
+  if (sideConversationBlocksModelLifecycle()) return;
   const checkpointId = resolveInferenceCheckpointId(status);
   if (!checkpointId) return;
 
@@ -706,6 +708,7 @@ export function applyActiveModelStatusToStore(
  * triggering a new /api/inference/load.
  */
 export async function tryAdoptServerActiveModel(): Promise<boolean> {
+  if (sideConversationBlocksModelLifecycle()) return false;
   const store = useChatRuntimeStore.getState();
   if (store.params.checkpoint) {
     return true;
@@ -718,6 +721,7 @@ export async function tryAdoptServerActiveModel(): Promise<boolean> {
     // Status endpoint unavailable: fall back to the normal auto-load path.
     return false;
   }
+  if (sideConversationBlocksModelLifecycle()) return false;
   // Not something chat can adopt; the sweep below picks a real chat model, which evicts
   // it exactly as an image load would.
   if (!status.active_model || isSpeechOnlyStatus(status)) {

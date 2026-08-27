@@ -81,6 +81,15 @@ import {
   sanitizeThreadScopedSettings,
 } from "../utils/thread-scoped-settings";
 import {
+  getActiveSideConversation,
+  sideConversationBlocksModelLifecycle,
+  updateSideConversationRunSettings,
+} from "../utils/side-conversation";
+import {
+  snapshotQueuedChatRunSettings,
+  type QueuedChatRunSettings,
+} from "../utils/queued-chat-run-settings";
+import {
   chatModelLifecycleGate,
   type ModelLifecycleLease,
 } from "../utils/model-lifecycle-gate";
@@ -1900,6 +1909,21 @@ function captureThreadScopedEdit(
   writeGlobal: (() => void) | null = null,
   value?: unknown,
 ): boolean {
+  const side = getActiveSideConversation();
+  if (side) {
+    // The controls share the live store with the parent that remains mounted.
+    // Keep the edit in the side run snapshot, but never schedule a write for
+    // the saved parent row or promote it to an installation default.
+    queueMicrotask(() => {
+      const current = getActiveSideConversation();
+      if (!current || current.owner !== side.owner) return;
+      updateSideConversationRunSettings(
+        current.sideThreadId,
+        snapshotQueuedChatRunSettings(useChatRuntimeStore.getState()),
+      );
+    });
+    return true;
+  }
   if (!isThreadOwnedSettingKey(field)) return false;
   const threadId = useChatRuntimeStore.getState().activeThreadId;
   if (threadId === null) return false;
@@ -2987,7 +3011,9 @@ type ChatRuntimeStore = {
   setThreadContextUsage: (
     threadId: string,
     usage: ContextUsageSnapshot,
+    options?: { visible?: boolean },
   ) => void;
+  clearThreadContextUsage: (threadId: string) => void;
 };
 
 type PersistedChatSettings = Awaited<
@@ -3690,6 +3716,16 @@ function setScalarSettingVersion<K extends ScalarSettingKey>(
   writeGlobal();
 }
 
+/** Restore the saved parent's controls after an ephemeral side session. */
+export function restoreSideConversationParentSettings(
+  settings: QueuedChatRunSettings,
+): void {
+  useChatRuntimeStore.setState({
+    ...settings,
+    params: { ...settings.params },
+  });
+}
+
 export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   settingsHydrated: false,
   threadScopedSettingsPending: false,
@@ -3935,6 +3971,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
     return settingsHydrationPromise;
   },
   beginModelLoading: () => {
+    if (sideConversationBlocksModelLifecycle()) return null;
     const lease = chatModelLifecycleGate.tryAcquire();
     if (lease !== null) {
       set({ modelLoading: true });
@@ -3969,6 +4006,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       // counters under the new checkpoint.
       const checkpointChanged = state.params.checkpoint !== params.checkpoint;
       const fromModelDefaults = options?.fromModelDefaults === true;
+      const side = getActiveSideConversation();
+      if (side && (checkpointChanged || fromModelDefaults)) return state;
       // Remember what the outgoing model was running with before replacing it.
       const outgoing = checkpointChanged
         ? rememberOutgoingModel(state, state.params)
@@ -3979,7 +4018,9 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       // common one, never restores the model's own settings. fromModelDefaults
       // marks the updates that re-apply model defaults after a load or a status
       // poll: they overwrite remembered values, so memory goes back over them.
-      noteLoadedContext(params.checkpoint, options?.maxTokensCap);
+      if (!side) {
+        noteLoadedContext(params.checkpoint, options?.maxTokensCap);
+      }
       const replayed = checkpointChanged || fromModelDefaults;
       const nextParams = getReplayedParams(
         state.rememberParamsPerModel,
@@ -4007,8 +4048,11 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
         effective,
         options?.trackQueuedSettings !== false,
       );
+      const sideParamsChanged =
+        side !== null &&
+        shouldAdvanceQueuedSettingsEpoch(state.params, effective);
       const persistingGlobally =
-        options?.persist !== false && state.settingsHydrated;
+        !side && options?.persist !== false && state.settingsHydrated;
       // A sampling key moved with a chat open belongs to that chat, so it reaches neither
       // the installation defaults nor this model's memory, both shared with every other
       // chat. What is left over is still the installation's.
@@ -4019,18 +4063,22 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       // arriving snapshot apply over it and let the pairing capture take it for an
       // installation default, pinning it onto the next snapshot-less chat.
       const sharedParams =
-        options?.persist !== false
+        side
+          ? changedParams
+          : options?.persist !== false
           ? withoutCapturedThreadEdits(changedParams, fromModelDefaults)
           : changedParams;
       // An edit belongs to the model the params now describe, so a call that moves
       // checkpoint and sliders at once files them under the destination.
-      const paramsByModel = getParamsByModelAfterEdit(
-        state,
-        outgoing,
-        nextParams,
-        sharedParams,
-        options?.persist !== false && !fromModelDefaults,
-      );
+      const paramsByModel = side
+        ? null
+        : getParamsByModelAfterEdit(
+            state,
+            outgoing,
+            nextParams,
+            sharedParams,
+            options?.persist !== false && !fromModelDefaults,
+          );
       if (persistingGlobally) {
         // A switch replays the destination's entry over the params, so writing
         // it back says nothing new and, merged per key on the server, would put
@@ -4048,6 +4096,16 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
           nextParams.checkpoint,
           checkpointChanged && state.params.checkpoint !== "",
         );
+      }
+      if (sideParamsChanged) {
+        queueMicrotask(() => {
+          const current = getActiveSideConversation();
+          if (!current || current.owner !== side.owner) return;
+          updateSideConversationRunSettings(
+            current.sideThreadId,
+            snapshotQueuedChatRunSettings(useChatRuntimeStore.getState()),
+          );
+        });
       }
       return {
         params: effective,
@@ -4215,18 +4273,23 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   setLastModelLoadError: (lastModelLoadError) => set({ lastModelLoadError }),
   setCheckpoint: (modelId, ggufVariant, options) =>
     set((state) => {
+      if (sideConversationBlocksModelLifecycle()) return state;
+      const side = getActiveSideConversation();
+      const persistForConversation = options?.persist !== false && !side;
       // Persist external selections so they survive a refresh. Local ids are
       // NOT persisted -- they're re-derived from the backend on mount, and a
       // stale persisted local id would race the freshly-loaded model. See
       // LAST_EXTERNAL_CHECKPOINT_KEY notes.
-      saveLastExternalCheckpoint(isExternalModelId(modelId) ? modelId : null);
+      if (persistForConversation) {
+        saveLastExternalCheckpoint(isExternalModelId(modelId) ? modelId : null);
+      }
       // Only disarm research for a connection that cannot drive it. Gating on the id
       // prefix alone silently switched it off for capable providers too, and saveBool
       // now reaches the backend, so that would write the preference off for every
       // browser on the install. Hoisted because all three writes below share it.
       const clampsDeepResearch =
         isExternalModelId(modelId) && !externalModelSupportsStudioTools(modelId);
-      if (clampsDeepResearch) {
+      if (clampsDeepResearch && persistForConversation) {
         saveBool(CHAT_DEEP_RESEARCH_ENABLED_KEY, false);
       }
       // Clear stale per-turn usage on model change; the relaxed external-provider
@@ -4236,7 +4299,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       // Not for a restore: the model it steps off is the one a background load
       // put there, and its load defaults are not settings the user chose.
       const outgoing =
-        checkpointChanged && options?.persist !== false
+        checkpointChanged && persistForConversation
           ? rememberOutgoingModel(state, state.params)
           : null;
       const baseParams = getReplayedParams(
@@ -4303,9 +4366,21 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       const restoredParams = checkpointChanged
         ? restoreThreadScopedParams(nextParams)
         : nextParams;
+      if (side) {
+        queueMicrotask(() => {
+          const current = getActiveSideConversation();
+          if (!current || current.owner !== side.owner) return;
+          updateSideConversationRunSettings(
+            current.sideThreadId,
+            snapshotQueuedChatRunSettings(useChatRuntimeStore.getState()),
+          );
+        });
+      }
       return {
         params: restoredParams,
-        ...getReplayStatePatch(state, nextParams, outgoing, baseParams),
+        ...(persistForConversation
+          ? getReplayStatePatch(state, nextParams, outgoing, baseParams)
+          : {}),
         activeGgufVariant: nextGgufVariant,
         ...(queuedSettingsChanged
           ? { queuedSettingsEpoch: state.queuedSettingsEpoch + 1 }
@@ -4317,7 +4392,13 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
         ...(checkpointChanged
           ? {
               contextUsage: null,
-              contextUsageByThreadId: {},
+              contextUsageByThreadId: side
+                ? Object.fromEntries(
+                    Object.entries(state.contextUsageByThreadId).filter(
+                      ([threadId]) => threadId !== side.sideThreadId,
+                    ),
+                  )
+                : {},
               activeModelIsLocal: false,
               specFallbackReason: null,
               mmprojFallbackReason: null,
@@ -4512,6 +4593,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   setSettingsPanelOpen: (settingsPanelOpen) => set({ settingsPanelOpen }),
   setEditingMessageId: (id) => set({ editingMessageId: id }),
   clearCheckpoint: () => {
+    if (sideConversationBlocksModelLifecycle()) return;
     // Mirror setCheckpoint's persistence: dropping the checkpoint must also
     // clear any stored external selection so the next refresh doesn't snap
     // back to a model the user intentionally cleared.
@@ -4643,10 +4725,15 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   setLastOpenRouterChosenModel: (lastOpenRouterChosenModel) =>
     set({ lastOpenRouterChosenModel }),
   setReasoningStyle: (reasoningStyle) =>
-    set((state) => ({
-      reasoningStyle,
-      queuedSettingsEpoch: state.queuedSettingsEpoch + 1,
-    })),
+    set((state) => {
+      if (reasoningStyle !== state.reasoningStyle) {
+        captureThreadScopedEdit("reasoningStyle");
+      }
+      return {
+        reasoningStyle,
+        queuedSettingsEpoch: state.queuedSettingsEpoch + 1,
+      };
+    }),
   setReasoningEffort: (reasoningEffort) =>
     set((state) => {
       setScalarSettingVersion(
@@ -4666,7 +4753,9 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
         preserveThinking,
         state.preserveThinking,
       );
-      notePreserveThinkingPreference(preserveThinking);
+      if (!sideConversationBlocksModelLifecycle()) {
+        notePreserveThinkingPreference(preserveThinking);
+      }
       return {
         preserveThinking,
         queuedSettingsEpoch: state.queuedSettingsEpoch + 1,
@@ -4864,6 +4953,9 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
     // the sandbox/confirmation bypass active without re-accepting the warning.
     // Turning bypass off returns to the last persisted ask/auto level.
     set((state) => {
+      if (bypassPermissions !== state.bypassPermissions) {
+        captureThreadScopedEdit("bypassPermissions");
+      }
       if (bypassPermissions) {
         // Full access never prompts; mirror confirm_tool_calls=false in the
         // store so metadata does not report confirmations as enabled.
@@ -5297,13 +5389,21 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       }
       return { contextUsage, contextUsageByThreadId: next };
     }),
-  setThreadContextUsage: (threadId, usage) =>
+  setThreadContextUsage: (threadId, usage, options) =>
     set((state) => ({
+      ...(options?.visible ? { contextUsage: usage } : {}),
       contextUsageByThreadId: {
         ...state.contextUsageByThreadId,
         [threadId]: usage,
       },
     })),
+  clearThreadContextUsage: (threadId) =>
+    set((state) => {
+      if (!(threadId in state.contextUsageByThreadId)) return state;
+      const contextUsageByThreadId = { ...state.contextUsageByThreadId };
+      delete contextUsageByThreadId[threadId];
+      return { contextUsageByThreadId };
+    }),
 }));
 
 // Mirror token edits made through the shared store (e.g. Unsloth's field).
