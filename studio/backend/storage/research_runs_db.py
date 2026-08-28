@@ -13,7 +13,12 @@ import time
 from typing import Any
 
 from core.inference.web_access_policy import check_url_access
-from storage.studio_db import get_connection
+from storage.studio_db import (
+    ChatMessageProtectedError,
+    get_connection,
+    guard_manual_compaction_lifecycle_activation,
+    guard_manual_compaction_message_metadata_update,
+)
 
 ACTIVE_STATUSES = frozenset(
     {"planning", "awaiting_approval", "queued", "running", "paused", "cancelling"}
@@ -25,6 +30,24 @@ _EVENTS_CHANGED = threading.Condition()
 
 class ResearchConflictError(RuntimeError):
     pass
+
+
+def _guard_compaction_metadata_update(
+    conn: sqlite3.Connection, message_id: str, metadata: object
+) -> None:
+    try:
+        guard_manual_compaction_message_metadata_update(conn, message_id, metadata)
+    except ChatMessageProtectedError as exc:
+        raise ResearchConflictError("Manual compaction protects this research message") from exc
+
+
+def _guard_compaction_lifecycle_activation(
+    conn: sqlite3.Connection, thread_id: str, *message_ids: str | None
+) -> None:
+    try:
+        guard_manual_compaction_lifecycle_activation(conn, thread_id, message_ids)
+    except ChatMessageProtectedError as exc:
+        raise ResearchConflictError("Manual compaction protects this research ancestry") from exc
 
 
 def now_ms() -> int:
@@ -154,6 +177,12 @@ def _bind_assistant_locked(
     plan_revision: int,
     created: int,
 ) -> None:
+    _guard_compaction_lifecycle_activation(
+        conn,
+        thread_id,
+        user_message_id,
+        assistant_message_id,
+    )
     if not assistant_message_id:
         return
     message = conn.execute(
@@ -209,6 +238,7 @@ def _bind_assistant_locked(
         raise ResearchConflictError("Assistant message does not match this research run")
     merged_metadata = dict(existing_metadata) if isinstance(existing_metadata, dict) else {}
     merged_metadata.update(metadata)
+    _guard_compaction_metadata_update(conn, assistant_message_id, merged_metadata)
     conn.execute(
         "UPDATE chat_messages SET metadata_json=? WHERE id=?",
         (_strict_message_dumps(merged_metadata), assistant_message_id),
@@ -300,6 +330,7 @@ def _unbind_assistant_locked(
         return
     for key in ("researchRunId", "researchStatus", "researchPlanRevision", "serverManaged"):
         metadata.pop(key, None)
+    _guard_compaction_metadata_update(conn, previous_id, metadata)
     conn.execute(
         "UPDATE chat_messages SET metadata_json=? WHERE id=?",
         (_strict_message_dumps(metadata), previous_id),
@@ -365,6 +396,13 @@ def rebind_cancelled(
         if message is None or message["role"] != "user" or message["thread_id"] != thread_id:
             conn.commit()
             return None
+        _guard_compaction_lifecycle_activation(
+            conn,
+            thread_id,
+            user_message_id,
+            assistant_message_id,
+            run["assistant_message_id"],
+        )
         run_id = run["id"]
         revision = int(run["plan_revision"]) + 1
         now = now_ms()
@@ -528,7 +566,15 @@ def _discover_assistant_locked(conn: sqlite3.Connection, run: sqlite3.Row) -> st
             (bound_id, run["thread_id"]),
         ).fetchone()
         if bound is not None:
-            return str(bound["id"])
+            message_id = str(bound["id"])
+            _guard_compaction_lifecycle_activation(
+                conn,
+                str(run["thread_id"]),
+                str(run["user_message_id"]),
+                bound_id,
+                message_id,
+            )
+            return message_id
     rows = conn.execute(
         """SELECT id, metadata_json FROM chat_messages
            WHERE thread_id=? AND parent_id=? AND role='assistant' ORDER BY created_at, id""",
@@ -538,6 +584,13 @@ def _discover_assistant_locked(conn: sqlite3.Connection, run: sqlite3.Row) -> st
         metadata = _strict_message_loads(message["metadata_json"], {})
         if isinstance(metadata, dict) and metadata.get("researchRunId") == run["id"]:
             message_id = str(message["id"])
+            _guard_compaction_lifecycle_activation(
+                conn,
+                str(run["thread_id"]),
+                str(run["user_message_id"]),
+                bound_id,
+                message_id,
+            )
             conn.execute(
                 "UPDATE research_runs SET assistant_message_id=?, updated_at=? WHERE id=?",
                 (message_id, now_ms(), run["id"]),
@@ -602,6 +655,12 @@ def create_and_bind_terminal_fallback(
         if message_id is not None:
             conn.commit()
             return message_id, False
+        _guard_compaction_lifecycle_activation(
+            conn,
+            str(run["thread_id"]),
+            str(run["user_message_id"]),
+            run["assistant_message_id"],
+        )
 
         attempt = int(run["retry_count"])
         message_id = f"research-{run_id}" if attempt == 0 else f"research-{run_id}-{attempt}"
@@ -805,7 +864,8 @@ def retry(run_id: str, max_retries: int = 3) -> str:
     try:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT status, retry_count, plan_json, owner_subject, thread_id "
+            "SELECT status, retry_count, plan_json, owner_subject, thread_id, "
+            "user_message_id, assistant_message_id "
             "FROM research_runs WHERE id = ?",
             (run_id,),
         ).fetchone()
@@ -813,6 +873,12 @@ def retry(run_id: str, max_retries: int = 3) -> str:
             raise KeyError(run_id)
         if row["status"] not in {"failed", "cancelled"}:
             raise ResearchConflictError("Only failed or cancelled runs can be retried")
+        _guard_compaction_lifecycle_activation(
+            conn,
+            str(row["thread_id"]),
+            str(row["user_message_id"]),
+            row["assistant_message_id"],
+        )
         # Counted per question, not per run row: a thread holds one run for its lifetime and
         # re-points it at each new question, so a raw retry_count would hand a fresh question
         # whatever the stopped one left over -- and nothing at all once three were spent.

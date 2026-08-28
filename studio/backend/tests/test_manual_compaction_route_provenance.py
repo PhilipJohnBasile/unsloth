@@ -17,6 +17,9 @@ from routes import inference
 from storage import studio_db
 
 
+_CLAIM_ID = "2" * 64
+
+
 def _reset_db(tmp_path, monkeypatch):
     monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
     monkeypatch.setattr(studio_db, "_schema_ready", False)
@@ -59,6 +62,13 @@ def _prepare(tmp_path, monkeypatch):
         {"role": "user", "content": "/compact"},
     ]
     parsed = ChatCompletionRequest(model = "model", messages = messages)
+    manual_compaction.bind_manual_compaction_command(
+        "thread-route",
+        attempt_id = "attempt-route",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-1",
+        attempt_sequence = 1,
+    )
     prepared = manual_compaction.prepare_manual_compaction(
         "thread-route",
         attempt_id = "attempt-route",
@@ -87,6 +97,7 @@ def _payload(
         stream = stream,
         manual_compaction = {
             "attemptId": prepared["attemptId"],
+            "claimId": _CLAIM_ID,
             "threadId": prepared["threadId"],
             "commandMessageId": prepared["commandMessageId"],
             "expectedHeadMessageId": prepared["expectedHeadMessageId"],

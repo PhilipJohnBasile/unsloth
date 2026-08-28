@@ -28,6 +28,7 @@ from auth.authentication import get_current_subject
 from core.manual_compaction import (
     ManualCompactionError,
     archive_manual_compaction_best_effort,
+    bind_manual_compaction_command,
     cancel_manual_compaction,
     commit_manual_compaction,
     get_manual_compaction_attempt,
@@ -387,6 +388,17 @@ class ManualCompactionPrepareRequest(BaseModel):
     messages: list[InferenceChatMessage] = Field(min_length = 2, max_length = 40_000)
 
 
+class ManualCompactionBindRequest(BaseModel):
+    model_config = ConfigDict(extra = "forbid")
+
+    attemptId: str = Field(min_length = 1, max_length = 128)
+    commandMessageId: str = Field(min_length = 1, max_length = 128)
+    summaryMessageId: str = Field(min_length = 1, max_length = 128)
+    attemptSequence: int = Field(ge = 1, le = 2**53 - 1)
+    expectedAttemptId: Optional[str] = Field(default = None, min_length = 1, max_length = 128)
+    expectedAttemptSequence: Optional[int] = Field(default = None, ge = 1, le = 2**53 - 1)
+
+
 class ManualCompactionCommitRequest(BaseModel):
     model_config = ConfigDict(extra = "forbid")
 
@@ -403,6 +415,7 @@ class ManualCompactionCancelRequest(BaseModel):
 
     attemptId: str = Field(min_length = 1, max_length = 128)
     commandMessageId: str = Field(min_length = 1, max_length = 128)
+    claimId: str = Field(min_length = 64, max_length = 64, pattern = r"^[0-9a-f]{64}$")
 
 
 class ManualCompactionResponse(BaseModel):
@@ -1364,6 +1377,31 @@ def _manual_compaction_http_error(exc: ManualCompactionError) -> HTTPException:
 
 
 @router.post(
+    "/threads/{thread_id}/compactions:bind",
+    response_model = ChatMessage,
+)
+def bind_thread_manual_compaction(
+    thread_id: str,
+    payload: ManualCompactionBindRequest,
+    current_subject: str = Depends(get_current_subject),
+):
+    try:
+        return ChatMessage(
+            **bind_manual_compaction_command(
+                thread_id,
+                attempt_id = payload.attemptId,
+                command_message_id = payload.commandMessageId,
+                summary_message_id = payload.summaryMessageId,
+                attempt_sequence = payload.attemptSequence,
+                expected_attempt_id = payload.expectedAttemptId,
+                expected_attempt_sequence = payload.expectedAttemptSequence,
+            )
+        )
+    except ManualCompactionError as exc:
+        raise _manual_compaction_http_error(exc) from exc
+
+
+@router.post(
     "/threads/{thread_id}/compactions:prepare",
     response_model = ManualCompactionResponse,
 )
@@ -1428,6 +1466,7 @@ def cancel_thread_manual_compaction(
                 thread_id,
                 attempt_id = payload.attemptId,
                 command_message_id = payload.commandMessageId,
+                claim_id = payload.claimId,
             )
         )
     except ManualCompactionError as exc:

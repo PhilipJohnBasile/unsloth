@@ -1863,6 +1863,13 @@ class ManualCompactionEnvelope(BaseModel):
     model_config = {"extra": "forbid", "populate_by_name": True}
 
     attempt_id: str = Field(alias = "attemptId", min_length = 1, max_length = 128)
+    claim_id: str = Field(
+        alias = "claimId",
+        min_length = 64,
+        max_length = 64,
+        pattern = r"^[0-9a-f]{64}$",
+        repr = False,
+    )
     thread_id: str = Field(alias = "threadId", min_length = 1, max_length = 128)
     command_message_id: str = Field(alias = "commandMessageId", min_length = 1, max_length = 128)
     expected_head_message_id: str = Field(

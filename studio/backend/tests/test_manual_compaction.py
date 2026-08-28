@@ -9,13 +9,18 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 
 from core import manual_compaction
 from core.rag import conversation_archive
 from models.inference import ChatCompletionRequest
 from routes import chat_history, inference
-from storage import studio_db
+from storage import chat_generation_runs_db, research_runs_db, studio_db
+
+
+_CLAIM_ID = "1" * 64
+_prepare_core = manual_compaction.prepare_manual_compaction
 
 
 def _reset_db(tmp_path, monkeypatch):
@@ -81,6 +86,108 @@ def _set_raw_message_json(message_id, column, value):
         conn.close()
 
 
+def _set_raw_parent(message_id, parent_id):
+    conn = studio_db.get_connection()
+    try:
+        conn.execute("UPDATE chat_messages SET parent_id = ? WHERE id = ?", (parent_id, message_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _raw_message_row(message_id):
+    conn = studio_db.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT id, thread_id, parent_id, role, content_json, attachments_json, "
+            "metadata_json, created_at FROM chat_messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+        return tuple(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def _raw_attempt_row(attempt_id):
+    conn = studio_db.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM manual_compactions WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        return tuple(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def _raw_reservation_row(attempt_id):
+    conn = studio_db.get_connection()
+    try:
+        row = conn.execute(
+            "SELECT * FROM manual_compaction_attempt_reservations WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        return tuple(row) if row is not None else None
+    finally:
+        conn.close()
+
+
+def _raw_research_state(run_id, thread_id = "thread-1"):
+    conn = studio_db.get_connection()
+    try:
+        run = conn.execute("SELECT * FROM research_runs WHERE id = ?", (run_id,)).fetchone()
+        claims = conn.execute(
+            "SELECT * FROM research_thread_claims WHERE thread_id = ? ORDER BY owner_subject",
+            (thread_id,),
+        ).fetchall()
+        events = conn.execute(
+            "SELECT * FROM research_events WHERE run_id = ? ORDER BY seq",
+            (run_id,),
+        ).fetchall()
+        return (
+            tuple(run) if run is not None else None,
+            [tuple(row) for row in claims],
+            [tuple(row) for row in events],
+        )
+    finally:
+        conn.close()
+
+
+def _raw_generation_state(run_id):
+    conn = studio_db.get_connection()
+    try:
+        run = conn.execute(
+            "SELECT * FROM chat_generation_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        events = conn.execute(
+            "SELECT * FROM chat_generation_events WHERE run_id = ? ORDER BY seq",
+            (run_id,),
+        ).fetchall()
+        return tuple(run) if run is not None else None, [tuple(row) for row in events]
+    finally:
+        conn.close()
+
+
+def _raw_thread_and_messages(thread_id = "thread-1"):
+    conn = studio_db.get_connection()
+    try:
+        thread = conn.execute(
+            "SELECT * FROM chat_threads WHERE id = ?",
+            (thread_id,),
+        ).fetchone()
+        messages = conn.execute(
+            "SELECT * FROM chat_messages WHERE thread_id = ? ORDER BY id",
+            (thread_id,),
+        ).fetchall()
+        return (
+            tuple(thread) if thread is not None else None,
+            [tuple(row) for row in messages],
+        )
+    finally:
+        conn.close()
+
+
 def _seed_prunable_branch(
     tmp_path,
     monkeypatch,
@@ -118,21 +225,88 @@ def _full_wire_messages():
     return [{"role": "system", "content": "Project rules"}, *_wire_messages()]
 
 
-def _prepare(messages = None):
+def _prepare_bound(
+    thread_id,
+    *,
+    attempt_id,
+    command_message_id,
+    expected_head_message_id,
+    message_ids,
+    request_messages,
+    summary_message_id = None,
+):
+    if summary_message_id is None:
+        summary_message_id = (
+            "summary-1" if command_message_id == "compact-1" else f"summary-{command_message_id}"
+        )
+    command = studio_db.get_chat_message(thread_id, command_message_id)
+    metadata = command.get("metadata") if command else None
+    current = (
+        metadata.get(manual_compaction.MANUAL_COMPACTION_CLIENT_KEY)
+        if isinstance(metadata, dict)
+        else None
+    )
+    sequence = 1
+    expected_attempt_id = None
+    expected_attempt_sequence = None
+    if isinstance(current, dict):
+        if current.get("attemptId") == attempt_id:
+            sequence = current.get("attemptSequence", 1)
+            summary_message_id = current.get("summaryMessageId", summary_message_id)
+        else:
+            sequence = current.get("attemptSequence", 0) + 1
+            expected_attempt_id = current.get("attemptId")
+            expected_attempt_sequence = current.get("attemptSequence")
+    manual_compaction.bind_manual_compaction_command(
+        thread_id,
+        attempt_id = attempt_id,
+        command_message_id = command_message_id,
+        summary_message_id = summary_message_id,
+        attempt_sequence = sequence,
+        expected_attempt_id = expected_attempt_id,
+        expected_attempt_sequence = expected_attempt_sequence,
+    )
+    return _prepare_core(
+        thread_id,
+        attempt_id = attempt_id,
+        command_message_id = command_message_id,
+        expected_head_message_id = expected_head_message_id,
+        message_ids = message_ids,
+        request_messages = request_messages,
+    )
+
+
+def _prepare(messages = None, *, summary_message_id = "summary-1"):
     request_messages = ChatCompletionRequest(
         model = "model", messages = messages or _full_wire_messages()
     ).messages
-    return manual_compaction.prepare_manual_compaction(
+    return _prepare_bound(
         "thread-1",
         attempt_id = "attempt-1",
         command_message_id = "compact-1",
         expected_head_message_id = "compact-1",
         message_ids = ["u1", "a1", "compact-1"],
         request_messages = request_messages,
+        summary_message_id = summary_message_id,
     )
 
 
-def _request(prepared, messages = None):
+def _client_record(thread_id = "thread-1", command_message_id = "compact-1"):
+    command = studio_db.get_chat_message(thread_id, command_message_id)
+    metadata = command.get("metadata") if command else None
+    return (
+        metadata.get(manual_compaction.MANUAL_COMPACTION_CLIENT_KEY)
+        if isinstance(metadata, dict)
+        else None
+    )
+
+
+def _request(
+    prepared,
+    messages = None,
+    *,
+    claim_id = _CLAIM_ID,
+):
     return ChatCompletionRequest(
         model = "model",
         thread_id = "thread-1",
@@ -161,6 +335,7 @@ def _request(prepared, messages = None):
         context_management = [{"type": "compaction"}],
         manual_compaction = {
             "attemptId": prepared["attemptId"],
+            "claimId": claim_id,
             "threadId": prepared["threadId"],
             "commandMessageId": prepared["commandMessageId"],
             "expectedHeadMessageId": prepared["expectedHeadMessageId"],
@@ -175,8 +350,13 @@ def _request(prepared, messages = None):
     )
 
 
-def _claim(prepared, messages = None):
-    request = _request(prepared, messages = messages)
+def _claim(
+    prepared,
+    messages = None,
+    *,
+    claim_id = _CLAIM_ID,
+):
+    request = _request(prepared, messages = messages, claim_id = claim_id)
     manual_compaction.validate_and_rewrite_manual_compaction_request(request)
     return request
 
@@ -229,6 +409,11 @@ def _run_in_writer_order(monkeypatch, winner_name, winner, loser_name, loser):
             results[name] = exc
 
     monkeypatch.setattr(studio_db, "get_connection", gated_get_connection)
+    # These lifecycle modules bind the storage function at import time, while manual
+    # compaction resolves it through the storage module. Gate every direct writer so
+    # this helper controls the same SQLite transaction boundary for either operation.
+    monkeypatch.setattr(chat_generation_runs_db, "get_connection", gated_get_connection)
+    monkeypatch.setattr(research_runs_db, "get_connection", gated_get_connection)
     winner_thread = threading.Thread(
         target = capture,
         args = (winner_name, winner),
@@ -288,7 +473,7 @@ def test_prepare_prunes_anthropic_refusal_and_pins_full_source(tmp_path, monkeyp
         {"role": "user", "content": "/compact"},
     ]
 
-    prepared = manual_compaction.prepare_manual_compaction(
+    prepared = _prepare_bound(
         "thread-1",
         attempt_id = "attempt-refusal",
         command_message_id = "compact-1",
@@ -337,7 +522,7 @@ def test_prepare_prunes_abandoned_turn_in_both_reasoning_modes(
         {"role": "user", "content": "/compact"},
     ]
 
-    prepared = manual_compaction.prepare_manual_compaction(
+    prepared = _prepare_bound(
         "thread-1",
         attempt_id = f"attempt-abandoned-{include_reasoning}",
         command_message_id = "compact-1",
@@ -384,7 +569,7 @@ def test_archive_uses_persisted_pruned_payload(
         {"role": "assistant", "content": "Use a staged rollout."},
         {"role": "user", "content": "/compact"},
     ]
-    prepared = manual_compaction.prepare_manual_compaction(
+    prepared = _prepare_bound(
         "thread-1",
         attempt_id = attempt_id,
         command_message_id = "compact-1",
@@ -466,7 +651,7 @@ def test_prepare_keeps_complete_reasoning_only_turn_in_both_modes(
         {"role": "user", "content": "/compact"},
     ]
 
-    prepared = manual_compaction.prepare_manual_compaction(
+    prepared = _prepare_bound(
         "thread-1",
         attempt_id = f"attempt-reasoning-{include_reasoning}",
         command_message_id = "compact-1",
@@ -698,7 +883,7 @@ def test_attempt_reads_fail_closed_on_malformed_archive_and_output_provenance(
 def test_prepare_rejects_non_exact_ancestry(tmp_path, monkeypatch, message_ids, command_id, detail):
     _seed_branch(tmp_path, monkeypatch)
     with pytest.raises(manual_compaction.ManualCompactionConflict, match = detail):
-        manual_compaction.prepare_manual_compaction(
+        _prepare_core(
             "thread-1",
             attempt_id = "bad-attempt",
             command_message_id = command_id,
@@ -715,7 +900,7 @@ def test_prepare_rejects_cross_thread_ids_and_branch_bounds(tmp_path, monkeypatc
         _message("foreign", None, "user", "/compact", thread_id = "thread-2")
     )
     with pytest.raises(manual_compaction.ManualCompactionConflict, match = "crosses"):
-        manual_compaction.prepare_manual_compaction(
+        _prepare_core(
             "thread-1",
             attempt_id = "cross-thread",
             command_message_id = "foreign",
@@ -725,7 +910,7 @@ def test_prepare_rejects_cross_thread_ids_and_branch_bounds(tmp_path, monkeypatc
         )
     monkeypatch.setattr(manual_compaction, "MAX_MANUAL_COMPACTION_MESSAGES", 2)
     with pytest.raises(manual_compaction.ManualCompactionError, match = "2 to 2"):
-        manual_compaction.prepare_manual_compaction(
+        _prepare_bound(
             "thread-1",
             attempt_id = "too-long",
             command_message_id = "compact-1",
@@ -738,21 +923,21 @@ def test_prepare_rejects_cross_thread_ids_and_branch_bounds(tmp_path, monkeypatc
 def test_prepare_rejects_attempt_collision_and_non_literal_head(tmp_path, monkeypatch):
     _seed_branch(tmp_path, monkeypatch)
     _prepare()
-    replacement = manual_compaction.prepare_manual_compaction(
-        "thread-1",
-        attempt_id = "attempt-same-branch",
-        command_message_id = "compact-1",
-        expected_head_message_id = "compact-1",
-        message_ids = ["u1", "a1", "compact-1"],
-        request_messages = ChatCompletionRequest(
-            model = "model", messages = _full_wire_messages()
-        ).messages,
-    )
-    assert replacement["state"] == "pending"
-    assert manual_compaction.get_manual_compaction_attempt("attempt-1")["state"] == "cancelled"
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "live /compact"):
+        _prepare_bound(
+            "thread-1",
+            attempt_id = "attempt-same-branch",
+            command_message_id = "compact-1",
+            expected_head_message_id = "compact-1",
+            message_ids = ["u1", "a1", "compact-1"],
+            request_messages = ChatCompletionRequest(
+                model = "model", messages = _full_wire_messages()
+            ).messages,
+        )
+    assert manual_compaction.get_manual_compaction_attempt("attempt-1")["state"] == "pending"
     studio_db.upsert_chat_message(_message("compact-other", "a1", "user", "/compact"))
-    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "another branch"):
-        manual_compaction.prepare_manual_compaction(
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "already used"):
+        _prepare_bound(
             "thread-1",
             attempt_id = "attempt-1",
             command_message_id = "compact-other",
@@ -760,14 +945,14 @@ def test_prepare_rejects_attempt_collision_and_non_literal_head(tmp_path, monkey
             message_ids = ["u1", "a1", "compact-other"],
             request_messages = _full_wire_messages(),
         )
-    studio_db.upsert_chat_message(_message("compact-1", "a1", "user", "/compact now"))
+    studio_db.upsert_chat_message(_message("compact-invalid", "a1", "user", "/compact now"))
     with pytest.raises(manual_compaction.ManualCompactionConflict, match = "literal"):
-        manual_compaction.prepare_manual_compaction(
+        _prepare_bound(
             "thread-1",
             attempt_id = "not-literal",
-            command_message_id = "compact-1",
-            expected_head_message_id = "compact-1",
-            message_ids = ["u1", "a1", "compact-1"],
+            command_message_id = "compact-invalid",
+            expected_head_message_id = "compact-invalid",
+            message_ids = ["u1", "a1", "compact-invalid"],
             request_messages = _full_wire_messages(),
         )
 
@@ -1155,14 +1340,7 @@ def test_malformed_search_image_envelope_cannot_be_forged_as_text(tmp_path, monk
     forged = [dict(message) for message in messages]
     forged[3] = {**forged[3], "content": result["text"]}
     with pytest.raises(manual_compaction.ManualCompactionConflict, match = "exact stored"):
-        manual_compaction.prepare_manual_compaction(
-            "thread-1",
-            attempt_id = "forged-search-images",
-            command_message_id = "compact-1",
-            expected_head_message_id = "compact-1",
-            message_ids = ["u1", "a1", "compact-1"],
-            request_messages = forged,
-        )
+        _prepare(forged)
 
 
 @pytest.mark.parametrize(
@@ -1229,14 +1407,7 @@ def test_prepare_matches_frontend_sandbox_wrapper_validation(
         forged = [dict(message) for message in messages]
         forged[3] = {**forged[3], "content": "ok"}
         with pytest.raises(manual_compaction.ManualCompactionConflict, match = "exact stored"):
-            manual_compaction.prepare_manual_compaction(
-                "thread-1",
-                attempt_id = "forged-wrapper",
-                command_message_id = "compact-1",
-                expected_head_message_id = "compact-1",
-                message_ids = ["u1", "a1", "compact-1"],
-                request_messages = forged,
-            )
+            _prepare(forged)
 
 
 def test_prepare_binds_codex_reasoning_replay_metadata(tmp_path, monkeypatch):
@@ -1260,7 +1431,10 @@ def test_prepare_binds_codex_reasoning_replay_metadata(tmp_path, monkeypatch):
     assistant["metadata"] = {
         "custom": {"openaiCodexReasoning": [{"type": "reasoning", "id": "changed", "summary": []}]}
     }
-    studio_db.upsert_chat_message(assistant, allow_generation_edit = True)
+    before = _raw_message_row("a1")
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "checkpoint"):
+        studio_db.upsert_chat_message(assistant, allow_generation_edit = True)
+    assert _raw_message_row("a1") == before
     with pytest.raises(manual_compaction.ManualCompactionConflict, match = "already running"):
         manual_compaction.validate_and_rewrite_manual_compaction_request(
             _request(prepared, messages = messages)
@@ -1299,14 +1473,7 @@ def test_prepare_requires_current_stored_project_instructions(tmp_path, monkeypa
         "content": "<project_instructions>\nSkip it.\n</project_instructions>",
     }
     with pytest.raises(manual_compaction.ManualCompactionConflict, match = "project instructions"):
-        manual_compaction.prepare_manual_compaction(
-            "thread-1",
-            attempt_id = "altered-project",
-            command_message_id = "compact-1",
-            expected_head_message_id = "compact-1",
-            message_ids = ["u1", "a1", "compact-1"],
-            request_messages = ChatCompletionRequest(model = "model", messages = changed).messages,
-        )
+        _prepare(ChatCompletionRequest(model = "model", messages = changed).messages)
 
 
 def test_prepare_rejects_a_truncated_wire_branch(tmp_path, monkeypatch):
@@ -1371,14 +1538,7 @@ def test_prepare_binds_text_and_image_attachments_to_wire_content(tmp_path, monk
         "content": [{"type": "text", "text": "Explain the migration."}],
     }
     with pytest.raises(manual_compaction.ManualCompactionConflict, match = "exact stored"):
-        manual_compaction.prepare_manual_compaction(
-            "thread-1",
-            attempt_id = "attachment-drift",
-            command_message_id = "compact-1",
-            expected_head_message_id = "compact-1",
-            message_ids = ["u1", "a1", "compact-1"],
-            request_messages = changed,
-        )
+        _prepare(changed)
 
 
 @pytest.mark.parametrize(
@@ -1459,7 +1619,16 @@ def test_inference_rejects_truncation_and_prepare_drift(tmp_path, monkeypatch):
     with pytest.raises(manual_compaction.ManualCompactionConflict, match = "request changed"):
         manual_compaction.validate_and_rewrite_manual_compaction_request(system_drifted)
 
-    studio_db.upsert_chat_message(_message("a1", "u1", "assistant", "Changed answer."))
+    changed_source = _message("a1", "u1", "assistant", "Changed answer.")
+    before = _raw_message_row("a1")
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "checkpoint"):
+        studio_db.upsert_chat_message(changed_source)
+    assert _raw_message_row("a1") == before
+    _set_raw_message_json(
+        "a1",
+        "content_json",
+        json.dumps(changed_source["content"], separators = (",", ":")),
+    )
     with pytest.raises(manual_compaction.ManualCompactionConflict, match = "source changed"):
         manual_compaction.validate_and_rewrite_manual_compaction_request(_request(prepared))
 
@@ -1902,6 +2071,17 @@ def test_commit_rejects_a_summary_that_is_no_longer_the_leaf(tmp_path, monkeypat
 
 def test_prepare_and_commit_route_models_drive_archive_after_activation(tmp_path, monkeypatch):
     _seed_branch(tmp_path, monkeypatch)
+    bound = chat_history.bind_thread_manual_compaction(
+        "thread-1",
+        chat_history.ManualCompactionBindRequest(
+            attemptId = "route-attempt",
+            commandMessageId = "compact-1",
+            summaryMessageId = "summary-route",
+            attemptSequence = 1,
+        ),
+        current_subject = "test-user",
+    )
+    assert bound.metadata[manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]["state"] == "bound"
     prepared = chat_history.prepare_thread_manual_compaction(
         "thread-1",
         chat_history.ManualCompactionPrepareRequest(
@@ -1975,7 +2155,7 @@ def test_pending_archive_recovers_after_activation_crash_and_stays_idempotent(
     tmp_path, monkeypatch
 ):
     _seed_branch(tmp_path, monkeypatch)
-    prepared = _prepare()
+    prepared = _prepare(summary_message_id = "summary-crash")
     _claim(prepared)
     _record_output(prepared, "crash-safe summary")
     studio_db.upsert_chat_message(
@@ -2240,7 +2420,7 @@ def test_next_prepare_uses_branch_local_active_revision(tmp_path, monkeypatch):
         expected_summary_hash = manual_compaction.summary_hash(text),
     )
     studio_db.upsert_chat_message(_message("compact-2", "summary-1", "user", "/compact"))
-    next_attempt = manual_compaction.prepare_manual_compaction(
+    next_attempt = _prepare_bound(
         "thread-1",
         attempt_id = "attempt-2",
         command_message_id = "compact-2",
@@ -2424,7 +2604,7 @@ def test_project_instruction_context_drift_blocks_inference_and_commit(tmp_path,
         "project-1",
         {"instructions": "Keep migrations reversible.", "updatedAt": 9},
     )
-    refreshed = manual_compaction.prepare_manual_compaction(
+    refreshed = _prepare_bound(
         "thread-1",
         attempt_id = "attempt-refreshed",
         command_message_id = "compact-1",
@@ -2432,7 +2612,9 @@ def test_project_instruction_context_drift_blocks_inference_and_commit(tmp_path,
         message_ids = ["u1", "a1", "compact-1"],
         request_messages = messages,
     )
-    assert manual_compaction.get_manual_compaction_attempt("attempt-1")["state"] == "cancelled"
+    invalidated = manual_compaction.get_manual_compaction_attempt("attempt-1")
+    assert invalidated["state"] == "failed"
+    assert invalidated["terminalReason"] == "prepare_invalidated"
     _claim(refreshed, messages = messages)
     studio_db.update_chat_project(
         "project-1",
@@ -2650,7 +2832,7 @@ def test_identical_missing_id_calls_in_two_rounds_get_distinct_stable_ids(tmp_pa
     assert normalized.messages[3].tool_call_id == first_id
     assert normalized.messages[6].tool_call_id == second_id
 
-    prepared = manual_compaction.prepare_manual_compaction(
+    prepared = _prepare_bound(
         "thread-1",
         attempt_id = "attempt-1",
         command_message_id = "compact-1",
@@ -2674,7 +2856,7 @@ def test_concurrent_prepare_and_commit_serialize_without_revision_split(tmp_path
             return exc
 
     def _prepare_with_id(attempt_id):
-        return manual_compaction.prepare_manual_compaction(
+        return _prepare_bound(
             "thread-1",
             attempt_id = attempt_id,
             command_message_id = "compact-1",
@@ -2687,17 +2869,15 @@ def test_concurrent_prepare_and_commit_serialize_without_revision_split(tmp_path
 
     with ThreadPoolExecutor(max_workers = 2) as pool:
         prepared_results = list(pool.map(prepare, ("attempt-a", "attempt-b")))
-    assert all(isinstance(result, dict) for result in prepared_results)
-    stored = [
-        manual_compaction.get_manual_compaction_attempt(result["attemptId"])
-        for result in prepared_results
-    ]
-    live = [attempt for attempt in stored if attempt["state"] == "pending"]
-    cancelled = [attempt for attempt in stored if attempt["state"] == "cancelled"]
-    assert len(live) == 1
-    assert len(cancelled) == 1
-
-    winner = live[0]
+    winners = [result for result in prepared_results if isinstance(result, dict)]
+    losers = [result for result in prepared_results if isinstance(result, Exception)]
+    assert len(winners) == 1
+    assert len(losers) == 1
+    assert any(detail in str(losers[0]) for detail in ("binding CAS is stale", "live /compact"))
+    winner = winners[0]
+    assert winner["state"] == "pending"
+    losing_attempt_id = "attempt-b" if winner["attemptId"] == "attempt-a" else "attempt-a"
+    assert manual_compaction.get_manual_compaction_attempt(losing_attempt_id) is None
     _claim(winner)
     _record_output(winner, "summary")
     studio_db.upsert_chat_message(_message("summary-1", "compact-1", "assistant", "summary"))
@@ -2721,12 +2901,20 @@ def test_concurrent_prepare_and_commit_serialize_without_revision_split(tmp_path
     }
 
 
-def test_pending_source_drift_is_replaced_without_bricking_the_branch(tmp_path, monkeypatch):
+def test_pending_source_drift_cannot_replace_the_fenced_ancestry(tmp_path, monkeypatch):
     _seed_branch(tmp_path, monkeypatch)
     first = _prepare()
     user = studio_db.get_chat_message("thread-1", "u1")
     user["content"] = [{"type": "text", "text": "Explain the revised migration."}]
-    studio_db.upsert_chat_message(user)
+    before = _raw_message_row("u1")
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "checkpoint"):
+        studio_db.upsert_chat_message(user)
+    assert _raw_message_row("u1") == before
+    _set_raw_message_json(
+        "u1",
+        "content_json",
+        json.dumps(user["content"], separators = (",", ":")),
+    )
     messages = [
         {"role": "system", "content": "Project rules"},
         {"role": "user", "content": "Explain the revised migration."},
@@ -2734,19 +2922,115 @@ def test_pending_source_drift_is_replaced_without_bricking_the_branch(tmp_path, 
         {"role": "user", "content": "/compact"},
     ]
 
-    replacement = manual_compaction.prepare_manual_compaction(
+    command_before = _raw_message_row("compact-1")
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "ancestry changed"):
+        _prepare_bound(
+            "thread-1",
+            attempt_id = "attempt-2",
+            command_message_id = "compact-1",
+            expected_head_message_id = "compact-1",
+            message_ids = ["u1", "a1", "compact-1"],
+            request_messages = messages,
+        )
+
+    assert _raw_message_row("compact-1") == command_before
+    assert manual_compaction.get_manual_compaction_attempt(first["attemptId"])["state"] == "pending"
+    assert manual_compaction.get_manual_compaction_attempt("attempt-2") is None
+
+
+def test_child_after_prepare_claim_terminalizes_and_new_head_can_bind(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    studio_db.upsert_chat_message(_message("late-child", "compact-1", "assistant", "Late response"))
+
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "no longer the branch"):
+        _claim(prepared)
+
+    invalidated = manual_compaction.get_manual_compaction_attempt(prepared["attemptId"])
+    assert invalidated["state"] == "failed"
+    assert invalidated["terminalReason"] == "prepare_invalidated"
+    studio_db.upsert_chat_message(_message("compact-2", "late-child", "user", "/compact"))
+    bound = manual_compaction.bind_manual_compaction_command(
         "thread-1",
         attempt_id = "attempt-2",
-        command_message_id = "compact-1",
-        expected_head_message_id = "compact-1",
-        message_ids = ["u1", "a1", "compact-1"],
-        request_messages = messages,
+        command_message_id = "compact-2",
+        summary_message_id = "summary-2",
+        attempt_sequence = 1,
+    )
+    assert bound["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]["attemptId"] == (
+        "attempt-2"
     )
 
-    assert replacement["state"] == "pending"
-    assert replacement["sourceHash"] != first["sourceHash"]
-    assert manual_compaction.get_manual_compaction_attempt("attempt-1")["state"] == "cancelled"
-    _claim(replacement, messages = messages)
+
+def test_child_after_prepare_replacement_terminalizes_before_branch_head_conflict(
+    tmp_path, monkeypatch
+):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    studio_db.upsert_chat_message(_message("late-child", "compact-1", "assistant", "Late response"))
+    fence_before = _client_record()
+
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "no longer the branch"):
+        manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = "attempt-2",
+            command_message_id = "compact-1",
+            summary_message_id = "summary-2",
+            attempt_sequence = 2,
+            expected_attempt_id = prepared["attemptId"],
+            expected_attempt_sequence = 1,
+        )
+
+    invalidated = manual_compaction.get_manual_compaction_attempt(prepared["attemptId"])
+    assert invalidated["state"] == "failed"
+    assert invalidated["terminalReason"] == "prepare_invalidated"
+    assert _client_record() == fence_before
+    assert manual_compaction.get_manual_compaction_attempt("attempt-2") is None
+    assert _raw_reservation_row("attempt-2") is None
+
+
+@pytest.mark.parametrize("first", ["claim", "replacement"])
+def test_child_after_prepare_claim_and_replacement_serialize_to_one_invalidation(
+    tmp_path, monkeypatch, first
+):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    studio_db.upsert_chat_message(_message("late-child", "compact-1", "assistant", "Late response"))
+
+    def claim():
+        return _claim(prepared)
+
+    def replacement():
+        return manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = "attempt-2",
+            command_message_id = "compact-1",
+            summary_message_id = "summary-2",
+            attempt_sequence = 2,
+            expected_attempt_id = prepared["attemptId"],
+            expected_attempt_sequence = 1,
+        )
+
+    operations = {"claim": claim, "replacement": replacement}
+    second = "replacement" if first == "claim" else "claim"
+    results = _run_in_writer_order(
+        monkeypatch,
+        f"{first}-winner",
+        operations[first],
+        f"{second}-loser",
+        operations[second],
+    )
+
+    assert all(
+        isinstance(result, manual_compaction.ManualCompactionConflict)
+        for result in results.values()
+    )
+    invalidated = manual_compaction.get_manual_compaction_attempt(prepared["attemptId"])
+    assert invalidated["state"] == "failed"
+    assert invalidated["terminalReason"] == "prepare_invalidated"
+    assert _client_record()["attemptId"] == prepared["attemptId"]
+    assert manual_compaction.get_manual_compaction_attempt("attempt-2") is None
+    assert _raw_reservation_row("attempt-2") is None
 
 
 def test_expired_running_attempt_can_be_replaced(tmp_path, monkeypatch):
@@ -2765,7 +3049,7 @@ def test_expired_running_attempt_can_be_replaced(tmp_path, monkeypatch):
     with pytest.raises(manual_compaction.ManualCompactionConflict, match = "terminal"):
         _prepare()
 
-    replacement = manual_compaction.prepare_manual_compaction(
+    replacement = _prepare_bound(
         "thread-1",
         attempt_id = "attempt-after-expiry",
         command_message_id = "compact-1",
@@ -2833,7 +3117,7 @@ def test_expired_commit_wins_writer_lock_over_replacement(tmp_path, monkeypatch)
         )
 
     def replace():
-        return manual_compaction.prepare_manual_compaction(
+        return _prepare_bound(
             "thread-1",
             attempt_id = "attempt-2",
             command_message_id = "compact-1",
@@ -2858,7 +3142,9 @@ def test_expired_commit_wins_writer_lock_over_replacement(tmp_path, monkeypatch)
     assert manual_compaction.get_manual_compaction_attempt("attempt-2") is None
 
 
-def test_expired_replacement_wins_writer_lock_over_late_commit(tmp_path, monkeypatch):
+def test_expired_replacement_binding_rejects_late_commit_and_recovers_stale_child(
+    tmp_path, monkeypatch
+):
     _seed_branch(tmp_path, monkeypatch)
     prepared = _prepare()
     _claim(prepared)
@@ -2869,19 +3155,23 @@ def test_expired_replacement_wins_writer_lock_over_late_commit(tmp_path, monkeyp
         lambda: (running["leaseExpiresAt"] + 1) / 1000,
     )
 
-    def replace():
-        return manual_compaction.prepare_manual_compaction(
-            "thread-1",
-            attempt_id = "attempt-2",
-            command_message_id = "compact-1",
-            expected_head_message_id = "compact-1",
-            message_ids = ["u1", "a1", "compact-1"],
-            request_messages = _full_wire_messages(),
-        )
+    replacement = manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-2",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-1",
+        attempt_sequence = 2,
+        expected_attempt_id = "attempt-1",
+        expected_attempt_sequence = 1,
+    )
+    assert (
+        replacement["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]["attemptId"]
+        == "attempt-2"
+    )
 
-    def store_late_summary_then_commit():
-        studio_db.upsert_chat_message(_message("summary-1", "compact-1", "assistant", "summary"))
-        return manual_compaction.commit_manual_compaction(
+    studio_db.upsert_chat_message(_message("summary-1", "compact-1", "assistant", "summary"))
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "failed: lease_expired"):
+        manual_compaction.commit_manual_compaction(
             "thread-1",
             attempt_id = "attempt-1",
             command_message_id = "compact-1",
@@ -2890,20 +3180,94 @@ def test_expired_replacement_wins_writer_lock_over_late_commit(tmp_path, monkeyp
             expected_revision = 1,
             expected_summary_hash = manual_compaction.summary_hash("summary"),
         )
+    assert _client_record()["attemptId"] == "attempt-2"
+
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "branch head"):
+        _prepare_core(
+            "thread-1",
+            attempt_id = "attempt-2",
+            command_message_id = "compact-1",
+            expected_head_message_id = "compact-1",
+            message_ids = ["u1", "a1", "compact-1"],
+            request_messages = _full_wire_messages(),
+        )
+
+    # The stale child has no server authority. Removing it cannot remove or rewrite the
+    # fenced command ancestry, and an exact retry then promotes the durable reservation.
+    studio_db.sync_chat_messages(
+        "thread-1",
+        [
+            studio_db.get_chat_message("thread-1", "u1"),
+            studio_db.get_chat_message("thread-1", "a1"),
+            studio_db.get_chat_message("thread-1", "compact-1"),
+        ],
+        prune_missing = True,
+    )
+    recovered = _prepare_core(
+        "thread-1",
+        attempt_id = "attempt-2",
+        command_message_id = "compact-1",
+        expected_head_message_id = "compact-1",
+        message_ids = ["u1", "a1", "compact-1"],
+        request_messages = _full_wire_messages(),
+    )
+    assert recovered["state"] == "pending"
+    assert manual_compaction.get_manual_compaction_attempt("attempt-1")["state"] == "failed"
+
+
+def test_expired_replacement_wins_writer_lock_before_late_summary_and_commit(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    _claim(prepared)
+    running = manual_compaction.get_manual_compaction_attempt(prepared["attemptId"])
+    monkeypatch.setattr(
+        manual_compaction.time,
+        "time",
+        lambda: (running["leaseExpiresAt"] + 1) / 1000,
+    )
+
+    def replace():
+        return manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = "attempt-2",
+            command_message_id = "compact-1",
+            summary_message_id = "summary-1",
+            attempt_sequence = 2,
+            expected_attempt_id = prepared["attemptId"],
+            expected_attempt_sequence = 1,
+        )
+
+    def late_commit():
+        studio_db.upsert_chat_message(_message("summary-1", "compact-1", "assistant", "summary"))
+        return manual_compaction.commit_manual_compaction(
+            "thread-1",
+            attempt_id = prepared["attemptId"],
+            command_message_id = prepared["commandMessageId"],
+            summary_message_id = "summary-1",
+            expected_head_message_id = "summary-1",
+            expected_revision = prepared["revision"],
+            expected_summary_hash = manual_compaction.summary_hash("summary"),
+        )
 
     results = _run_in_writer_order(
         monkeypatch,
         "replacement-winner",
         replace,
-        "late-response-loser",
-        store_late_summary_then_commit,
+        "late-commit-loser",
+        late_commit,
     )
 
-    assert results["replacement-winner"]["state"] == "pending"
-    assert isinstance(results["late-response-loser"], manual_compaction.ManualCompactionConflict)
-    assert "failed" in str(results["late-response-loser"])
-    assert manual_compaction.get_manual_compaction_attempt("attempt-2")["state"] == "pending"
-    assert manual_compaction.get_manual_compaction_attempt("attempt-1")["state"] == "failed"
+    assert isinstance(results["replacement-winner"], dict)
+    assert isinstance(results["late-commit-loser"], manual_compaction.ManualCompactionConflict)
+    assert "failed: lease_expired" in str(results["late-commit-loser"])
+    assert _client_record()["attemptId"] == "attempt-2"
+    assert _raw_reservation_row("attempt-2") is not None
+    assert manual_compaction.get_manual_compaction_attempt(prepared["attemptId"])["state"] == (
+        "failed"
+    )
+    assert manual_compaction.get_manual_compaction_attempt("attempt-2") is None
+    summary = studio_db.get_chat_message("thread-1", "summary-1")
+    assert summary.get("metadata") is None
 
 
 def test_only_one_inference_request_can_claim_an_attempt(tmp_path, monkeypatch):
@@ -2938,6 +3302,7 @@ def test_cancelled_attempt_cannot_commit_and_releases_the_branch(tmp_path, monke
         "thread-1",
         attempt_id = "attempt-1",
         command_message_id = "compact-1",
+        claim_id = _CLAIM_ID,
     )
     assert cancelled["state"] == "cancelled"
     assert cancelled["cancelledAt"] is not None
@@ -2962,7 +3327,7 @@ def test_cancelled_attempt_cannot_commit_and_releases_the_branch(tmp_path, monke
         ],
         prune_missing = True,
     )
-    replacement = manual_compaction.prepare_manual_compaction(
+    replacement = _prepare_bound(
         "thread-1",
         attempt_id = "attempt-2",
         command_message_id = "compact-1",
@@ -3079,7 +3444,7 @@ def test_fork_rekeys_active_summary_ids_attempt_and_source_hash(tmp_path, monkey
     studio_db.upsert_chat_message(
         _message("compact-2", "nfsummary", "user", "/compact", thread_id = "fork-2")
     )
-    nested_prepare = manual_compaction.prepare_manual_compaction(
+    nested_prepare = _prepare_bound(
         "fork-2",
         attempt_id = "attempt-nested",
         command_message_id = "compact-2",
@@ -3093,6 +3458,115 @@ def test_fork_rekeys_active_summary_ids_attempt_and_source_hash(tmp_path, monkey
     )
     assert nested_prepare["revision"] == 2
     assert nested_prepare["effectiveSourceMessageIds"] == ["nfsummary"]
+
+
+def test_fork_keeps_complete_active_checkpoint_but_strips_newer_live_authority(
+    tmp_path, monkeypatch
+):
+    _seed_branch(tmp_path, monkeypatch)
+    first = _prepare()
+    _claim(first)
+    _record_output(first, "summary")
+    studio_db.upsert_chat_message(_message("summary-1", "compact-1", "assistant", "summary"))
+    manual_compaction.commit_manual_compaction(
+        "thread-1",
+        attempt_id = first["attemptId"],
+        command_message_id = first["commandMessageId"],
+        summary_message_id = "summary-1",
+        expected_head_message_id = "summary-1",
+        expected_revision = first["revision"],
+        expected_summary_hash = manual_compaction.summary_hash("summary"),
+    )
+    for message in (
+        _message("u2", "summary-1", "user", "Continue."),
+        _message("a2", "u2", "assistant", "Continuing."),
+        _message("compact-2", "a2", "user", "/compact"),
+    ):
+        studio_db.upsert_chat_message(message)
+    second_messages = [
+        {"role": "system", "content": "Project rules"},
+        {"role": "assistant", "content": "summary"},
+        {"role": "user", "content": "Continue."},
+        {"role": "assistant", "content": "Continuing."},
+        {"role": "user", "content": "/compact"},
+    ]
+    second = _prepare_bound(
+        "thread-1",
+        attempt_id = "attempt-2",
+        command_message_id = "compact-2",
+        expected_head_message_id = "compact-2",
+        message_ids = ["u1", "a1", "compact-1", "summary-1", "u2", "a2", "compact-2"],
+        request_messages = ChatCompletionRequest(model = "model", messages = second_messages).messages,
+        summary_message_id = "summary-2",
+    )
+    _claim(second, messages = second_messages, claim_id = "9" * 64)
+    source_attempt_before = manual_compaction.get_manual_compaction_attempt("attempt-2")
+    ids = iter(["fu1", "fa1", "fc1", "fs1", "fu2", "fa2", "fc2"])
+
+    studio_db.fork_chat_thread(
+        source_thread_id = "thread-1",
+        branch_message_id = "compact-2",
+        new_thread_id = "fork-live",
+        new_title = "Fork live",
+        created_at = 30,
+        id_factory = lambda: next(ids),
+    )
+
+    fork_active = studio_db.get_chat_message("fork-live", "fs1")["metadata"]["manualCompaction"]
+    assert fork_active["state"] == "active"
+    assert fork_active["threadId"] == "fork-live"
+    assert (
+        manual_compaction.get_manual_compaction_attempt(fork_active["attemptId"])["state"]
+        == "active"
+    )
+    fork_live_command = studio_db.get_chat_message("fork-live", "fc2")
+    assert manual_compaction.MANUAL_COMPACTION_CLIENT_KEY not in (
+        fork_live_command.get("metadata") or {}
+    )
+    rebound = manual_compaction.bind_manual_compaction_command(
+        "fork-live",
+        attempt_id = "fork-fresh-attempt",
+        command_message_id = "fc2",
+        summary_message_id = "fork-fresh-summary",
+        attempt_sequence = 1,
+    )
+    assert (
+        rebound["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]["attemptSequence"] == 1
+    )
+    assert manual_compaction.get_manual_compaction_attempt("attempt-2") == source_attempt_before
+
+
+def test_fork_strips_malformed_and_incomplete_client_authority_without_touching_source(
+    tmp_path, monkeypatch
+):
+    _seed_branch(tmp_path, monkeypatch)
+    malformed_metadata = {
+        manual_compaction.MANUAL_COMPACTION_CLIENT_KEY: {
+            "schemaVersion": 1,
+            "state": "running",
+            "attemptId": "stale",
+        }
+    }
+    _set_raw_message_json(
+        "compact-1",
+        "metadata_json",
+        json.dumps(malformed_metadata, separators = (",", ":")),
+    )
+    source_before = _raw_message_row("compact-1")
+    ids = iter(["fu1", "fa1", "fcompact"])
+
+    studio_db.fork_chat_thread(
+        source_thread_id = "thread-1",
+        branch_message_id = "compact-1",
+        new_thread_id = "fork-malformed",
+        new_title = "Fork malformed",
+        created_at = 30,
+        id_factory = lambda: next(ids),
+    )
+
+    forked = studio_db.get_chat_message("fork-malformed", "fcompact")
+    assert manual_compaction.MANUAL_COMPACTION_CLIENT_KEY not in (forked.get("metadata") or {})
+    assert _raw_message_row("compact-1") == source_before
 
 
 def test_fork_route_retries_the_cloned_effective_archive(tmp_path, monkeypatch):
@@ -3203,7 +3677,9 @@ def test_schema_persists_attempt_fields_as_canonical_json(tmp_path, monkeypatch)
     assert row["output_recorded_at"] is None
 
 
-def test_schema_migrates_the_pre_lifecycle_compaction_table(tmp_path, monkeypatch):
+def test_schema_migrates_pre_lifecycle_table_but_terminalizes_incomplete_authority(
+    tmp_path, monkeypatch
+):
     _seed_branch(tmp_path, monkeypatch)
     prepared = _prepare()
     conn = studio_db.get_connection()
@@ -3267,10 +3743,12 @@ def test_schema_migrates_the_pre_lifecycle_compaction_table(tmp_path, monkeypatc
 
     monkeypatch.setattr(studio_db, "_schema_ready", False)
     migrated = manual_compaction.get_manual_compaction_attempt(prepared["attemptId"])
-    assert migrated["state"] == "pending"
+    assert migrated["state"] == "failed"
+    assert migrated["terminalReason"] == "migrated_failed"
     assert migrated["startedAt"] is None
     assert migrated["leaseExpiresAt"] is None
     assert migrated["archivePayload"] == []
+    assert migrated["sourceMessageIds"] == []
     assert migrated["outputSummaryHash"] is None
     assert migrated["outputFinishReason"] is None
     conn = studio_db.get_connection()
@@ -3287,3 +3765,1910 @@ def test_schema_migrates_the_pre_lifecycle_compaction_table(tmp_path, monkeypatc
     assert "archive_payload_json" in schema
     assert "output_finish_reason" in schema
     assert "idx_manual_compactions_live_branch" in indexes
+
+
+def test_two_initial_bind_clients_converge_on_one_attempt_and_summary(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    claim_a = "a" * 64
+    claim_b = "b" * 64
+
+    def bind(attempt_id, summary_message_id):
+        return manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = attempt_id,
+            command_message_id = "compact-1",
+            summary_message_id = summary_message_id,
+            attempt_sequence = 1,
+        )
+
+    results = _run_in_writer_order(
+        monkeypatch,
+        "client-a",
+        lambda: bind("attempt-a", "summary-a"),
+        "client-b",
+        lambda: bind("attempt-b", "summary-b"),
+    )
+
+    assert (
+        results["client-a"]["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]["attemptId"]
+        == "attempt-a"
+    )
+    assert isinstance(results["client-b"], manual_compaction.ManualCompactionConflict)
+    assert "binding CAS is stale" in str(results["client-b"])
+    record = _client_record()
+    assert record["attemptId"] == "attempt-a"
+    assert record["summaryMessageId"] == "summary-a"
+
+    prepared = _prepare_core(
+        "thread-1",
+        attempt_id = record["attemptId"],
+        command_message_id = "compact-1",
+        expected_head_message_id = "compact-1",
+        message_ids = ["u1", "a1", "compact-1"],
+        request_messages = ChatCompletionRequest(
+            model = "model", messages = _full_wire_messages()
+        ).messages,
+    )
+    recovered = _prepare_core(
+        "thread-1",
+        attempt_id = record["attemptId"],
+        command_message_id = "compact-1",
+        expected_head_message_id = "compact-1",
+        message_ids = ["u1", "a1", "compact-1"],
+        request_messages = ChatCompletionRequest(
+            model = "model", messages = _full_wire_messages()
+        ).messages,
+    )
+    assert recovered == prepared
+    _claim(prepared, claim_id = claim_a)
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "not owned"):
+        manual_compaction.cancel_manual_compaction(
+            "thread-1",
+            attempt_id = prepared["attemptId"],
+            command_message_id = prepared["commandMessageId"],
+            claim_id = claim_b,
+        )
+    _record_output(prepared, "one summary")
+    studio_db.upsert_chat_message(_message("summary-a", "compact-1", "assistant", "one summary"))
+    committed = manual_compaction.commit_manual_compaction(
+        "thread-1",
+        attempt_id = prepared["attemptId"],
+        command_message_id = prepared["commandMessageId"],
+        summary_message_id = "summary-a",
+        expected_head_message_id = "summary-a",
+        expected_revision = prepared["revision"],
+        expected_summary_hash = manual_compaction.summary_hash("one summary"),
+    )
+    assert committed["state"] == "active"
+    assert _client_record()["state"] == "summary_saved"
+    conn = studio_db.get_connection()
+    try:
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM manual_compactions WHERE thread_id = ?",
+                ("thread-1",),
+            ).fetchone()["count"]
+            == 1
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM chat_messages WHERE thread_id = ? AND parent_id = ?",
+                ("thread-1", "compact-1"),
+            ).fetchone()["count"]
+            == 1
+        )
+    finally:
+        conn.close()
+
+
+def test_late_initial_bind_cannot_downgrade_prepared_or_summary_saved(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-a",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-a",
+        attempt_sequence = 1,
+    )
+    prepared = _prepare_core(
+        "thread-1",
+        attempt_id = "attempt-a",
+        command_message_id = "compact-1",
+        expected_head_message_id = "compact-1",
+        message_ids = ["u1", "a1", "compact-1"],
+        request_messages = ChatCompletionRequest(
+            model = "model", messages = _full_wire_messages()
+        ).messages,
+    )
+    authoritative_prepared = json.loads(json.dumps(_client_record()))
+    assert authoritative_prepared["state"] == "prepared"
+    assert "claimId" not in authoritative_prepared["envelope"]
+
+    for state in ("prepared", "summary_saved"):
+        with pytest.raises(manual_compaction.ManualCompactionConflict):
+            manual_compaction.bind_manual_compaction_command(
+                "thread-1",
+                attempt_id = "attempt-late",
+                command_message_id = "compact-1",
+                summary_message_id = "summary-late",
+                attempt_sequence = 1,
+            )
+        assert _client_record()["state"] == state
+        if state == "prepared":
+            _claim(prepared, claim_id = "a" * 64)
+            _record_output(prepared, "durable summary")
+            studio_db.upsert_chat_message(
+                _message("summary-a", "compact-1", "assistant", "durable summary")
+            )
+            manual_compaction.commit_manual_compaction(
+                "thread-1",
+                attempt_id = prepared["attemptId"],
+                command_message_id = prepared["commandMessageId"],
+                summary_message_id = "summary-a",
+                expected_head_message_id = "summary-a",
+                expected_revision = prepared["revision"],
+                expected_summary_hash = manual_compaction.summary_hash("durable summary"),
+            )
+    saved = _client_record()
+    assert saved["attemptId"] == "attempt-a"
+    assert saved["summaryMessageId"] == "summary-a"
+    assert saved["summaryHash"] == manual_compaction.summary_hash("durable summary")
+
+
+def test_request_drift_cannot_replace_or_cancel_the_prepared_winner(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    command_before = json.loads(json.dumps(_client_record()))
+    drifted = _full_wire_messages()
+    drifted[1] = {"role": "user", "content": "Different request"}
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "exact stored"):
+        _prepare(drifted)
+    assert _client_record() == command_before
+    assert manual_compaction.get_manual_compaction_attempt("attempt-1")["state"] == "pending"
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "not owned"):
+        manual_compaction.cancel_manual_compaction(
+            "thread-1",
+            attempt_id = "attempt-1",
+            command_message_id = "compact-1",
+            claim_id = "b" * 64,
+        )
+    assert manual_compaction.get_manual_compaction_attempt("attempt-1")["state"] == "pending"
+
+
+def test_claim_secret_owns_cancel_replay_and_never_crosses_the_request_boundary(
+    tmp_path, monkeypatch
+):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    claim_id = "c" * 64
+    request = _claim(prepared, claim_id = claim_id)
+    assert request.manual_compaction is None
+    conn = studio_db.get_connection()
+    try:
+        raw = dict(
+            conn.execute(
+                "SELECT * FROM manual_compactions WHERE attempt_id = ?",
+                (prepared["attemptId"],),
+            ).fetchone()
+        )
+    finally:
+        conn.close()
+    assert raw["claim_token_hash"] == hashlib.sha256(claim_id.encode("ascii")).hexdigest()
+    assert claim_id not in json.dumps(raw, sort_keys = True)
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "not owned"):
+        manual_compaction.cancel_manual_compaction(
+            "thread-1",
+            attempt_id = prepared["attemptId"],
+            command_message_id = prepared["commandMessageId"],
+            claim_id = "d" * 64,
+        )
+    cancelled = manual_compaction.cancel_manual_compaction(
+        "thread-1",
+        attempt_id = prepared["attemptId"],
+        command_message_id = prepared["commandMessageId"],
+        claim_id = claim_id,
+    )
+    replayed = manual_compaction.cancel_manual_compaction(
+        "thread-1",
+        attempt_id = prepared["attemptId"],
+        command_message_id = prepared["commandMessageId"],
+        claim_id = claim_id,
+    )
+    assert cancelled["state"] == replayed["state"] == "cancelled"
+    assert claim_id not in json.dumps(cancelled, sort_keys = True)
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "not owned"):
+        manual_compaction.cancel_manual_compaction(
+            "thread-1",
+            attempt_id = prepared["attemptId"],
+            command_message_id = prepared["commandMessageId"],
+            claim_id = "d" * 64,
+        )
+
+
+def test_two_concurrent_claims_have_one_owner_and_only_that_owner_can_cancel(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    claims = ("e" * 64, "f" * 64)
+
+    def claim(claim_id):
+        try:
+            return claim_id, _claim(prepared, claim_id = claim_id)
+        except manual_compaction.ManualCompactionConflict as exc:
+            return claim_id, exc
+
+    with ThreadPoolExecutor(max_workers = 2) as pool:
+        results = list(pool.map(claim, claims))
+    winners = [result for result in results if not isinstance(result[1], Exception)]
+    losers = [result for result in results if isinstance(result[1], Exception)]
+    assert len(winners) == len(losers) == 1
+    winner_claim = winners[0][0]
+    loser_claim = losers[0][0]
+    assert "already running" in str(losers[0][1])
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "not owned"):
+        manual_compaction.cancel_manual_compaction(
+            "thread-1",
+            attempt_id = prepared["attemptId"],
+            command_message_id = prepared["commandMessageId"],
+            claim_id = loser_claim,
+        )
+    cancelled = manual_compaction.cancel_manual_compaction(
+        "thread-1",
+        attempt_id = prepared["attemptId"],
+        command_message_id = prepared["commandMessageId"],
+        claim_id = winner_claim,
+    )
+    assert cancelled["state"] == "cancelled"
+
+
+def test_process_restart_terminalizes_owned_running_attempt_without_plaintext(
+    tmp_path, monkeypatch
+):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    claim_id = "9" * 64
+    _claim(prepared, claim_id = claim_id)
+
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    recovered = manual_compaction.get_manual_compaction_attempt(prepared["attemptId"])
+
+    assert recovered["state"] == "failed"
+    assert recovered["terminalReason"] == "inference_failed"
+    assert claim_id not in json.dumps(recovered, sort_keys = True)
+    replayed = manual_compaction.cancel_manual_compaction(
+        "thread-1",
+        attempt_id = prepared["attemptId"],
+        command_message_id = prepared["commandMessageId"],
+        claim_id = claim_id,
+    )
+    assert replayed["state"] == "failed"
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "not owned"):
+        manual_compaction.cancel_manual_compaction(
+            "thread-1",
+            attempt_id = prepared["attemptId"],
+            command_message_id = prepared["commandMessageId"],
+            claim_id = "8" * 64,
+        )
+
+
+def test_ordinary_message_writes_cannot_bypass_client_fence(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-1",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-1",
+        attempt_sequence = 1,
+    )
+    command = studio_db.get_chat_message("thread-1", "compact-1")
+    record = command["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]
+    reordered = {key: record[key] for key in reversed(list(record))}
+    command["metadata"] = {manual_compaction.MANUAL_COMPACTION_CLIENT_KEY: reordered}
+    saved = studio_db.upsert_chat_message(command)
+    assert saved["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY] == record
+
+    unrelated = json.loads(json.dumps(saved))
+    unrelated["metadata"]["unrelated"] = {"value": 1}
+    before = _raw_message_row("compact-1")
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "checkpoint"):
+        studio_db.upsert_chat_message(unrelated)
+    assert _raw_message_row("compact-1") == before
+
+    changed = json.loads(json.dumps(saved))
+    changed["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]["attemptId"] = "forged"
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "fenced transition"):
+        studio_db.upsert_chat_message(changed)
+    removed = json.loads(json.dumps(saved))
+    removed["metadata"].pop(manual_compaction.MANUAL_COMPACTION_CLIENT_KEY)
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "fenced transition"):
+        studio_db.upsert_chat_message(removed)
+
+    studio_db.upsert_chat_message(_message("compact-2", "a1", "user", "/compact"))
+    introduced = studio_db.get_chat_message("thread-1", "compact-2")
+    introduced["metadata"] = {
+        manual_compaction.MANUAL_COMPACTION_CLIENT_KEY: record,
+    }
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "fenced transition"):
+        studio_db.upsert_chat_message(introduced)
+
+    stale_batch = studio_db.list_chat_messages("thread-1")
+    for message in stale_batch:
+        if message["id"] == "compact-1":
+            message["metadata"].pop(manual_compaction.MANUAL_COMPACTION_CLIENT_KEY)
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "fenced transition"):
+        studio_db.sync_chat_messages("thread-1", stale_batch)
+    without_command = [
+        message
+        for message in studio_db.list_chat_messages("thread-1")
+        if message["id"] != "compact-1"
+    ]
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "cannot be pruned"):
+        studio_db.sync_chat_messages("thread-1", without_command, prune_missing = True)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["parent", "role", "content", "content-parts", "attachments", "metadata", "created-at"],
+)
+def test_live_command_fence_rejects_every_persisted_row_mutation_without_writes(
+    tmp_path, monkeypatch, mutation
+):
+    _seed_branch(tmp_path, monkeypatch)
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-1",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-1",
+        attempt_sequence = 1,
+    )
+    changed = json.loads(json.dumps(studio_db.get_chat_message("thread-1", "compact-1")))
+    if mutation == "parent":
+        changed["parentId"] = "u1"
+    elif mutation == "role":
+        changed["role"] = "assistant"
+    elif mutation == "content":
+        changed["content"][0]["text"] = "/compact stale"
+    elif mutation == "content-parts":
+        changed["content"].append({"type": "text", "text": "stale"})
+    elif mutation == "attachments":
+        changed["attachments"] = [{"id": "attachment-1", "name": "stale.txt"}]
+    elif mutation == "metadata":
+        changed["metadata"]["stale"] = True
+    else:
+        changed["createdAt"] += 1
+
+    before = _raw_message_row("compact-1")
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "checkpoint"):
+        studio_db.upsert_chat_message(changed)
+    assert _raw_message_row("compact-1") == before
+
+
+@pytest.mark.parametrize(
+    ("message_id", "mutation"),
+    [("u1", "content"), ("u1", "metadata"), ("a1", "parent"), ("a1", "created-at")],
+)
+def test_prepared_fence_protects_complete_source_ancestry_without_writes(
+    tmp_path, monkeypatch, message_id, mutation
+):
+    _seed_branch(tmp_path, monkeypatch)
+    _prepare()
+    changed = json.loads(json.dumps(studio_db.get_chat_message("thread-1", message_id)))
+    if mutation == "content":
+        changed["content"][0]["text"] = "stale"
+    elif mutation == "metadata":
+        changed["metadata"] = {"stale": True}
+    elif mutation == "parent":
+        changed["parentId"] = None
+    else:
+        changed["createdAt"] += 1
+
+    before = _raw_message_row(message_id)
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "checkpoint"):
+        studio_db.upsert_chat_message(changed)
+    assert _raw_message_row(message_id) == before
+
+
+def test_live_fence_rejects_source_relink_and_prune_atomically(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    _prepare()
+    before = {message_id: _raw_message_row(message_id) for message_id in ("u1", "a1", "compact-1")}
+
+    relinked = studio_db.list_chat_messages("thread-1")
+    next(message for message in relinked if message["id"] == "a1")["parentId"] = None
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "checkpoint"):
+        studio_db.sync_chat_messages("thread-1", relinked, prune_missing = True)
+    assert {message_id: _raw_message_row(message_id) for message_id in before} == before
+
+    pruned = [
+        message for message in studio_db.list_chat_messages("thread-1") if message["id"] != "u1"
+    ]
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "cannot be pruned"):
+        studio_db.sync_chat_messages("thread-1", pruned, prune_missing = True)
+    assert {message_id: _raw_message_row(message_id) for message_id in before} == before
+
+
+def test_bound_fence_blocks_attachment_and_content_blob_deletion(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    user = studio_db.get_chat_message("thread-1", "u1")
+    user["attachments"] = [{"id": "attachment-u1", "name": "notes.txt"}]
+    studio_db.upsert_chat_message(user)
+    command = studio_db.get_chat_message("thread-1", "compact-1")
+    command["attachments"] = [{"id": "attachment-command", "name": "command.txt"}]
+    studio_db.upsert_chat_message(command)
+    assistant = studio_db.get_chat_message("thread-1", "a1")
+    image_part = {"type": "image", "image": "data:image/png;base64,YQ=="}
+    assistant["content"].append(image_part)
+    studio_db.upsert_chat_message(assistant)
+    content_part_id = studio_db._content_part_id(image_part)
+    assert content_part_id is not None
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-1",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-1",
+        attempt_sequence = 1,
+    )
+
+    for message_id, attachment_id in (
+        ("u1", "attachment-u1"),
+        ("compact-1", "attachment-command"),
+        ("a1", content_part_id),
+    ):
+        before = _raw_message_row(message_id)
+        with pytest.raises(studio_db.ChatMessageProtectedError, match = "cannot be edited"):
+            studio_db.delete_chat_attachment(message_id, attachment_id)
+        assert _raw_message_row(message_id) == before
+
+
+def test_claim_rechecks_server_derived_prepared_command_hash(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    command = studio_db.get_chat_message("thread-1", "compact-1")
+    command["metadata"]["raw-drift"] = True
+    _set_raw_message_json(
+        "compact-1",
+        "metadata_json",
+        json.dumps(command["metadata"], separators = (",", ":")),
+    )
+
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "changed after prepare"):
+        _claim(prepared)
+    raw_attempt_row = None
+    conn = studio_db.get_connection()
+    try:
+        raw_attempt_row = dict(
+            conn.execute(
+                "SELECT state, claim_token_hash FROM manual_compactions WHERE attempt_id = ?",
+                (prepared["attemptId"],),
+            ).fetchone()
+        )
+    finally:
+        conn.close()
+    assert raw_attempt_row == {"state": "pending", "claim_token_hash": None}
+
+
+def test_commit_rechecks_server_derived_prepared_command_hash(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    _claim(prepared)
+    _record_output(prepared, "summary")
+    studio_db.upsert_chat_message(_message("summary-1", "compact-1", "assistant", "summary"))
+    conn = studio_db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE chat_messages SET created_at = created_at + 1 WHERE id = ?",
+            ("compact-1",),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    before = _raw_message_row("compact-1")
+
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "changed after prepare"):
+        manual_compaction.commit_manual_compaction(
+            "thread-1",
+            attempt_id = prepared["attemptId"],
+            command_message_id = prepared["commandMessageId"],
+            summary_message_id = "summary-1",
+            expected_head_message_id = "summary-1",
+            expected_revision = prepared["revision"],
+            expected_summary_hash = manual_compaction.summary_hash("summary"),
+        )
+    assert _raw_message_row("compact-1") == before
+    assert (
+        manual_compaction.get_manual_compaction_attempt(prepared["attemptId"])["state"] == "running"
+    )
+
+
+def test_prepared_command_digest_cannot_be_replayed_as_summary_saved(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    _claim(prepared)
+    _record_output(prepared, "summary")
+    studio_db.upsert_chat_message(_message("summary-1", "compact-1", "assistant", "summary"))
+    summary_hash = manual_compaction.summary_hash("summary")
+    command = studio_db.get_chat_message("thread-1", "compact-1")
+    client = command["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]
+    client = {
+        **client,
+        "state": "summary_saved",
+        "summaryHash": summary_hash,
+    }
+    command["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY] = client
+    prepared_hash = prepared["commandHash"]
+    assert prepared_hash != studio_db.canonical_chat_message_hash(command, state = "summary_saved")
+    conn = studio_db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE chat_messages SET metadata_json = ? WHERE id = ?",
+            (json.dumps(command["metadata"], separators = (",", ":")), "compact-1"),
+        )
+        conn.execute(
+            "UPDATE manual_compactions SET state = 'active', summary_message_id = ?, "
+            "summary_hash = ?, command_hash_state = 'summary_saved', lease_expires_at = NULL, "
+            "claim_token_hash = NULL, committed_at = ? WHERE attempt_id = ?",
+            ("summary-1", summary_hash, 20, prepared["attemptId"]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    before = _raw_message_row("compact-1")
+
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "changed after prepare"):
+        manual_compaction.commit_manual_compaction(
+            "thread-1",
+            attempt_id = prepared["attemptId"],
+            command_message_id = prepared["commandMessageId"],
+            summary_message_id = "summary-1",
+            expected_head_message_id = "summary-1",
+            expected_revision = prepared["revision"],
+            expected_summary_hash = summary_hash,
+        )
+    assert _raw_message_row("compact-1") == before
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("threadId",),
+        ("commandMessageId",),
+        ("attemptId",),
+        ("summaryMessageId",),
+        ("expectedHeadMessageId",),
+        ("sourceHeadMessageId",),
+        ("envelope", "attemptId"),
+        ("envelope", "threadId"),
+        ("envelope", "commandMessageId"),
+        ("envelope", "expectedHeadMessageId"),
+    ],
+    ids = lambda path: "-".join(path),
+)
+def test_route_maps_every_invalid_stored_client_id_to_409_without_mutation(
+    tmp_path, monkeypatch, path
+):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    command = studio_db.get_chat_message("thread-1", "compact-1")
+    client = command["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]
+    target = client
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = "x" * 129
+    _set_raw_message_json(
+        "compact-1",
+        "metadata_json",
+        json.dumps(command["metadata"], separators = (",", ":")),
+    )
+    before = _raw_message_row("compact-1")
+
+    with pytest.raises(HTTPException) as exc_info:
+        chat_history.bind_thread_manual_compaction(
+            "thread-1",
+            chat_history.ManualCompactionBindRequest(
+                attemptId = prepared["attemptId"],
+                commandMessageId = prepared["commandMessageId"],
+                summaryMessageId = "summary-1",
+                attemptSequence = 1,
+            ),
+            current_subject = "test-user",
+        )
+
+    assert exc_info.value.status_code == 409
+    assert "Stored manual compaction" in str(exc_info.value.detail)
+    assert _raw_message_row("compact-1") == before
+
+
+def test_authenticated_asgi_bind_maps_corrupt_stored_id_to_409_without_mutation(
+    tmp_path, monkeypatch
+):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    command = studio_db.get_chat_message("thread-1", "compact-1")
+    command["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]["envelope"]["threadId"] = (
+        "x" * 129
+    )
+    _set_raw_message_json(
+        "compact-1",
+        "metadata_json",
+        json.dumps(command["metadata"], separators = (",", ":")),
+    )
+    before = _raw_message_row("compact-1")
+    app = FastAPI()
+    app.include_router(chat_history.router, prefix = "/api/chat")
+    app.dependency_overrides[chat_history.get_current_subject] = lambda: "test-user"
+
+    response = TestClient(app, raise_server_exceptions = False).post(
+        "/api/chat/threads/thread-1/compactions:bind",
+        headers = {"Authorization": "Bearer authenticated-test-session"},
+        json = {
+            "attemptId": prepared["attemptId"],
+            "commandMessageId": prepared["commandMessageId"],
+            "summaryMessageId": "summary-1",
+            "attemptSequence": 1,
+        },
+    )
+
+    assert response.status_code == 409
+    assert "Stored manual compaction" in response.json()["detail"]
+    assert _raw_message_row("compact-1") == before
+
+
+@pytest.mark.parametrize("operation", ["bind", "prepare", "commit", "cancel"])
+def test_mounted_manual_compaction_routes_require_auth_and_reject_corrupt_fence_without_mutation(
+    tmp_path, monkeypatch, operation
+):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    claim_id = "a" * 64
+    summary_text = "summary"
+    if operation in ("commit", "cancel"):
+        _claim(prepared, claim_id = claim_id)
+    if operation == "commit":
+        _record_output(prepared, summary_text)
+        studio_db.upsert_chat_message(_message("summary-1", "compact-1", "assistant", summary_text))
+
+    command = studio_db.get_chat_message("thread-1", "compact-1")
+    command["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]["envelope"]["threadId"] = (
+        "x" * 129
+    )
+    _set_raw_message_json(
+        "compact-1",
+        "metadata_json",
+        json.dumps(command["metadata"], separators = (",", ":")),
+    )
+    command_before = _raw_message_row("compact-1")
+    attempt_before = _raw_attempt_row(prepared["attemptId"])
+    reservation_before = _raw_reservation_row(prepared["attemptId"])
+    summary_before = _raw_message_row("summary-1")
+
+    requests = {
+        "bind": {
+            "attemptId": prepared["attemptId"],
+            "commandMessageId": prepared["commandMessageId"],
+            "summaryMessageId": "summary-1",
+            "attemptSequence": 1,
+        },
+        "prepare": {
+            "attemptId": prepared["attemptId"],
+            "commandMessageId": prepared["commandMessageId"],
+            "expectedHeadMessageId": prepared["expectedHeadMessageId"],
+            "messageIds": ["u1", "a1", "compact-1"],
+            "messages": _full_wire_messages(),
+        },
+        "commit": {
+            "attemptId": prepared["attemptId"],
+            "commandMessageId": prepared["commandMessageId"],
+            "summaryMessageId": "summary-1",
+            "expectedHeadMessageId": "summary-1",
+            "expectedRevision": prepared["revision"],
+            "summaryHash": manual_compaction.summary_hash(summary_text),
+        },
+        "cancel": {
+            "attemptId": prepared["attemptId"],
+            "commandMessageId": prepared["commandMessageId"],
+            "claimId": claim_id,
+        },
+    }
+    app = FastAPI()
+    app.include_router(chat_history.router, prefix = "/api/chat")
+    client = TestClient(app, raise_server_exceptions = False)
+    path = f"/api/chat/threads/thread-1/compactions:{operation}"
+
+    unauthenticated = client.post(path, json = requests[operation])
+    assert unauthenticated.status_code in (401, 403)
+    assert _raw_message_row("compact-1") == command_before
+    assert _raw_attempt_row(prepared["attemptId"]) == attempt_before
+    assert _raw_reservation_row(prepared["attemptId"]) == reservation_before
+    assert _raw_message_row("summary-1") == summary_before
+
+    app.dependency_overrides[chat_history.get_current_subject] = lambda: "test-user"
+    authenticated = client.post(
+        path,
+        headers = {"Authorization": "Bearer authenticated-test-session"},
+        json = requests[operation],
+    )
+    assert authenticated.status_code == 409
+    assert "Stored manual compaction" in authenticated.json()["detail"]
+    assert _raw_message_row("compact-1") == command_before
+    assert _raw_attempt_row(prepared["attemptId"]) == attempt_before
+    assert _raw_reservation_row(prepared["attemptId"]) == reservation_before
+    assert _raw_message_row("summary-1") == summary_before
+
+
+def test_malformed_legacy_client_metadata_fails_closed_but_preserves_exact_fence(
+    tmp_path, monkeypatch
+):
+    _seed_branch(tmp_path, monkeypatch)
+    malformed = {"schemaVersion": 1}
+    conn = studio_db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE chat_messages SET metadata_json = ? WHERE thread_id = ? AND id = ?",
+            (
+                json.dumps(
+                    {manual_compaction.MANUAL_COMPACTION_CLIENT_KEY: malformed},
+                    separators = (",", ":"),
+                ),
+                "thread-1",
+                "compact-1",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "invalid"):
+        manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = "attempt-1",
+            command_message_id = "compact-1",
+            summary_message_id = "summary-1",
+            attempt_sequence = 1,
+        )
+    command = studio_db.get_chat_message("thread-1", "compact-1")
+    command["metadata"]["unrelated"] = True
+    before = _raw_message_row("compact-1")
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "metadata is corrupt"):
+        studio_db.upsert_chat_message(command)
+    assert _raw_message_row("compact-1") == before
+    command["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY] = {"schemaVersion": 2}
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "metadata is corrupt"):
+        studio_db.upsert_chat_message(command)
+
+
+def test_terminal_replacement_requires_exact_sequence_and_blocks_late_owner(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    _claim(prepared, claim_id = "4" * 64)
+    manual_compaction.cancel_manual_compaction(
+        "thread-1",
+        attempt_id = prepared["attemptId"],
+        command_message_id = prepared["commandMessageId"],
+        claim_id = "4" * 64,
+    )
+    replacement_message = manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-2",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-1",
+        attempt_sequence = 2,
+        expected_attempt_id = "attempt-1",
+        expected_attempt_sequence = 1,
+    )
+    replacement = replacement_message["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]
+    assert replacement["state"] == "bound"
+    assert replacement["attemptSequence"] == 2
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "CAS is stale"):
+        manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = "attempt-1",
+            command_message_id = "compact-1",
+            summary_message_id = "summary-1",
+            attempt_sequence = 1,
+        )
+    second = _prepare_core(
+        "thread-1",
+        attempt_id = "attempt-2",
+        command_message_id = "compact-1",
+        expected_head_message_id = "compact-1",
+        message_ids = ["u1", "a1", "compact-1"],
+        request_messages = ChatCompletionRequest(
+            model = "model", messages = _full_wire_messages()
+        ).messages,
+    )
+    assert second["state"] == "pending"
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "binding is stale"):
+        manual_compaction.cancel_manual_compaction(
+            "thread-1",
+            attempt_id = "attempt-1",
+            command_message_id = "compact-1",
+            claim_id = "4" * 64,
+        )
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "live /compact"):
+        manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = "attempt-3",
+            command_message_id = "compact-1",
+            summary_message_id = "summary-1",
+            attempt_sequence = 3,
+            expected_attempt_id = "attempt-2",
+            expected_attempt_sequence = 2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("stored_parent", "stale_parent"),
+    [(None, ""), ("", None)],
+    ids = ["null-to-empty", "empty-to-null"],
+)
+def test_fenced_root_parent_representation_is_exact_for_upsert_sync_and_digest(
+    tmp_path, monkeypatch, stored_parent, stale_parent
+):
+    rows = _seed_branch(tmp_path, monkeypatch)
+    if stored_parent == "":
+        _set_raw_parent("u1", "")
+    prepared = _prepare()
+    before = _raw_message_row("u1")
+    stale = studio_db.get_chat_message("thread-1", "u1")
+    stale["parentId"] = stale_parent
+
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "checkpoint"):
+        studio_db.upsert_chat_message(stale)
+    assert _raw_message_row("u1") == before
+
+    snapshot = [studio_db.get_chat_message("thread-1", row["id"]) for row in rows]
+    snapshot[0]["parentId"] = stale_parent
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "checkpoint"):
+        studio_db.sync_chat_messages("thread-1", snapshot)
+    assert _raw_message_row("u1") == before
+
+    stored_root = studio_db.get_chat_message("thread-1", "u1")
+    stale_root = {**stored_root, "parentId": stale_parent}
+    assert studio_db.canonical_chat_message_hash(
+        stored_root, state = "prepared"
+    ) != studio_db.canonical_chat_message_hash(stale_root, state = "prepared")
+
+    _claim(prepared)
+    assert (
+        manual_compaction.get_manual_compaction_attempt(prepared["attemptId"])["state"] == "running"
+    )
+
+
+@pytest.mark.parametrize("corruption", ["missing", "cycle", "cross-thread"])
+def test_initial_bind_requires_complete_acyclic_same_thread_ancestry(
+    tmp_path, monkeypatch, corruption
+):
+    _seed_branch(tmp_path, monkeypatch)
+    if corruption == "cross-thread":
+        studio_db.upsert_chat_thread(_thread("thread-2"))
+        studio_db.upsert_chat_message(
+            _message("foreign-parent", None, "user", "Foreign", thread_id = "thread-2")
+        )
+        invalid_parent = "foreign-parent"
+    else:
+        invalid_parent = "missing-parent" if corruption == "missing" else "compact-1"
+    _set_raw_parent("a1", invalid_parent)
+    before = _raw_message_row("compact-1")
+
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "ancestry"):
+        manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = "attempt-invalid",
+            command_message_id = "compact-1",
+            summary_message_id = "summary-invalid",
+            attempt_sequence = 1,
+        )
+
+    assert _raw_message_row("compact-1") == before
+    conn = studio_db.get_connection()
+    try:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM manual_compaction_attempt_reservations WHERE attempt_id = ?",
+                ("attempt-invalid",),
+            ).fetchone()
+            is None
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("corruption", ["missing", "cycle", "cross-thread"])
+def test_terminal_replacement_requires_complete_original_ancestry(
+    tmp_path, monkeypatch, corruption
+):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    _claim(prepared, claim_id = "5" * 64)
+    manual_compaction.cancel_manual_compaction(
+        "thread-1",
+        attempt_id = prepared["attemptId"],
+        command_message_id = prepared["commandMessageId"],
+        claim_id = "5" * 64,
+    )
+    if corruption == "cross-thread":
+        studio_db.upsert_chat_thread(_thread("thread-2"))
+        studio_db.upsert_chat_message(
+            _message("foreign-parent", None, "user", "Foreign", thread_id = "thread-2")
+        )
+        invalid_parent = "foreign-parent"
+    else:
+        invalid_parent = "missing-parent" if corruption == "missing" else "compact-1"
+    _set_raw_parent("a1", invalid_parent)
+    command_before = _raw_message_row("compact-1")
+
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "ancestry"):
+        manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = "attempt-replacement",
+            command_message_id = "compact-1",
+            summary_message_id = "summary-replacement",
+            attempt_sequence = 2,
+            expected_attempt_id = prepared["attemptId"],
+            expected_attempt_sequence = 1,
+        )
+
+    assert _raw_message_row("compact-1") == command_before
+    assert _client_record()["attemptId"] == prepared["attemptId"]
+
+
+def test_terminal_fence_blocks_full_row_edits_prune_relink_and_attachment_delete(
+    tmp_path, monkeypatch
+):
+    rows = _seed_branch(tmp_path, monkeypatch)
+    root = studio_db.get_chat_message("thread-1", "u1")
+    root["attachments"] = [{"id": "file-1", "name": "notes.txt"}]
+    studio_db.upsert_chat_message(root)
+    prepared = _prepare()
+    _claim(prepared, claim_id = "6" * 64)
+    manual_compaction.cancel_manual_compaction(
+        "thread-1",
+        attempt_id = prepared["attemptId"],
+        command_message_id = prepared["commandMessageId"],
+        claim_id = "6" * 64,
+    )
+    command_before = _raw_message_row("compact-1")
+    source_before = _raw_message_row("u1")
+
+    command = studio_db.get_chat_message("thread-1", "compact-1")
+    command.update(
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "changed"}],
+            "attachments": [{"id": "file-2"}],
+            "createdAt": 99,
+        }
+    )
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "checkpoint"):
+        studio_db.upsert_chat_message(command)
+    assert _raw_message_row("compact-1") == command_before
+
+    snapshot = [studio_db.get_chat_message("thread-1", row["id"]) for row in rows]
+    snapshot[1]["parentId"] = None
+    with pytest.raises(studio_db.ChatMessageProtectedError, match = "checkpoint"):
+        studio_db.sync_chat_messages("thread-1", snapshot[1:], prune_missing = True)
+    assert _raw_message_row("u1") == source_before
+    assert _raw_message_row("compact-1") == command_before
+
+    with pytest.raises(studio_db.ChatMessageProtectedError):
+        studio_db.delete_chat_attachment("u1", "file-1")
+    assert _raw_message_row("u1") == source_before
+
+
+@pytest.mark.parametrize("same_thread", [False, True], ids = ["cross-thread", "same-thread"])
+@pytest.mark.parametrize("winner_is_second", [False, True], ids = ["first-wins", "second-wins"])
+def test_attempt_reservation_collision_has_one_winner_and_loser_can_recover(
+    tmp_path, monkeypatch, same_thread, winner_is_second
+):
+    _seed_branch(tmp_path, monkeypatch)
+    if same_thread:
+        second_thread = "thread-1"
+        second_parent = "a1"
+    else:
+        second_thread = "thread-2"
+        studio_db.upsert_chat_thread(_thread(second_thread))
+        studio_db.upsert_chat_message(
+            _message("u2", None, "user", "Other branch", thread_id = second_thread)
+        )
+        studio_db.upsert_chat_message(
+            _message("a2", "u2", "assistant", "Other answer", thread_id = second_thread)
+        )
+        second_parent = "a2"
+    studio_db.upsert_chat_message(
+        _message(
+            "compact-2",
+            second_parent,
+            "user",
+            "/compact",
+            thread_id = second_thread,
+        )
+    )
+
+    def bind(
+        thread_id,
+        command_id,
+        summary_id,
+        attempt_id = "shared-attempt",
+    ):
+        return manual_compaction.bind_manual_compaction_command(
+            thread_id,
+            attempt_id = attempt_id,
+            command_message_id = command_id,
+            summary_message_id = summary_id,
+            attempt_sequence = 1,
+        )
+
+    first = lambda: bind("thread-1", "compact-1", "summary-1")
+    second = lambda: bind(second_thread, "compact-2", "summary-2")
+    winner = second if winner_is_second else first
+    loser = first if winner_is_second else second
+    winner_identity = (
+        (second_thread, "compact-2", "summary-2")
+        if winner_is_second
+        else ("thread-1", "compact-1", "summary-1")
+    )
+    loser_identity = (
+        ("thread-1", "compact-1", "summary-1")
+        if winner_is_second
+        else (second_thread, "compact-2", "summary-2")
+    )
+    results = _run_in_writer_order(
+        monkeypatch,
+        "reservation-winner",
+        winner,
+        "reservation-loser",
+        loser,
+    )
+    assert isinstance(results["reservation-winner"], dict)
+    assert isinstance(results["reservation-loser"], manual_compaction.ManualCompactionConflict)
+    assert _client_record(winner_identity[0], winner_identity[1])["attemptId"] == "shared-attempt"
+    assert _client_record(loser_identity[0], loser_identity[1]) is None
+
+    recovered = bind(*loser_identity, "recovered-attempt")
+    assert recovered["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]["attemptId"] == (
+        "recovered-attempt"
+    )
+    conn = studio_db.get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT attempt_id, thread_id, command_message_id FROM "
+            "manual_compaction_attempt_reservations ORDER BY attempt_id"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == sorted(
+            [
+                ("recovered-attempt", loser_identity[0], loser_identity[1]),
+                ("shared-attempt", winner_identity[0], winner_identity[1]),
+            ]
+        )
+    finally:
+        conn.close()
+
+
+def test_reservation_restart_backfill_and_cross_command_summary_fence(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-1",
+        command_message_id = "compact-1",
+        summary_message_id = "shared-summary",
+        attempt_sequence = 1,
+    )
+    conn = studio_db.get_connection()
+    try:
+        conn.execute(
+            "DELETE FROM manual_compaction_attempt_reservations WHERE attempt_id = 'attempt-1'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    assert studio_db.get_chat_message("thread-1", "compact-1") is not None
+    conn = studio_db.get_connection()
+    try:
+        restored = conn.execute(
+            "SELECT thread_id, command_message_id, summary_message_id, attempt_sequence "
+            "FROM manual_compaction_attempt_reservations WHERE attempt_id = 'attempt-1'"
+        ).fetchone()
+        assert tuple(restored) == ("thread-1", "compact-1", "shared-summary", 1)
+    finally:
+        conn.close()
+
+    studio_db.upsert_chat_message(_message("compact-2", "a1", "user", "/compact"))
+    before = _raw_message_row("compact-2")
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "Summary message id"):
+        manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = "attempt-2",
+            command_message_id = "compact-2",
+            summary_message_id = "shared-summary",
+            attempt_sequence = 1,
+        )
+    assert _raw_message_row("compact-2") == before
+
+
+@pytest.mark.parametrize("deletion", ["thread", "project", "history"])
+def test_attempt_reservation_survives_every_history_deletion_and_blocks_late_callbacks(
+    tmp_path, monkeypatch, deletion
+):
+    _seed_branch(tmp_path, monkeypatch)
+    if deletion == "project":
+        studio_db.upsert_chat_project(
+            {
+                "id": "project-1",
+                "name": "Project",
+                "instructions": "",
+                "archived": False,
+                "createdAt": 1,
+                "updatedAt": 1,
+            }
+        )
+        studio_db.update_chat_thread("thread-1", {"projectId": "project-1"})
+    prepared = _prepare()
+    _claim(prepared, claim_id = "7" * 64)
+
+    if deletion == "thread":
+        studio_db.delete_chat_threads(["thread-1"])
+    elif deletion == "project":
+        studio_db.delete_chat_project("project-1")
+    else:
+        studio_db.clear_chat_history()
+
+    assert manual_compaction.get_manual_compaction_attempt(prepared["attemptId"]) is None
+    conn = studio_db.get_connection()
+    try:
+        reservation = conn.execute(
+            "SELECT thread_id, command_message_id, retired_at "
+            "FROM manual_compaction_attempt_reservations WHERE attempt_id = ?",
+            (prepared["attemptId"],),
+        ).fetchone()
+        assert reservation is not None
+        assert tuple(reservation[:2]) == ("thread-1", "compact-1")
+        assert reservation["retired_at"] > 0
+    finally:
+        conn.close()
+
+    studio_db.upsert_chat_thread(_thread("thread-2"))
+    for message in [
+        _message("u2", None, "user", "Explain the migration.", thread_id = "thread-2"),
+        _message(
+            "a2",
+            "u2",
+            "assistant",
+            "Use a staged rollout.",
+            thread_id = "thread-2",
+        ),
+        _message("compact-2", "a2", "user", "/compact", thread_id = "thread-2"),
+    ]:
+        studio_db.upsert_chat_message(message)
+    command_before = _raw_message_row("compact-2")
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "permanently retired"):
+        manual_compaction.bind_manual_compaction_command(
+            "thread-2",
+            attempt_id = prepared["attemptId"],
+            command_message_id = "compact-2",
+            summary_message_id = "summary-2",
+            attempt_sequence = 1,
+        )
+    assert _raw_message_row("compact-2") == command_before
+    assert (
+        manual_compaction.fail_manual_compaction_attempt(prepared["attemptId"], "provider_failed")
+        is None
+    )
+    with pytest.raises(manual_compaction.ManualCompactionNotFound):
+        manual_compaction.record_manual_compaction_output(
+            prepared["attemptId"], text = "late output", finish_reason = "stop"
+        )
+
+    recovered = manual_compaction.bind_manual_compaction_command(
+        "thread-2",
+        attempt_id = f"fresh-{deletion}",
+        command_message_id = "compact-2",
+        summary_message_id = "summary-2",
+        attempt_sequence = 1,
+    )
+    assert recovered["metadata"][manual_compaction.MANUAL_COMPACTION_CLIENT_KEY]["attemptId"] == (
+        f"fresh-{deletion}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_real_nonstream_callback_after_deletion_cannot_restore_retired_attempt(
+    tmp_path, monkeypatch
+):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    _claim(prepared, claim_id = "8" * 64)
+    studio_db.delete_chat_threads(["thread-1"])
+    reservation_before = _raw_reservation_row(prepared["attemptId"])
+
+    response = inference.Response(
+        content = json.dumps(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "late summary"},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+        ),
+        media_type = "application/json",
+    )
+    observed = await inference._observe_manual_compaction_response(
+        response,
+        attempt_id = prepared["attemptId"],
+        cancel_event = threading.Event(),
+    )
+
+    assert observed.status_code == 502
+    assert json.loads(observed.body)["error"]["code"] == "manual_compaction_failed"
+    assert _raw_reservation_row(prepared["attemptId"]) == reservation_before
+    assert manual_compaction.get_manual_compaction_attempt(prepared["attemptId"]) is None
+
+
+@pytest.mark.parametrize("first", ["callback", "reuse"])
+def test_post_deletion_callback_and_attempt_reuse_recheck_retired_reservation_in_both_orders(
+    tmp_path, monkeypatch, first
+):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    _claim(prepared, claim_id = "9" * 64)
+    studio_db.delete_chat_threads(["thread-1"])
+    reservation_before = _raw_reservation_row(prepared["attemptId"])
+    studio_db.upsert_chat_thread(_thread("thread-2"))
+    for message in (
+        _message("u2", None, "user", "Other question", thread_id = "thread-2"),
+        _message("a2", "u2", "assistant", "Other answer", thread_id = "thread-2"),
+        _message("compact-2", "a2", "user", "/compact", thread_id = "thread-2"),
+    ):
+        studio_db.upsert_chat_message(message)
+    command_before = _raw_message_row("compact-2")
+
+    def callback():
+        return manual_compaction.record_manual_compaction_output(
+            prepared["attemptId"],
+            text = "late summary",
+            finish_reason = "stop",
+        )
+
+    def reuse():
+        return manual_compaction.bind_manual_compaction_command(
+            "thread-2",
+            attempt_id = prepared["attemptId"],
+            command_message_id = "compact-2",
+            summary_message_id = "summary-2",
+            attempt_sequence = 1,
+        )
+
+    operations = {"callback": callback, "reuse": reuse}
+    second = "reuse" if first == "callback" else "callback"
+    results = _run_in_writer_order(
+        monkeypatch,
+        f"{first}-winner",
+        operations[first],
+        f"{second}-loser",
+        operations[second],
+    )
+
+    assert isinstance(
+        results["callback-winner" if first == "callback" else "callback-loser"],
+        manual_compaction.ManualCompactionNotFound,
+    )
+    reuse_result = results["reuse-winner" if first == "reuse" else "reuse-loser"]
+    assert isinstance(reuse_result, manual_compaction.ManualCompactionConflict)
+    assert "permanently retired" in str(reuse_result)
+    assert _raw_reservation_row(prepared["attemptId"]) == reservation_before
+    assert _raw_message_row("compact-2") == command_before
+    assert _client_record("thread-2", "compact-2") is None
+
+
+def test_generation_existing_assistant_bind_loses_after_command_fence(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    _set_raw_message_json("a1", "content_json", "[]")
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-generation",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-generation",
+        attempt_sequence = 1,
+    )
+    before = _raw_message_row("a1")
+
+    with pytest.raises(
+        chat_generation_runs_db.ChatGenerationConflictError, match = "Manual compaction"
+    ):
+        chat_generation_runs_db.create_run(
+            run_id = "generation-run",
+            owner_subject = "test-user",
+            thread_id = "thread-1",
+            user_message_id = "u1",
+            assistant_message_id = "a1",
+            request_payload = {"model": "model", "messages": []},
+        )
+
+    assert _raw_message_row("a1") == before
+    assert chat_generation_runs_db.get_run("generation-run") is None
+
+
+def test_generation_status_transition_rolls_back_after_later_command_fence(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    _set_raw_message_json("a1", "content_json", "[]")
+    chat_generation_runs_db.create_run(
+        run_id = "generation-run",
+        owner_subject = "test-user",
+        thread_id = "thread-1",
+        user_message_id = "u1",
+        assistant_message_id = "a1",
+        request_payload = {"model": "model", "messages": []},
+    )
+    monkeypatch.setattr(
+        manual_compaction,
+        "_require_branch_lifecycle_quiescent",
+        lambda *_args, **_kwargs: None,
+    )
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-generation",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-generation",
+        attempt_sequence = 1,
+    )
+    before = _raw_message_row("a1")
+    worker_token = chat_generation_runs_db.get_worker_token("generation-run")
+
+    with pytest.raises(
+        chat_generation_runs_db.ChatGenerationConflictError, match = "Manual compaction"
+    ):
+        chat_generation_runs_db.mark_running("generation-run", worker_token)
+
+    assert _raw_message_row("a1") == before
+    assert chat_generation_runs_db.get_run("generation-run")["status"] == "queued"
+
+
+def test_active_generation_writer_wins_before_bind_without_partial_fence(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    _set_raw_message_json("a1", "content_json", "[]")
+    chat_generation_runs_db.create_run(
+        run_id = "generation-run",
+        owner_subject = "test-user",
+        thread_id = "thread-1",
+        user_message_id = "u1",
+        assistant_message_id = "a1",
+        request_payload = {"model": "model", "messages": []},
+    )
+    command_before = _raw_message_row("compact-1")
+
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "active generation"):
+        manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = "attempt-generation",
+            command_message_id = "compact-1",
+            summary_message_id = "summary-generation",
+            attempt_sequence = 1,
+        )
+
+    assert _raw_message_row("compact-1") == command_before
+    assert _client_record() is None
+    worker_token = chat_generation_runs_db.get_worker_token("generation-run")
+    assert chat_generation_runs_db.mark_running("generation-run", worker_token) is True
+    assert chat_generation_runs_db.get_run("generation-run")["status"] == "running"
+
+
+def test_research_existing_assistant_bind_loses_after_command_fence(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    _set_raw_message_json("a1", "content_json", "[]")
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-research",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-research",
+        attempt_sequence = 1,
+    )
+    before = _raw_message_row("a1")
+
+    with pytest.raises(research_runs_db.ResearchConflictError, match = "Manual compaction"):
+        research_runs_db.create_run(
+            run_id = "research-run",
+            owner_subject = "test-user",
+            thread_id = "thread-1",
+            user_message_id = "u1",
+            assistant_message_id = "a1",
+            config = {"model": "model"},
+            created_at = 20,
+        )
+
+    assert _raw_message_row("a1") == before
+    assert research_runs_db.get_run("research-run") is None
+
+
+def test_active_research_writer_wins_before_bind_without_partial_fence(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    _set_raw_message_json("a1", "content_json", "[]")
+    research_runs_db.create_run(
+        run_id = "research-run",
+        owner_subject = "test-user",
+        thread_id = "thread-1",
+        user_message_id = "u1",
+        assistant_message_id = "a1",
+        config = {"model": "model"},
+        created_at = 20,
+    )
+    command_before = _raw_message_row("compact-1")
+
+    with pytest.raises(manual_compaction.ManualCompactionConflict, match = "active research"):
+        manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = "attempt-research",
+            command_message_id = "compact-1",
+            summary_message_id = "summary-research",
+            attempt_sequence = 1,
+        )
+
+    assert _raw_message_row("compact-1") == command_before
+    assert _client_record() is None
+    assert research_runs_db.request_cancel("research-run") == "cancelling"
+
+
+@pytest.mark.parametrize(
+    ("lifecycle", "assistant_mode"),
+    [
+        ("generation", "new"),
+        ("generation", "off-branch"),
+        ("research", "new"),
+        ("research", "none"),
+        ("research", "off-branch"),
+    ],
+)
+@pytest.mark.parametrize("first", ["fence", "lifecycle"])
+def test_lifecycle_activation_and_command_fence_serialize_for_protected_user_ancestry(
+    tmp_path, monkeypatch, lifecycle, assistant_mode, first
+):
+    _seed_branch(tmp_path, monkeypatch)
+    assistant_id = None if assistant_mode == "none" else f"{lifecycle}-{assistant_mode}-reply"
+    if assistant_mode == "off-branch":
+        studio_db.upsert_chat_message(_message(assistant_id, "u1", "assistant", ""))
+    run_id = f"{lifecycle}-{assistant_mode}-run"
+    command_before = _raw_message_row("compact-1")
+    thread_before, messages_before = _raw_thread_and_messages()
+
+    def bind():
+        return manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = f"{run_id}-attempt",
+            command_message_id = "compact-1",
+            summary_message_id = f"{run_id}-summary",
+            attempt_sequence = 1,
+        )
+
+    if lifecycle == "generation":
+        expected_conflict = chat_generation_runs_db.ChatGenerationConflictError
+
+        def activate():
+            return chat_generation_runs_db.create_run(
+                run_id = run_id,
+                owner_subject = "test-user",
+                thread_id = "thread-1",
+                user_message_id = "u1",
+                assistant_message_id = assistant_id,
+                request_payload = {"model": "model", "messages": []},
+            )
+
+        def assert_no_lifecycle_mutation():
+            assert _raw_generation_state(run_id) == (None, [])
+
+    else:
+        expected_conflict = research_runs_db.ResearchConflictError
+
+        def activate():
+            return research_runs_db.create_run(
+                run_id = run_id,
+                owner_subject = "test-user",
+                thread_id = "thread-1",
+                user_message_id = "u1",
+                assistant_message_id = assistant_id,
+                config = {"model": "model"},
+                created_at = 20,
+            )
+
+        def assert_no_lifecycle_mutation():
+            assert _raw_research_state(run_id) == (None, [], [])
+
+    operations = {"fence": bind, "lifecycle": activate}
+    second = "lifecycle" if first == "fence" else "fence"
+    results = _run_in_writer_order(
+        monkeypatch,
+        f"{first}-winner",
+        operations[first],
+        f"{second}-loser",
+        operations[second],
+    )
+
+    if first == "fence":
+        assert isinstance(results["fence-winner"], dict)
+        assert isinstance(results["lifecycle-loser"], expected_conflict)
+        assert "Manual compaction" in str(results["lifecycle-loser"])
+        assert_no_lifecycle_mutation()
+        thread_after, messages_after = _raw_thread_and_messages()
+        assert thread_after == thread_before
+        before_by_id = {row[0]: row for row in messages_before}
+        after_by_id = {row[0]: row for row in messages_after}
+        assert set(after_by_id) == set(before_by_id)
+        for message_id, row in before_by_id.items():
+            if message_id != "compact-1":
+                assert after_by_id[message_id] == row
+        assert _client_record()["attemptId"] == f"{run_id}-attempt"
+        assert _raw_reservation_row(f"{run_id}-attempt") is not None
+    else:
+        assert not isinstance(results["lifecycle-winner"], Exception)
+        assert isinstance(results["fence-loser"], manual_compaction.ManualCompactionConflict)
+        assert _raw_message_row("compact-1") == command_before
+        assert _client_record() is None
+        assert _raw_reservation_row(f"{run_id}-attempt") is None
+
+
+@pytest.mark.parametrize("lifecycle", ["generation", "research"])
+@pytest.mark.parametrize("lifecycle_wins", [False, True], ids = ["fence-wins", "lifecycle-wins"])
+def test_lifecycle_creation_and_command_bind_serialize_without_partial_authority(
+    tmp_path, monkeypatch, lifecycle, lifecycle_wins
+):
+    _seed_branch(tmp_path, monkeypatch)
+    _set_raw_message_json("a1", "content_json", "[]")
+    command_before = _raw_message_row("compact-1")
+
+    def bind():
+        return manual_compaction.bind_manual_compaction_command(
+            "thread-1",
+            attempt_id = "attempt-lifecycle-race",
+            command_message_id = "compact-1",
+            summary_message_id = "summary-lifecycle-race",
+            attempt_sequence = 1,
+        )
+
+    if lifecycle == "generation":
+        expected_conflict = chat_generation_runs_db.ChatGenerationConflictError
+
+        def create_lifecycle():
+            return chat_generation_runs_db.create_run(
+                run_id = "lifecycle-race",
+                owner_subject = "test-user",
+                thread_id = "thread-1",
+                user_message_id = "u1",
+                assistant_message_id = "a1",
+                request_payload = {"model": "model", "messages": []},
+            )
+
+        get_run = chat_generation_runs_db.get_run
+    else:
+        expected_conflict = research_runs_db.ResearchConflictError
+
+        def create_lifecycle():
+            return research_runs_db.create_run(
+                run_id = "lifecycle-race",
+                owner_subject = "test-user",
+                thread_id = "thread-1",
+                user_message_id = "u1",
+                assistant_message_id = "a1",
+                config = {"model": "model"},
+                created_at = 20,
+            )
+
+        get_run = research_runs_db.get_run
+
+    winner_name = "lifecycle-winner" if lifecycle_wins else "fence-winner"
+    loser_name = "fence-loser" if lifecycle_wins else "lifecycle-loser"
+    winner = create_lifecycle if lifecycle_wins else bind
+    loser = bind if lifecycle_wins else create_lifecycle
+    results = _run_in_writer_order(
+        monkeypatch,
+        winner_name,
+        winner,
+        loser_name,
+        loser,
+    )
+
+    if lifecycle_wins:
+        assert not isinstance(results[winner_name], Exception)
+        assert isinstance(results[loser_name], manual_compaction.ManualCompactionConflict)
+        assert _client_record() is None
+        assert _raw_message_row("compact-1") == command_before
+        assert get_run("lifecycle-race") is not None
+    else:
+        assert isinstance(results[winner_name], dict)
+        assert isinstance(results[loser_name], expected_conflict)
+        assert _client_record()["attemptId"] == "attempt-lifecycle-race"
+        assert get_run("lifecycle-race") is None
+
+    conn = studio_db.get_connection()
+    try:
+        reservation = conn.execute(
+            "SELECT thread_id, command_message_id FROM "
+            "manual_compaction_attempt_reservations WHERE attempt_id = ?",
+            ("attempt-lifecycle-race",),
+        ).fetchone()
+        assert (reservation is None) is lifecycle_wins
+    finally:
+        conn.close()
+
+
+def test_research_rebind_unbind_rolls_back_after_later_command_fence(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    _set_raw_message_json("a1", "content_json", "[]")
+    research_runs_db.create_run(
+        run_id = "research-run",
+        owner_subject = "test-user",
+        thread_id = "thread-1",
+        user_message_id = "u1",
+        assistant_message_id = "a1",
+        config = {"model": "model"},
+        created_at = 20,
+    )
+    conn = studio_db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE research_runs SET status = 'cancelled', cancel_requested = 1, "
+            "completed_at = 21 WHERE id = 'research-run'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-research",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-research",
+        attempt_sequence = 1,
+    )
+    studio_db.upsert_chat_message(_message("u2", "compact-1", "user", "Next question"))
+    studio_db.upsert_chat_message(_message("a2", "u2", "assistant", ""))
+    before = _raw_message_row("a1")
+
+    with pytest.raises(research_runs_db.ResearchConflictError, match = "Manual compaction"):
+        research_runs_db.rebind_cancelled(
+            thread_id = "thread-1",
+            user_message_id = "u2",
+            assistant_message_id = "a2",
+            config = {"model": "model"},
+        )
+
+    assert _raw_message_row("a1") == before
+    stored = research_runs_db.get_run("research-run")
+    assert stored["status"] == "cancelled"
+    assert stored["assistantMessageId"] == "a1"
+
+
+@pytest.mark.parametrize("assistant_mode", ["none", "off-branch"])
+def test_research_retry_rejects_protected_user_ancestry_without_mutation(
+    tmp_path, monkeypatch, assistant_mode
+):
+    _seed_branch(tmp_path, monkeypatch)
+    assistant_id = None if assistant_mode == "none" else "research-retry-reply"
+    research_runs_db.create_run(
+        run_id = "research-retry",
+        owner_subject = "test-user",
+        thread_id = "thread-1",
+        user_message_id = "u1",
+        assistant_message_id = assistant_id,
+        config = {"model": "model"},
+        created_at = 20,
+    )
+    conn = studio_db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE research_runs SET status = 'failed', completed_at = 21, "
+            "error_message = 'stopped' WHERE id = 'research-retry'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-retry-fence",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-retry-fence",
+        attempt_sequence = 1,
+    )
+    research_before = _raw_research_state("research-retry")
+    storage_before = _raw_thread_and_messages()
+
+    with pytest.raises(research_runs_db.ResearchConflictError, match = "Manual compaction"):
+        research_runs_db.retry("research-retry")
+
+    assert _raw_research_state("research-retry") == research_before
+    assert _raw_thread_and_messages() == storage_before
+
+
+@pytest.mark.parametrize("assistant_mode", ["none", "off-branch"])
+def test_research_rebind_rejects_protected_target_user_without_mutation(
+    tmp_path, monkeypatch, assistant_mode
+):
+    _seed_branch(tmp_path, monkeypatch)
+    studio_db.upsert_chat_message(_message("research-old-user", None, "user", "Old question"))
+    research_runs_db.create_run(
+        run_id = "research-rebind",
+        owner_subject = "test-user",
+        thread_id = "thread-1",
+        user_message_id = "research-old-user",
+        assistant_message_id = None,
+        config = {"model": "model"},
+        created_at = 20,
+    )
+    conn = studio_db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE research_runs SET status = 'cancelled', cancel_requested = 1, "
+            "completed_at = 21 WHERE id = 'research-rebind'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assistant_id = None if assistant_mode == "none" else "research-rebind-reply"
+    if assistant_id is not None:
+        studio_db.upsert_chat_message(_message(assistant_id, "u1", "assistant", ""))
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-rebind-fence",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-rebind-fence",
+        attempt_sequence = 1,
+    )
+    research_before = _raw_research_state("research-rebind")
+    storage_before = _raw_thread_and_messages()
+
+    with pytest.raises(research_runs_db.ResearchConflictError, match = "Manual compaction"):
+        research_runs_db.rebind_cancelled(
+            thread_id = "thread-1",
+            user_message_id = "u1",
+            assistant_message_id = assistant_id,
+            config = {"model": "model"},
+        )
+
+    assert _raw_research_state("research-rebind") == research_before
+    assert _raw_thread_and_messages() == storage_before
+
+
+def test_terminal_research_fallback_cannot_insert_after_user_ancestry_is_fenced(
+    tmp_path, monkeypatch
+):
+    _seed_branch(tmp_path, monkeypatch)
+    research_runs_db.create_run(
+        run_id = "research-fallback",
+        owner_subject = "test-user",
+        thread_id = "thread-1",
+        user_message_id = "u1",
+        assistant_message_id = None,
+        config = {"model": "model"},
+        created_at = 20,
+    )
+    conn = studio_db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE research_runs SET status = 'failed', completed_at = 21, "
+            "error_message = 'stopped' WHERE id = 'research-fallback'"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = "attempt-fallback-fence",
+        command_message_id = "compact-1",
+        summary_message_id = "summary-fallback-fence",
+        attempt_sequence = 1,
+    )
+    research_before = _raw_research_state("research-fallback")
+    storage_before = _raw_thread_and_messages()
+
+    with pytest.raises(research_runs_db.ResearchConflictError, match = "Manual compaction"):
+        research_runs_db.create_and_bind_terminal_fallback(
+            "research-fallback",
+            text = "Failed safely",
+            status = "failed",
+        )
+
+    assert _raw_research_state("research-fallback") == research_before
+    assert _raw_thread_and_messages() == storage_before
+    assert studio_db.get_chat_message("thread-1", "research-research-fallback") is None
+
+
+@pytest.mark.parametrize("operation", ["direct-discovery", "terminal-fallback"])
+@pytest.mark.parametrize("child_state", ["discovered", "already-bound"])
+def test_existing_research_child_discovery_fails_closed_after_user_ancestry_is_fenced(
+    tmp_path, monkeypatch, operation, child_state
+):
+    _seed_branch(tmp_path, monkeypatch)
+    run_id = f"research-{child_state}"
+    child_id = f"{run_id}-reply"
+    research_runs_db.create_run(
+        run_id = run_id,
+        owner_subject = "test-user",
+        thread_id = "thread-1",
+        user_message_id = "u1",
+        assistant_message_id = child_id if child_state == "already-bound" else None,
+        config = {"model": "model"},
+        created_at = 20,
+    )
+    if child_state == "discovered":
+        studio_db.upsert_chat_message(
+            _message(
+                child_id,
+                "u1",
+                "assistant",
+                "",
+                metadata = {"researchRunId": run_id},
+            )
+        )
+    conn = studio_db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE research_runs SET status = 'failed', completed_at = 21, "
+            "error_message = 'stopped' WHERE id = ?",
+            (run_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    manual_compaction.bind_manual_compaction_command(
+        "thread-1",
+        attempt_id = f"attempt-{child_state}-discovery-fence",
+        command_message_id = "compact-1",
+        summary_message_id = f"summary-{child_state}-discovery-fence",
+        attempt_sequence = 1,
+    )
+    research_before = _raw_research_state(run_id)
+    storage_before = _raw_thread_and_messages()
+
+    with pytest.raises(research_runs_db.ResearchConflictError, match = "Manual compaction"):
+        if operation == "direct-discovery":
+            research_runs_db.discover_and_bind_assistant_message(run_id)
+        else:
+            research_runs_db.create_and_bind_terminal_fallback(
+                run_id,
+                text = "Failed safely",
+                status = "failed",
+            )
+
+    assert _raw_research_state(run_id) == research_before
+    assert _raw_thread_and_messages() == storage_before
+
+
+def test_legacy_active_checkpoint_does_not_block_a_distinct_new_command(tmp_path, monkeypatch):
+    _seed_branch(tmp_path, monkeypatch)
+    prepared = _prepare()
+    _claim(prepared)
+    _record_output(prepared, "old summary")
+    studio_db.upsert_chat_message(_message("summary-1", "compact-1", "assistant", "old summary"))
+    active = manual_compaction.commit_manual_compaction(
+        "thread-1",
+        attempt_id = prepared["attemptId"],
+        command_message_id = prepared["commandMessageId"],
+        summary_message_id = "summary-1",
+        expected_head_message_id = "summary-1",
+        expected_revision = prepared["revision"],
+        expected_summary_hash = manual_compaction.summary_hash("old summary"),
+    )
+    conn = studio_db.get_connection()
+    try:
+        conn.execute(
+            "UPDATE chat_messages SET metadata_json = NULL WHERE thread_id = ? AND id = ?",
+            ("thread-1", "compact-1"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    studio_db.upsert_chat_message(_message("compact-2", "summary-1", "user", "/compact"))
+    next_attempt = _prepare_bound(
+        "thread-1",
+        attempt_id = "attempt-2",
+        command_message_id = "compact-2",
+        expected_head_message_id = "compact-2",
+        message_ids = ["u1", "a1", "compact-1", "summary-1", "compact-2"],
+        request_messages = [
+            {"role": "system", "content": "Project rules"},
+            {"role": "assistant", "content": "old summary"},
+            {"role": "user", "content": "/compact"},
+        ],
+        summary_message_id = "summary-2",
+    )
+    assert active["state"] == "active"
+    assert next_attempt["state"] == "pending"
+    assert next_attempt["revision"] == 2
+    assert manual_compaction.get_manual_compaction_attempt(active["attemptId"])["state"] == "active"

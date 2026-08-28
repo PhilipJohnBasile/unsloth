@@ -13,7 +13,12 @@ import threading
 import time
 from typing import Any, Iterable, Union
 
-from storage.studio_db import get_connection
+from storage.studio_db import (
+    ChatMessageProtectedError,
+    get_connection,
+    guard_manual_compaction_lifecycle_activation,
+    guard_manual_compaction_message_metadata_update,
+)
 
 ACTIVE_STATUSES = frozenset({"queued", "running", "cancelling"})
 TERMINAL_STATUSES = frozenset({"cancelled", "completed", "failed"})
@@ -25,6 +30,28 @@ ChatGenerationEventInput = Union[tuple[str, dict[str, Any]], tuple[str, dict[str
 
 class ChatGenerationConflictError(RuntimeError):
     pass
+
+
+def _guard_compaction_metadata_update(
+    conn: sqlite3.Connection, message_id: str, metadata: object
+) -> None:
+    try:
+        guard_manual_compaction_message_metadata_update(conn, message_id, metadata)
+    except ChatMessageProtectedError as exc:
+        raise ChatGenerationConflictError(
+            "Manual compaction protects this generation message"
+        ) from exc
+
+
+def _guard_compaction_lifecycle_activation(
+    conn: sqlite3.Connection, thread_id: str, *message_ids: str | None
+) -> None:
+    try:
+        guard_manual_compaction_lifecycle_activation(conn, thread_id, message_ids)
+    except ChatMessageProtectedError as exc:
+        raise ChatGenerationConflictError(
+            "Manual compaction protects this generation ancestry"
+        ) from exc
 
 
 def now_ms() -> int:
@@ -175,6 +202,7 @@ def _sync_assistant_status_locked(conn: sqlite3.Connection, run_id: str, status:
             metadata["incomplete"] = {"reason": "length"}
         else:
             metadata.pop("incomplete", None)
+    _guard_compaction_metadata_update(conn, row["assistant_message_id"], metadata)
     conn.execute(
         "UPDATE chat_messages SET metadata_json=? WHERE id=?",
         (_strict_message_dumps(metadata), row["assistant_message_id"]),
@@ -233,6 +261,12 @@ def create_run(
             or user_message["role"] != "user"
         ):
             raise ValueError("userMessageId must identify a user message in the thread")
+        _guard_compaction_lifecycle_activation(
+            conn,
+            thread_id,
+            user_message_id,
+            assistant_message_id,
+        )
         active = conn.execute(
             """SELECT 1 FROM chat_generation_runs
                WHERE thread_id=? AND status IN ('queued','running','cancelling')""",
@@ -294,6 +328,7 @@ def create_run(
                 dict(assistant_metadata) if isinstance(assistant_metadata, dict) else {}
             )
             merged_metadata.update(metadata)
+            _guard_compaction_metadata_update(conn, assistant_message_id, merged_metadata)
             conn.execute(
                 "UPDATE chat_messages SET metadata_json=? WHERE id=?",
                 (_strict_message_dumps(merged_metadata), assistant_message_id),

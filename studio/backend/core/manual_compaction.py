@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import re
 import time
@@ -29,6 +30,7 @@ MANUAL_COMPACTION_PENDING_TTL_MS = 60 * 60 * 1000
 MANUAL_COMPACTION_TERMINAL_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 MAX_MANUAL_COMPACTION_TERMINAL_ATTEMPTS_PER_THREAD = 32
 MANUAL_COMPACTION_SCHEMA_VERSION = 1
+MANUAL_COMPACTION_CLIENT_KEY = "manualCompactionClient"
 MANUAL_COMPACTION_HANDOFF_INSTRUCTION = (
     "Create a durable handoff summary of the conversation above. Preserve the user's goals, "
     "decisions, constraints, relevant files and commands, observed errors, completed work, and "
@@ -37,6 +39,7 @@ MANUAL_COMPACTION_HANDOFF_INSTRUCTION = (
 )
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_CLAIM_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _AUDIO_DATA_RE = re.compile(r"data:audio/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+")
 _SEARCH_IMAGE_ID_RE = re.compile(r"^[0-9a-f]{12}$")
 _SEARCH_IMAGE_TOKEN_RE = re.compile(
@@ -71,6 +74,7 @@ _TERMINAL_REASONS = _INFERENCE_TERMINAL_REASONS | frozenset(
         "migrated_duplicate_live_branch",
         "migrated_failed",
         "pending_expired",
+        "prepare_invalidated",
         "replaced",
     }
 )
@@ -149,6 +153,274 @@ def _strict_json_dumps(value: Any, *, sort_keys: bool = False) -> str:
         sort_keys = sort_keys,
         separators = (",", ":"),
     )
+
+
+def _claim_token_hash(value: Any) -> str:
+    if not isinstance(value, str) or _CLAIM_ID_RE.fullmatch(value) is None:
+        raise ManualCompactionError("claim id must be a 256-bit lowercase hexadecimal token")
+    return hashlib.sha256(value.encode("ascii")).hexdigest()
+
+
+def _stored_bounded_id(value: Any, label: str) -> str:
+    try:
+        return _bounded_id(value, label)
+    except ManualCompactionError as exc:
+        raise ManualCompactionConflict(f"Stored manual compaction {label} is invalid") from exc
+
+
+_CLIENT_BASE_KEYS = frozenset(
+    {
+        "schemaVersion",
+        "state",
+        "threadId",
+        "commandMessageId",
+        "attemptId",
+        "summaryMessageId",
+        "attemptSequence",
+        "expectedHeadMessageId",
+    }
+)
+_CLIENT_ENVELOPE_KEYS = frozenset(
+    {
+        "attemptId",
+        "threadId",
+        "commandMessageId",
+        "expectedHeadMessageId",
+        "sourceHash",
+        "requestHash",
+        "requestMessageCount",
+        "projectInstructionDigest",
+        "projectInstructionRevision",
+        "contextDigest",
+        "revision",
+    }
+)
+
+
+def _manual_compaction_client_record(message: dict[str, Any]) -> dict[str, Any] | None:
+    metadata = message.get("metadata")
+    if not isinstance(metadata, dict) or MANUAL_COMPACTION_CLIENT_KEY not in metadata:
+        return None
+    raw = metadata[MANUAL_COMPACTION_CLIENT_KEY]
+    if not isinstance(raw, dict):
+        raise ManualCompactionConflict("Stored manual compaction client metadata is invalid")
+    state = raw.get("state")
+    expected_keys = set(_CLIENT_BASE_KEYS)
+    if state in ("prepared", "summary_saved"):
+        expected_keys.update(("sourceHeadMessageId", "envelope"))
+    if state == "summary_saved":
+        expected_keys.add("summaryHash")
+    if state not in ("bound", "prepared", "summary_saved") or set(raw) != expected_keys:
+        raise ManualCompactionConflict("Stored manual compaction client metadata is invalid")
+    if raw.get("schemaVersion") != MANUAL_COMPACTION_SCHEMA_VERSION:
+        raise ManualCompactionConflict("Stored manual compaction client metadata is invalid")
+
+    for key, label in (
+        ("threadId", "thread id"),
+        ("commandMessageId", "command message id"),
+        ("attemptId", "attempt id"),
+        ("summaryMessageId", "summary message id"),
+        ("expectedHeadMessageId", "expected head message id"),
+    ):
+        _stored_bounded_id(raw.get(key), label)
+    sequence = raw.get("attemptSequence")
+    if (
+        not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or sequence < 1
+        or sequence > 2**53 - 1
+    ):
+        raise ManualCompactionConflict("Stored manual compaction attempt sequence is invalid")
+    if (
+        raw["threadId"] != message.get("threadId")
+        or raw["commandMessageId"] != message.get("id")
+        or raw["expectedHeadMessageId"] != raw["commandMessageId"]
+        or raw["summaryMessageId"] == raw["commandMessageId"]
+    ):
+        raise ManualCompactionConflict("Stored manual compaction client identity is inconsistent")
+
+    if state == "bound":
+        return dict(raw)
+
+    source_head_message_id = _stored_bounded_id(
+        raw.get("sourceHeadMessageId"), "source head message id"
+    )
+    if source_head_message_id == raw["commandMessageId"]:
+        raise ManualCompactionConflict("Stored manual compaction source head is invalid")
+    envelope = raw.get("envelope")
+    if not isinstance(envelope, dict) or set(envelope) != _CLIENT_ENVELOPE_KEYS:
+        raise ManualCompactionConflict("Stored manual compaction envelope is invalid")
+    for key, label in (
+        ("attemptId", "envelope attempt id"),
+        ("threadId", "envelope thread id"),
+        ("commandMessageId", "envelope command message id"),
+        ("expectedHeadMessageId", "envelope expected head message id"),
+    ):
+        if _stored_bounded_id(envelope.get(key), label) != raw[key]:
+            raise ManualCompactionConflict("Stored manual compaction envelope is inconsistent")
+    for key in (
+        "sourceHash",
+        "requestHash",
+        "projectInstructionDigest",
+        "contextDigest",
+    ):
+        value = envelope.get(key)
+        if not isinstance(value, str) or _SHA256_RE.fullmatch(value) is None:
+            raise ManualCompactionConflict("Stored manual compaction envelope is invalid")
+    request_message_count = envelope.get("requestMessageCount")
+    project_instruction_revision = envelope.get("projectInstructionRevision")
+    revision = envelope.get("revision")
+    if (
+        not isinstance(request_message_count, int)
+        or isinstance(request_message_count, bool)
+        or not 2 <= request_message_count <= MAX_MANUAL_COMPACTION_REQUEST_MESSAGES
+        or not isinstance(project_instruction_revision, int)
+        or isinstance(project_instruction_revision, bool)
+        or project_instruction_revision < 0
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 1
+    ):
+        raise ManualCompactionConflict("Stored manual compaction envelope is invalid")
+    if state == "summary_saved":
+        summary_hash = raw.get("summaryHash")
+        if not isinstance(summary_hash, str) or _SHA256_RE.fullmatch(summary_hash) is None:
+            raise ManualCompactionConflict("Stored manual compaction summary hash is invalid")
+    return dict(raw)
+
+
+def _client_record_identity(record: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(
+        record[key]
+        for key in (
+            "threadId",
+            "commandMessageId",
+            "attemptId",
+            "summaryMessageId",
+            "attemptSequence",
+            "expectedHeadMessageId",
+        )
+    )
+
+
+def _reservation_identity(record: dict[str, Any]) -> tuple[Any, ...]:
+    return tuple(
+        record[key]
+        for key in (
+            "attemptId",
+            "threadId",
+            "commandMessageId",
+            "summaryMessageId",
+            "attemptSequence",
+        )
+    )
+
+
+def _reservation_from_row(row: Any) -> dict[str, Any]:
+    data = dict(row)
+    reservation = {
+        "attemptId": _stored_bounded_id(data.get("attempt_id"), "reserved attempt id"),
+        "threadId": _stored_bounded_id(data.get("thread_id"), "reserved thread id"),
+        "commandMessageId": _stored_bounded_id(
+            data.get("command_message_id"), "reserved command message id"
+        ),
+        "summaryMessageId": _stored_bounded_id(
+            data.get("summary_message_id"), "reserved summary message id"
+        ),
+        "attemptSequence": data.get("attempt_sequence"),
+    }
+    sequence = reservation["attemptSequence"]
+    if (
+        not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or not 1 <= sequence <= 2**53 - 1
+    ):
+        raise ManualCompactionConflict("Stored manual compaction reservation sequence is invalid")
+    created_at = data.get("created_at")
+    if not isinstance(created_at, int) or isinstance(created_at, bool) or created_at < 1:
+        raise ManualCompactionConflict("Stored manual compaction reservation time is invalid")
+    retired_at = data.get("retired_at")
+    if retired_at is not None and (
+        not isinstance(retired_at, int) or isinstance(retired_at, bool) or retired_at < 1
+    ):
+        raise ManualCompactionConflict(
+            "Stored manual compaction reservation retirement time is invalid"
+        )
+    reservation["retiredAt"] = retired_at
+    return reservation
+
+
+def _reserve_manual_compaction_attempt(conn, record: dict[str, Any], *, created_at: int) -> None:
+    """Reserve one global attempt identity under the bind writer transaction."""
+    existing = conn.execute(
+        "SELECT * FROM manual_compaction_attempt_reservations WHERE attempt_id = ?",
+        (record["attemptId"],),
+    ).fetchone()
+    if existing is not None:
+        stored_reservation = _reservation_from_row(existing)
+        if stored_reservation["retiredAt"] is not None:
+            raise ManualCompactionConflict("Attempt id is permanently retired")
+        if _reservation_identity(stored_reservation) != _reservation_identity(record):
+            raise ManualCompactionConflict("Attempt id is already reserved for another binding")
+        return
+    occupied_sequence = conn.execute(
+        "SELECT * FROM manual_compaction_attempt_reservations "
+        "WHERE thread_id = ? AND command_message_id = ? AND attempt_sequence = ?",
+        (record["threadId"], record["commandMessageId"], record["attemptSequence"]),
+    ).fetchone()
+    if occupied_sequence is not None:
+        raise ManualCompactionConflict("Attempt sequence is already reserved for this command")
+    occupied_summary = conn.execute(
+        "SELECT thread_id, command_message_id FROM manual_compaction_attempt_reservations "
+        "WHERE summary_message_id = ? LIMIT 1",
+        (record["summaryMessageId"],),
+    ).fetchone()
+    if occupied_summary is not None and (
+        str(occupied_summary["thread_id"]) != record["threadId"]
+        or str(occupied_summary["command_message_id"]) != record["commandMessageId"]
+    ):
+        raise ManualCompactionConflict("Summary message id is reserved for another command")
+    conn.execute(
+        "INSERT INTO manual_compaction_attempt_reservations "
+        "(attempt_id, thread_id, command_message_id, summary_message_id, attempt_sequence, "
+        "created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (*_reservation_identity(record), created_at),
+    )
+
+
+def _require_manual_compaction_attempt_reservation(conn, record: dict[str, Any]) -> None:
+    row = conn.execute(
+        "SELECT * FROM manual_compaction_attempt_reservations WHERE attempt_id = ?",
+        (record["attemptId"],),
+    ).fetchone()
+    reservation = _reservation_from_row(row) if row is not None else None
+    if (
+        reservation is None
+        or reservation["retiredAt"] is not None
+        or _reservation_identity(reservation) != _reservation_identity(record)
+    ):
+        raise ManualCompactionConflict("Manual compaction attempt reservation is stale")
+
+
+def _write_manual_compaction_client_record(
+    conn, message: dict[str, Any], record: dict[str, Any]
+) -> dict[str, Any]:
+    metadata = message.get("metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    metadata[MANUAL_COMPACTION_CLIENT_KEY] = record
+    changed = conn.execute(
+        "UPDATE chat_messages SET metadata_json = ? WHERE thread_id = ? AND id = ?",
+        (
+            _strict_json_dumps(metadata),
+            message["threadId"],
+            message["id"],
+        ),
+    ).rowcount
+    if changed != 1:
+        raise ManualCompactionConflict("The /compact command changed during its state transition")
+    updated = dict(message)
+    updated["metadata"] = metadata
+    return updated
 
 
 def _decode_stored_json(
@@ -1140,7 +1412,7 @@ def _exact_branch(
     _thread, by_id = _load_rows(conn, thread_id)
     branch: list[dict[str, Any]] = []
     previous: str | None = None
-    for message_id in checked:
+    for index, message_id in enumerate(checked):
         row = by_id.get(message_id)
         if row is None:
             foreign = conn.execute(
@@ -1151,11 +1423,86 @@ def _exact_branch(
                 raise ManualCompactionConflict("Compaction branch crosses thread boundaries")
             raise ManualCompactionConflict(f"Compaction branch message {message_id} is missing")
         message = _message_dict(row)
-        if message.get("parentId") != previous:
+        parent_id = message.get("parentId")
+        if (index == 0 and parent_id not in (None, "")) or (index > 0 and parent_id != previous):
             raise ManualCompactionConflict("Compaction branch is not the exact stored ancestry")
         branch.append(message)
         previous = message_id
     return branch
+
+
+def _complete_command_branch(conn, thread_id: str, command_message_id: str) -> list[dict[str, Any]]:
+    """Load and validate the complete same-thread root-to-command ancestry."""
+    _thread, by_id = _load_rows(conn, thread_id)
+    cursor: str | None = command_message_id
+    reversed_branch: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    while cursor is not None:
+        if cursor in seen:
+            raise ManualCompactionConflict("The /compact command ancestry contains a cycle")
+        if len(reversed_branch) >= MAX_MANUAL_COMPACTION_MESSAGES:
+            raise ManualCompactionError(
+                f"Compaction branch must contain 2 to {MAX_MANUAL_COMPACTION_MESSAGES} messages"
+            )
+        seen.add(cursor)
+        row = by_id.get(cursor)
+        if row is None:
+            if not reversed_branch:
+                raise ManualCompactionNotFound("The /compact command was not found")
+            foreign = conn.execute(
+                "SELECT thread_id FROM chat_messages WHERE id = ?", (cursor,)
+            ).fetchone()
+            if foreign is not None:
+                raise ManualCompactionConflict("The /compact command ancestry crosses threads")
+            raise ManualCompactionConflict("The /compact command ancestry is incomplete")
+        message = _message_dict(row)
+        reversed_branch.append(message)
+        parent_id = message.get("parentId")
+        if parent_id in (None, ""):
+            cursor = None
+        elif not isinstance(parent_id, str):
+            raise ManualCompactionConflict("The /compact command ancestry is invalid")
+        else:
+            cursor = parent_id
+    branch = list(reversed(reversed_branch))
+    if len(branch) < 2:
+        raise ManualCompactionError("Compaction branch must contain at least 2 messages")
+    return branch
+
+
+def _require_branch_lifecycle_quiescent(conn, thread_id: str, branch: list[dict[str, Any]]) -> None:
+    """Let an existing producer finish before its stored rows become immutable."""
+    message_ids = {str(message["id"]) for message in branch}
+    generation = conn.execute(
+        "SELECT user_message_id, assistant_message_id FROM chat_generation_runs "
+        "WHERE thread_id = ? AND status IN ('queued', 'running', 'cancelling')",
+        (thread_id,),
+    ).fetchall()
+    if any(
+        str(row["user_message_id"]) in message_ids
+        or str(row["assistant_message_id"]) in message_ids
+        for row in generation
+    ):
+        raise ManualCompactionConflict(
+            "The /compact ancestry still has an active generation lifecycle"
+        )
+    research = conn.execute(
+        "SELECT user_message_id, assistant_message_id FROM research_runs "
+        "WHERE thread_id = ? AND status IN "
+        "('planning', 'awaiting_approval', 'queued', 'running', 'paused', 'cancelling')",
+        (thread_id,),
+    ).fetchall()
+    if any(
+        str(row["user_message_id"]) in message_ids
+        or (
+            row["assistant_message_id"] is not None
+            and str(row["assistant_message_id"]) in message_ids
+        )
+        for row in research
+    ):
+        raise ManualCompactionConflict(
+            "The /compact ancestry still has an active research lifecycle"
+        )
 
 
 def _active_compaction_metadata(message: dict[str, Any]) -> dict[str, Any] | None:
@@ -1239,6 +1586,33 @@ def _attempt_from_row(row: Any) -> dict[str, Any]:
     state = data.get("state")
     if state not in ("pending", "running", "active", "cancelled", "failed"):
         raise ManualCompactionConflict("Stored manual compaction state is invalid")
+    command_hash = data.get("command_hash")
+    command_hash_state = data.get("command_hash_state")
+    valid_command_hash = (
+        isinstance(command_hash, str) and _SHA256_RE.fullmatch(command_hash) is not None
+    )
+    if state in ("pending", "running") and not (
+        valid_command_hash and command_hash_state == "prepared"
+    ):
+        raise ManualCompactionConflict("Stored manual compaction command hash is inconsistent")
+    if state == "active" and not (valid_command_hash and command_hash_state == "summary_saved"):
+        raise ManualCompactionConflict("Stored manual compaction command hash is inconsistent")
+    if state in ("cancelled", "failed") and not (
+        (command_hash is None and command_hash_state is None)
+        or valid_command_hash
+        and command_hash_state in ("prepared", "summary_saved")
+    ):
+        raise ManualCompactionConflict("Stored manual compaction command hash is inconsistent")
+    claim_token_hash = data.get("claim_token_hash")
+    if claim_token_hash is not None and (
+        not isinstance(claim_token_hash, str) or _SHA256_RE.fullmatch(claim_token_hash) is None
+    ):
+        raise ManualCompactionConflict("Stored manual compaction claim ownership is invalid")
+    if (state == "running") != (claim_token_hash is not None) and state not in (
+        "cancelled",
+        "failed",
+    ):
+        raise ManualCompactionConflict("Stored manual compaction claim ownership is inconsistent")
     source_message_ids = _decode_stored_json(
         data.get("source_message_ids_json"),
         label = "manual compaction source message ids",
@@ -1456,6 +1830,8 @@ def _attempt_from_row(row: Any) -> dict[str, Any]:
         "archivePayloadHash": archive_payload_hash,
         "revision": revision,
         "state": state,
+        "commandHash": command_hash,
+        "commandHashState": command_hash_state,
         "summaryMessageId": summary_message_id,
         "summaryHash": summary_hash,
         "outputSummaryHash": output_summary_hash,
@@ -1518,7 +1894,31 @@ def _terminalize_attempt(
     return changed == 1
 
 
+def _referenced_manual_compaction_attempt_ids(conn, thread_id: str | None) -> set[str]:
+    """Decode every scoped message before retention decides that a fence is unreferenced."""
+    rows = conn.execute(
+        "SELECT id, thread_id, parent_id, role, content_json, attachments_json, "
+        "metadata_json, created_at FROM chat_messages "
+        + ("" if thread_id is None else "WHERE thread_id = ?"),
+        () if thread_id is None else (thread_id,),
+    ).fetchall()
+    referenced: set[str] = set()
+    for row in rows:
+        message = _message_dict(row)
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict) or MANUAL_COMPACTION_CLIENT_KEY not in metadata:
+            continue
+        record = _manual_compaction_client_record(message)
+        if record is None:
+            raise ManualCompactionConflict("Stored manual compaction client metadata is invalid")
+        referenced.add(str(record["attemptId"]))
+    return referenced
+
+
 def _cleanup_manual_compaction_attempts(conn, thread_id: str | None, now: int) -> None:
+    # Discover references first. Any malformed message or fence aborts the writer
+    # transaction before terminalization, scrubbing, or retention can mutate state.
+    referenced_attempt_ids = _referenced_manual_compaction_attempt_ids(conn, thread_id)
     scope_sql = "1 = 1" if thread_id is None else "thread_id = ?"
     scope_params: tuple[Any, ...] = () if thread_id is None else (thread_id,)
     pending_cutoff = now - MANUAL_COMPACTION_PENDING_TTL_MS
@@ -1566,39 +1966,62 @@ def _cleanup_manual_compaction_attempts(conn, thread_id: str | None, now: int) -
         (_EMPTY_JSON_HASH, *scope_params),
     )
     terminal_cutoff = now - MANUAL_COMPACTION_TERMINAL_RETENTION_MS
-    if thread_id is not None:
+    terminal_rows = conn.execute(
+        "SELECT attempt_id, thread_id, finished_at, created_at "
+        "FROM manual_compactions WHERE "
+        f"{scope_sql} AND state IN ('cancelled', 'failed') "
+        "ORDER BY thread_id, finished_at DESC, created_at DESC, attempt_id DESC",
+        scope_params,
+    ).fetchall()
+    retained_unreferenced: dict[str, int] = {}
+    delete_ids: list[str] = []
+    for row in terminal_rows:
+        attempt_id = str(row["attempt_id"])
+        if attempt_id in referenced_attempt_ids:
+            continue
+        row_thread_id = str(row["thread_id"])
+        rank = retained_unreferenced.get(row_thread_id, 0)
+        retained_unreferenced[row_thread_id] = rank + 1
+        finished_at = int(row["finished_at"] or row["created_at"] or 0)
+        if (
+            finished_at <= terminal_cutoff
+            or rank >= MAX_MANUAL_COMPACTION_TERMINAL_ATTEMPTS_PER_THREAD
+        ):
+            delete_ids.append(attempt_id)
+    for start in range(0, len(delete_ids), 500):
+        chunk = delete_ids[start : start + 500]
+        placeholders = ",".join("?" for _ in chunk)
         conn.execute(
-            "DELETE FROM manual_compactions WHERE thread_id = ? "
-            "AND state IN ('cancelled', 'failed') AND (finished_at <= ? OR attempt_id NOT IN ("
-            "SELECT attempt_id FROM manual_compactions WHERE thread_id = ? "
-            "AND state IN ('cancelled', 'failed') "
-            "ORDER BY finished_at DESC, created_at DESC, attempt_id DESC LIMIT ?))",
-            (
-                thread_id,
-                terminal_cutoff,
-                thread_id,
-                MAX_MANUAL_COMPACTION_TERMINAL_ATTEMPTS_PER_THREAD,
-            ),
+            f"DELETE FROM manual_compactions WHERE attempt_id IN ({placeholders})",
+            tuple(chunk),
         )
-        return
-    conn.execute(
-        "DELETE FROM manual_compactions AS doomed "
-        "WHERE doomed.state IN ('cancelled', 'failed') "
-        "AND (doomed.finished_at <= ? OR doomed.attempt_id NOT IN ("
-        "SELECT kept.attempt_id FROM manual_compactions AS kept "
-        "WHERE kept.thread_id = doomed.thread_id "
-        "AND kept.state IN ('cancelled', 'failed') "
-        "ORDER BY kept.finished_at DESC, kept.created_at DESC, kept.attempt_id DESC LIMIT ?))",
-        (terminal_cutoff, MAX_MANUAL_COMPACTION_TERMINAL_ATTEMPTS_PER_THREAD),
-    )
 
 
-def reconcile_all_manual_compaction_attempts_in_connection(conn, *, now: int | None = None) -> None:
+def reconcile_all_manual_compaction_attempts_in_connection(
+    conn,
+    *,
+    now: int | None = None,
+    process_restart: bool = False,
+) -> None:
     """Idempotently expire and bound durable attempts for every thread."""
+    current = int(time.time() * 1000) if now is None else now
+    if process_restart:
+        running = conn.execute(
+            "SELECT attempt_id FROM manual_compactions WHERE state = 'running'"
+        ).fetchall()
+        for row in running:
+            _terminalize_attempt(
+                conn,
+                str(row["attempt_id"]),
+                current,
+                state = "failed",
+                reason = "inference_failed",
+                allowed_states = ("running",),
+            )
     _cleanup_manual_compaction_attempts(
         conn,
         None,
-        int(time.time() * 1000) if now is None else now,
+        current,
     )
 
 
@@ -1697,6 +2120,304 @@ def fail_manual_compaction_attempt(
         conn.close()
 
 
+def bind_manual_compaction_command(
+    thread_id: str,
+    *,
+    attempt_id: str,
+    command_message_id: str,
+    summary_message_id: str,
+    attempt_sequence: int,
+    expected_attempt_id: str | None = None,
+    expected_attempt_sequence: int | None = None,
+) -> dict[str, Any]:
+    """CAS the client-owned identity before prepare can create server state."""
+    thread_id = _bounded_id(thread_id, "thread id")
+    attempt_id = _bounded_id(attempt_id, "attempt id")
+    command_message_id = _bounded_id(command_message_id, "command message id")
+    summary_message_id = _bounded_id(summary_message_id, "summary message id")
+    if summary_message_id == command_message_id:
+        raise ManualCompactionError("summary message id must differ from the command message id")
+    if (
+        not isinstance(attempt_sequence, int)
+        or isinstance(attempt_sequence, bool)
+        or attempt_sequence < 1
+        or attempt_sequence > 2**53 - 1
+    ):
+        raise ManualCompactionError("attempt sequence must be a positive safe integer")
+    if (expected_attempt_id is None) != (expected_attempt_sequence is None):
+        raise ManualCompactionError(
+            "expected attempt id and sequence must both be present or both be absent"
+        )
+    if expected_attempt_id is not None:
+        expected_attempt_id = _bounded_id(expected_attempt_id, "expected attempt id")
+        if (
+            not isinstance(expected_attempt_sequence, int)
+            or isinstance(expected_attempt_sequence, bool)
+            or expected_attempt_sequence < 1
+            or expected_attempt_sequence > 2**53 - 1
+        ):
+            raise ManualCompactionError("expected attempt sequence must be a positive safe integer")
+
+    candidate = {
+        "schemaVersion": MANUAL_COMPACTION_SCHEMA_VERSION,
+        "state": "bound",
+        "threadId": thread_id,
+        "commandMessageId": command_message_id,
+        "attemptId": attempt_id,
+        "summaryMessageId": summary_message_id,
+        "attemptSequence": attempt_sequence,
+        "expectedHeadMessageId": command_message_id,
+    }
+    conn = _db().get_connection()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = int(time.time() * 1000)
+        terminalized_pending = False
+        _cleanup_manual_compaction_attempts(conn, thread_id, now)
+        branch = _complete_command_branch(conn, thread_id, command_message_id)
+        command = branch[-1]
+        if not _literal_compact(command):
+            raise ManualCompactionConflict("The fenced command must be the literal /compact")
+        current = _manual_compaction_client_record(command)
+        if current is not None and _client_record_identity(current) == _client_record_identity(
+            candidate
+        ):
+            _reserve_manual_compaction_attempt(conn, current, created_at = now)
+            conn.commit()
+            return command
+
+        _require_branch_lifecycle_quiescent(conn, thread_id, branch)
+
+        if current is None:
+            if expected_attempt_id is not None or attempt_sequence != 1:
+                raise ManualCompactionConflict("The /compact command binding CAS is stale")
+        else:
+            if (
+                current["attemptId"] != expected_attempt_id
+                or current["attemptSequence"] != expected_attempt_sequence
+                or attempt_sequence != current["attemptSequence"] + 1
+                or attempt_id == current["attemptId"]
+            ):
+                raise ManualCompactionConflict("The /compact command binding CAS is stale")
+            attempt_row = conn.execute(
+                "SELECT * FROM manual_compactions WHERE attempt_id = ?",
+                (current["attemptId"],),
+            ).fetchone()
+            if attempt_row is None:
+                raise ManualCompactionConflict(
+                    "The bound /compact attempt must be recovered before it can be replaced"
+                )
+            current_attempt = _attempt_from_row(attempt_row)
+            if (
+                current_attempt["threadId"] != thread_id
+                or current_attempt["commandMessageId"] != command_message_id
+            ):
+                raise ManualCompactionConflict("Stored /compact binding authority is inconsistent")
+            if current_attempt["state"] == "pending" and not _pending_attempt_is_valid(
+                conn, current_attempt
+            ):
+                now = int(time.time() * 1000)
+                if not _terminalize_attempt(
+                    conn,
+                    current_attempt["attemptId"],
+                    now,
+                    state = "failed",
+                    reason = "prepare_invalidated",
+                    allowed_states = ("pending",),
+                ):
+                    raise ManualCompactionConflict(
+                        "The invalidated /compact attempt changed during replacement"
+                    )
+                terminalized_pending = True
+                current_attempt = _attempt_from_row(
+                    conn.execute(
+                        "SELECT * FROM manual_compactions WHERE attempt_id = ?",
+                        (current_attempt["attemptId"],),
+                    ).fetchone()
+                )
+            if current_attempt["state"] not in ("cancelled", "failed"):
+                raise ManualCompactionConflict(
+                    "A live /compact attempt cannot be replaced through command metadata"
+                )
+            command_hash_state = current_attempt.get("commandHashState")
+            if command_hash_state not in ("prepared", "summary_saved"):
+                raise ManualCompactionConflict(
+                    "The terminal /compact command has no proven command digest"
+                )
+            _require_command_hash(current_attempt, command, state = command_hash_state)
+            source = branch[:-1]
+            if (
+                not source
+                or source[-1]["id"] != current_attempt["sourceHeadMessageId"]
+                or current_attempt["expectedHeadMessageId"] != command_message_id
+                or canonical_source_hash(source) != current_attempt["sourceHash"]
+            ):
+                raise ManualCompactionConflict(
+                    "The terminal /compact command ancestry changed before replacement"
+                )
+            _reserve_manual_compaction_attempt(
+                conn, current, created_at = current_attempt["createdAt"]
+            )
+
+        incoming_attempt = conn.execute(
+            "SELECT thread_id, command_message_id FROM manual_compactions WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        if incoming_attempt is not None:
+            raise ManualCompactionConflict("Attempt id is already used for another binding")
+        child = conn.execute(
+            "SELECT id FROM chat_messages WHERE thread_id = ? AND parent_id = ? LIMIT 1",
+            (thread_id, command_message_id),
+        ).fetchone()
+        if child is not None:
+            if terminalized_pending:
+                conn.commit()
+            raise ManualCompactionConflict("The /compact command is no longer the branch head")
+        reserved_summary = conn.execute(
+            "SELECT thread_id, parent_id FROM chat_messages WHERE id = ?",
+            (summary_message_id,),
+        ).fetchone()
+        if reserved_summary is not None:
+            raise ManualCompactionConflict("Summary message id is already in use")
+        _reserve_manual_compaction_attempt(conn, candidate, created_at = now)
+        updated = _write_manual_compaction_client_record(conn, command, candidate)
+        conn.commit()
+        return updated
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def _pending_attempt_is_valid(conn, attempt: dict[str, Any]) -> bool:
+    try:
+        source_ids = list(attempt["sourceMessageIds"])
+        branch = _exact_branch(
+            conn,
+            attempt["threadId"],
+            [*source_ids, attempt["commandMessageId"]],
+            attempt["expectedHeadMessageId"],
+        )
+        command = branch[-1]
+        if not _literal_compact(command):
+            return False
+        if canonical_source_hash(branch[:-1]) != attempt["sourceHash"]:
+            return False
+        if _next_branch_revision(conn, attempt["threadId"], branch[:-1]) != attempt["revision"]:
+            return False
+        child = conn.execute(
+            "SELECT id FROM chat_messages WHERE thread_id = ? AND parent_id = ? LIMIT 1",
+            (attempt["threadId"], attempt["commandMessageId"]),
+        ).fetchone()
+        if child is not None:
+            return False
+        _recheck_project_context(conn, attempt["threadId"], attempt)
+        effective = _effective_branch(conn, attempt["threadId"], branch[:-1], command)
+        if [message["id"] for message in effective[:-1]] != attempt["effectiveSourceMessageIds"]:
+            return False
+        archive_payload, _archive_json, archive_payload_hash = _archive_payload(effective)
+        return (
+            archive_payload == attempt["archivePayload"]
+            and archive_payload_hash == attempt["archivePayloadHash"]
+        )
+    except ManualCompactionError:
+        return False
+
+
+def _manual_compaction_envelope(attempt: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "attemptId": attempt["attemptId"],
+        "threadId": attempt["threadId"],
+        "commandMessageId": attempt["commandMessageId"],
+        "expectedHeadMessageId": attempt["expectedHeadMessageId"],
+        "sourceHash": attempt["sourceHash"],
+        "requestHash": attempt["requestHash"],
+        "requestMessageCount": attempt["requestMessageCount"],
+        "projectInstructionDigest": attempt["projectInstructionDigest"],
+        "projectInstructionRevision": attempt["projectInstructionRevision"],
+        "contextDigest": attempt["contextDigest"],
+        "revision": attempt["revision"],
+    }
+
+
+def _canonical_command_hash(command: dict[str, Any], *, state: str) -> str:
+    try:
+        return _db().canonical_chat_message_hash(command, state = state)
+    except (KeyError, TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ManualCompactionConflict(
+            "Stored /compact command cannot be hashed canonically"
+        ) from exc
+
+
+def _require_command_hash(attempt: dict[str, Any], command: dict[str, Any], *, state: str) -> None:
+    if attempt.get("commandHashState") != state:
+        raise ManualCompactionConflict("The /compact command hash state is stale")
+    if not hmac.compare_digest(
+        str(attempt.get("commandHash") or ""), _canonical_command_hash(command, state = state)
+    ):
+        raise ManualCompactionConflict("The /compact command changed after prepare")
+
+
+def _advance_prepared_client_record(
+    conn, command: dict[str, Any], attempt: dict[str, Any]
+) -> dict[str, Any]:
+    current = _manual_compaction_client_record(command)
+    if current is None or (
+        current["threadId"] != attempt["threadId"]
+        or current["commandMessageId"] != attempt["commandMessageId"]
+        or current["attemptId"] != attempt["attemptId"]
+    ):
+        raise ManualCompactionConflict("The /compact command binding changed before prepare")
+    if current["state"] not in ("bound", "prepared"):
+        raise ManualCompactionConflict("The /compact command is not in a preparable state")
+    prepared = {key: current[key] for key in _CLIENT_BASE_KEYS if key != "state"}
+    prepared.update(
+        {
+            "state": "prepared",
+            "sourceHeadMessageId": attempt["sourceHeadMessageId"],
+            "envelope": _manual_compaction_envelope(attempt),
+        }
+    )
+    if current["state"] == "prepared":
+        if current != prepared:
+            raise ManualCompactionConflict("Stored /compact prepared metadata is inconsistent")
+        return command
+    return _write_manual_compaction_client_record(conn, command, prepared)
+
+
+def _advance_summary_saved_client_record(
+    conn,
+    command: dict[str, Any],
+    attempt: dict[str, Any],
+    *,
+    summary_message_id: str,
+    summary_hash: str,
+) -> dict[str, Any]:
+    current = _manual_compaction_client_record(command)
+    if current is None or (
+        current["threadId"] != attempt["threadId"]
+        or current["commandMessageId"] != attempt["commandMessageId"]
+        or current["attemptId"] != attempt["attemptId"]
+        or current["summaryMessageId"] != summary_message_id
+    ):
+        raise ManualCompactionConflict("The /compact command binding changed before commit")
+    saved = {
+        **{key: current[key] for key in _CLIENT_BASE_KEYS if key != "state"},
+        "state": "summary_saved",
+        "sourceHeadMessageId": attempt["sourceHeadMessageId"],
+        "envelope": _manual_compaction_envelope(attempt),
+        "summaryHash": summary_hash,
+    }
+    if current["state"] == "summary_saved":
+        if current != saved:
+            raise ManualCompactionConflict("Stored /compact summary metadata is inconsistent")
+        return command
+    if current["state"] != "prepared":
+        raise ManualCompactionConflict("The /compact command is not prepared for commit")
+    return _write_manual_compaction_client_record(conn, command, saved)
+
+
 def prepare_manual_compaction(
     thread_id: str,
     *,
@@ -1724,6 +2445,18 @@ def prepare_manual_compaction(
         command = branch[-1]
         if command["id"] != command_message_id or not _literal_compact(command):
             raise ManualCompactionConflict("The branch head must be the literal /compact command")
+        binding = _manual_compaction_client_record(command)
+        if binding is None or (
+            binding["threadId"] != thread_id
+            or binding["commandMessageId"] != command_message_id
+            or binding["attemptId"] != attempt_id
+            or binding["expectedHeadMessageId"] != expected_head_message_id
+            or binding["state"] not in ("bound", "prepared")
+        ):
+            raise ManualCompactionConflict(
+                "The /compact command must be fenced to this attempt before prepare"
+            )
+        _require_manual_compaction_attempt_reservation(conn, binding)
         child = conn.execute(
             "SELECT id FROM chat_messages WHERE thread_id = ? AND parent_id = ? LIMIT 1",
             (thread_id, command_message_id),
@@ -1802,6 +2535,8 @@ def prepare_manual_compaction(
                 raise ManualCompactionConflict(
                     "Manual compaction attempt is terminal; prepare a new attempt id"
                 )
+            prepared_command = _advance_prepared_client_record(conn, command, stored)
+            _require_command_hash(stored, prepared_command, state = "prepared")
             conn.commit()
             return stored
         occupied = conn.execute(
@@ -1824,6 +2559,31 @@ def prepare_manual_compaction(
                 raise ManualCompactionConflict(
                     "This /compact branch already has a running or active attempt"
                 )
+        result = {
+            **candidate,
+            "state": "pending",
+            "summaryMessageId": None,
+            "summaryHash": None,
+            "outputSummaryHash": None,
+            "outputFinishReason": None,
+            "outputRecordedAt": None,
+            "archiveStatus": "pending",
+            "createdAt": now,
+            "startedAt": None,
+            "leaseExpiresAt": None,
+            "cancelledAt": None,
+            "committedAt": None,
+            "terminalReason": None,
+            "finishedAt": None,
+        }
+        prepared_command = _advance_prepared_client_record(conn, command, result)
+        command_hash = _canonical_command_hash(prepared_command, state = "prepared")
+        result.update(
+            {
+                "commandHash": command_hash,
+                "commandHashState": "prepared",
+            }
+        )
         conn.execute(
             """
             INSERT INTO manual_compactions (
@@ -1832,8 +2592,10 @@ def prepare_manual_compaction(
                 effective_source_message_ids_json, source_hash, request_hash,
                 request_message_count, project_instruction_digest,
                 project_instruction_revision, context_digest, archive_payload_json,
-                archive_payload_hash, revision, state, archive_status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending', ?)
+                archive_payload_hash, revision, state, command_hash, command_hash_state,
+                archive_status, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?,
+                'prepared', 'pending', ?)
             """,
             (
                 attempt_id,
@@ -1852,27 +2614,12 @@ def prepare_manual_compaction(
                 archive_payload_json,
                 archive_payload_hash,
                 revision,
+                command_hash,
                 now,
             ),
         )
         conn.commit()
-        return {
-            **candidate,
-            "state": "pending",
-            "summaryMessageId": None,
-            "summaryHash": None,
-            "outputSummaryHash": None,
-            "outputFinishReason": None,
-            "outputRecordedAt": None,
-            "archiveStatus": "pending",
-            "createdAt": now,
-            "startedAt": None,
-            "leaseExpiresAt": None,
-            "cancelledAt": None,
-            "committedAt": None,
-            "terminalReason": None,
-            "finishedAt": None,
-        }
+        return result
     except Exception:
         conn.rollback()
         raise
@@ -2025,6 +2772,9 @@ def _stored_studio_tool_history(branch: Iterable[dict[str, Any]]) -> bool | None
 
 
 def _rewrite_claimed_payload(payload: Any, *, studio_tool_history: bool | None = None) -> None:
+    # The claim secret and durable envelope terminate at this security boundary.
+    # Downstream providers receive only the rewritten handoff request.
+    payload.manual_compaction = None
     payload.messages[-1].content = MANUAL_COMPACTION_HANDOFF_INSTRUCTION
     payload.tools = None
     payload.tool_choice = "none"
@@ -2084,6 +2834,7 @@ def validate_and_rewrite_manual_compaction_request(payload: Any) -> dict[str, An
         return None
     envelope = _envelope_dict(envelope_value)
     attempt_id = _bounded_id(envelope.get("attemptId", ""), "attempt id")
+    claim_token_hash = _claim_token_hash(envelope.get("claimId"))
     request_encoded, request_branch = _canonical_request(getattr(payload, "messages", []))
     now = int(time.time() * 1000)
     conn = _db().get_connection()
@@ -2158,13 +2909,36 @@ def validate_and_rewrite_manual_compaction_request(payload: Any) -> dict[str, An
             raise ManualCompactionConflict(
                 "Manual compaction branch revision changed after prepare"
             )
-        if not _literal_compact(branch[-1]):
+        command = branch[-1]
+        if not _literal_compact(command):
             raise ManualCompactionConflict("The prepared /compact command changed")
+        command_binding = _manual_compaction_client_record(command)
+        if command_binding is None or (
+            command_binding["threadId"] != attempt["threadId"]
+            or command_binding["commandMessageId"] != attempt["commandMessageId"]
+            or command_binding["attemptId"] != attempt_id
+            or command_binding["state"] != "prepared"
+        ):
+            raise ManualCompactionConflict("The prepared /compact command binding changed")
+        _require_manual_compaction_attempt_reservation(conn, command_binding)
+        _require_command_hash(attempt, command, state = "prepared")
         child = conn.execute(
             "SELECT id FROM chat_messages WHERE thread_id = ? AND parent_id = ? LIMIT 1",
             (attempt["threadId"], attempt["commandMessageId"]),
         ).fetchone()
         if child is not None:
+            if not _terminalize_attempt(
+                conn,
+                attempt_id,
+                now,
+                state = "failed",
+                reason = "prepare_invalidated",
+                allowed_states = ("pending",),
+            ):
+                raise ManualCompactionConflict(
+                    "The invalidated /compact attempt changed during claim"
+                )
+            conn.commit()
             raise ManualCompactionConflict(
                 "The prepared /compact command is no longer the branch head"
             )
@@ -2189,9 +2963,9 @@ def validate_and_rewrite_manual_compaction_request(payload: Any) -> dict[str, An
         lease_expires_at = now + MANUAL_COMPACTION_LEASE_MS
         changed = conn.execute(
             "UPDATE manual_compactions SET state = 'running', started_at = ?, "
-            "lease_expires_at = ?, cancelled_at = NULL "
+            "lease_expires_at = ?, cancelled_at = NULL, claim_token_hash = ? "
             "WHERE attempt_id = ? AND state = 'pending'",
-            (now, lease_expires_at, attempt_id),
+            (now, lease_expires_at, claim_token_hash, attempt_id),
         ).rowcount
         if changed != 1:
             raise ManualCompactionConflict("Manual compaction inference claim was lost")
@@ -2297,12 +3071,13 @@ def summary_hash(text: str) -> str:
 
 
 def cancel_manual_compaction(
-    thread_id: str, *, attempt_id: str, command_message_id: str
+    thread_id: str, *, attempt_id: str, command_message_id: str, claim_id: str
 ) -> dict[str, Any]:
-    """Cancel an uncommitted attempt so the branch can be prepared again."""
+    """Cancel only the running inference request that owns the claim secret."""
     thread_id = _bounded_id(thread_id, "thread id")
     attempt_id = _bounded_id(attempt_id, "attempt id")
     command_message_id = _bounded_id(command_message_id, "command message id")
+    candidate_claim_hash = _claim_token_hash(claim_id)
     conn = _db().get_connection()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -2315,11 +3090,38 @@ def cancel_manual_compaction(
         attempt = _attempt_from_row(row)
         if attempt["threadId"] != thread_id or attempt["commandMessageId"] != command_message_id:
             raise ManualCompactionConflict("Manual compaction cancellation is stale")
+        command_row = conn.execute(
+            "SELECT * FROM chat_messages WHERE thread_id = ? AND id = ?",
+            (thread_id, command_message_id),
+        ).fetchone()
+        if command_row is None:
+            raise ManualCompactionConflict("The /compact command is missing during cancellation")
+        command_binding = _manual_compaction_client_record(_message_dict(command_row))
+        if command_binding is None or (
+            command_binding["threadId"] != thread_id
+            or command_binding["commandMessageId"] != command_message_id
+            or command_binding["attemptId"] != attempt_id
+        ):
+            raise ManualCompactionConflict("Manual compaction cancellation binding is stale")
+        _require_manual_compaction_attempt_reservation(conn, command_binding)
         if attempt["state"] == "active":
             raise ManualCompactionConflict("An active manual compaction cannot be cancelled")
+        stored_claim_hash = row["claim_token_hash"]
+        if not (
+            isinstance(stored_claim_hash, str)
+            and _SHA256_RE.fullmatch(stored_claim_hash) is not None
+            and hmac.compare_digest(stored_claim_hash, candidate_claim_hash)
+        ):
+            raise ManualCompactionConflict(
+                "Manual compaction cancellation is not owned by this inference request"
+            )
         if attempt["state"] in ("cancelled", "failed"):
             conn.commit()
             return attempt
+        if attempt["state"] != "running":
+            raise ManualCompactionConflict(
+                "A pending manual compaction cannot be cancelled without an inference claim"
+            )
         now = int(time.time() * 1000)
         _cancel_attempt(conn, attempt_id, now)
         updated = conn.execute(
@@ -2432,6 +3234,22 @@ def commit_manual_compaction(
         summary = branch[-1]
         if command["id"] != command_message_id or not _literal_compact(command):
             raise ManualCompactionConflict("The literal /compact command changed before commit")
+        command_binding = _manual_compaction_client_record(command)
+        expected_binding_state = "summary_saved" if active else "prepared"
+        if command_binding is None or (
+            command_binding["threadId"] != thread_id
+            or command_binding["commandMessageId"] != command_message_id
+            or command_binding["attemptId"] != attempt_id
+            or command_binding["summaryMessageId"] != summary_message_id
+            or command_binding["state"] != expected_binding_state
+        ):
+            raise ManualCompactionConflict("The /compact command binding changed before commit")
+        _require_manual_compaction_attempt_reservation(conn, command_binding)
+        _require_command_hash(
+            attempt,
+            command,
+            state = "summary_saved" if active else "prepared",
+        )
         if summary.get("parentId") != command_message_id:
             raise ManualCompactionConflict("Manual compaction summary is not the command child")
         current_source_hash = canonical_source_hash(branch[:-2])
@@ -2493,6 +3311,14 @@ def commit_manual_compaction(
                 raise ManualCompactionConflict(
                     "Stored manual compaction metadata changed after commit"
                 )
+            saved_command = _advance_summary_saved_client_record(
+                conn,
+                command,
+                attempt,
+                summary_message_id = summary_message_id,
+                summary_hash = actual_summary_hash,
+            )
+            _require_command_hash(attempt, saved_command, state = "summary_saved")
             conn.commit()
             if attempt["archiveStatus"] in ("pending", "failed"):
                 return attempt
@@ -2531,14 +3357,30 @@ def commit_manual_compaction(
                 summary_message_id,
             ),
         )
+        saved_command = _advance_summary_saved_client_record(
+            conn,
+            command,
+            attempt,
+            summary_message_id = summary_message_id,
+            summary_hash = actual_summary_hash,
+        )
+        saved_command_hash = _canonical_command_hash(saved_command, state = "summary_saved")
         changed = conn.execute(
             """
             UPDATE manual_compactions
             SET state = 'active', summary_message_id = ?, summary_hash = ?,
-                lease_expires_at = NULL, committed_at = ?
+                command_hash = ?, command_hash_state = 'summary_saved',
+                lease_expires_at = NULL, claim_token_hash = NULL, committed_at = ?
             WHERE attempt_id = ? AND state = 'running' AND revision = ?
             """,
-            (summary_message_id, actual_summary_hash, now, attempt_id, expected_revision),
+            (
+                summary_message_id,
+                actual_summary_hash,
+                saved_command_hash,
+                now,
+                attempt_id,
+                expected_revision,
+            ),
         ).rowcount
         if changed != 1:
             raise ManualCompactionConflict("Manual compaction commit lost its revision race")
@@ -2548,6 +3390,8 @@ def commit_manual_compaction(
             "state": "active",
             "summaryMessageId": summary_message_id,
             "summaryHash": actual_summary_hash,
+            "commandHash": saved_command_hash,
+            "commandHashState": "summary_saved",
             "leaseExpiresAt": None,
             "committedAt": now,
         }
@@ -2623,56 +3467,199 @@ def archive_manual_compaction_best_effort(result: dict[str, Any]) -> str:
 
 
 def rewrite_forked_manual_compaction_metadata(
-    *, source_rows: list[Any], id_map: dict[str, str], new_thread_id: str
+    *, conn, source_rows: list[Any], id_map: dict[str, str], new_thread_id: str
 ) -> dict[str, str]:
-    """Return rewritten metadata JSON by old message id for active summaries in a fork."""
+    """Strip source authority and restore only complete, proven active checkpoints."""
     source_messages = [_message_dict(row) for row in source_rows]
     cloned: list[dict[str, Any]] = []
-    for message in source_messages:
-        cloned.append(
-            {
-                **message,
-                "id": id_map[message["id"]],
-                "threadId": new_thread_id,
-                "parentId": id_map.get(message.get("parentId")),
-            }
-        )
     rewritten: dict[str, str] = {}
+    for message in source_messages:
+        metadata = message.get("metadata")
+        next_metadata = dict(metadata) if isinstance(metadata, dict) else None
+        had_authority = False
+        if isinstance(next_metadata, dict):
+            for key in (MANUAL_COMPACTION_CLIENT_KEY, "manualCompaction"):
+                if key in next_metadata:
+                    had_authority = True
+                    next_metadata.pop(key, None)
+        cloned_message = {
+            **message,
+            "id": id_map[message["id"]],
+            "threadId": new_thread_id,
+            "parentId": (
+                message.get("parentId")
+                if message.get("parentId") in (None, "")
+                else id_map.get(message.get("parentId"))
+            ),
+            "metadata": next_metadata,
+        }
+        cloned.append(cloned_message)
+        if had_authority:
+            rewritten[message["id"]] = _strict_json_dumps(next_metadata)
+
+    active_keys = {
+        "schemaVersion",
+        "state",
+        "attemptId",
+        "threadId",
+        "revision",
+        "commandMessageId",
+        "sourceHeadMessageId",
+        "summaryMessageId",
+        "sourceHash",
+        "requestHash",
+        "requestMessageCount",
+        "projectInstructionDigest",
+        "projectInstructionRevision",
+        "contextDigest",
+        "archivePayloadHash",
+        "outputSummaryHash",
+        "outputFinishReason",
+        "summaryHash",
+    }
     for index, message in enumerate(source_messages):
         metadata = message.get("metadata")
         raw = metadata.get("manualCompaction") if isinstance(metadata, dict) else None
-        if not isinstance(raw, dict) or raw.get("state") != "active":
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != active_keys
+            or raw.get("schemaVersion") != MANUAL_COMPACTION_SCHEMA_VERSION
+            or raw.get("state") != "active"
+            or index < 2
+        ):
             continue
         summary_old = message["id"]
         source_head_old = raw.get("sourceHeadMessageId")
         command_old = raw.get("commandMessageId")
-        if source_head_old not in id_map or command_old not in id_map:
-            raise ManualCompactionConflict("Forked compaction metadata points outside its ancestry")
-        source_index = next(
-            (
-                i
-                for i, candidate in enumerate(source_messages[:index])
-                if candidate["id"] == source_head_old
-            ),
-            None,
+        command_index = index - 1
+        command_message = source_messages[command_index]
+        if (
+            command_old not in id_map
+            or source_head_old not in id_map
+            or command_message["id"] != command_old
+            or message.get("parentId") != command_old
+            or source_messages[command_index - 1]["id"] != source_head_old
+        ):
+            continue
+        try:
+            client = _manual_compaction_client_record(command_message)
+            old_attempt_row = conn.execute(
+                "SELECT * FROM manual_compactions WHERE attempt_id = ? AND state = 'active'",
+                (raw.get("attemptId"),),
+            ).fetchone()
+            if client is None or old_attempt_row is None:
+                continue
+            old_attempt = _attempt_from_row(old_attempt_row)
+            source_ids = [candidate["id"] for candidate in source_messages[:command_index]]
+            if (
+                client["state"] != "summary_saved"
+                or client["attemptId"] != raw.get("attemptId")
+                or client["summaryMessageId"] != summary_old
+                or client["summaryHash"] != raw.get("summaryHash")
+                or old_attempt["threadId"] != message["threadId"]
+                or old_attempt["commandMessageId"] != command_old
+                or old_attempt["sourceHeadMessageId"] != source_head_old
+                or old_attempt["expectedHeadMessageId"] != command_old
+                or old_attempt["summaryMessageId"] != summary_old
+                or old_attempt["sourceMessageIds"] != source_ids
+                or not all(
+                    source_id in id_map for source_id in old_attempt["effectiveSourceMessageIds"]
+                )
+            ):
+                continue
+            source_hash = canonical_source_hash(source_messages[:command_index])
+            _text, _content_json, stored_summary_hash = _strict_summary(message, active = True)
+            effective = _effective_branch(
+                conn,
+                message["threadId"],
+                source_messages[:command_index],
+                command_message,
+            )
+            archive_payload, _archive_json, archive_payload_hash = _archive_payload(effective)
+            if (
+                source_hash != old_attempt["sourceHash"]
+                or stored_summary_hash != raw.get("summaryHash")
+                or [candidate["id"] for candidate in effective[:-1]]
+                != old_attempt["effectiveSourceMessageIds"]
+                or archive_payload != old_attempt["archivePayload"]
+                or archive_payload_hash != old_attempt["archivePayloadHash"]
+            ):
+                continue
+            expected_active = {
+                "schemaVersion": MANUAL_COMPACTION_SCHEMA_VERSION,
+                "state": "active",
+                "attemptId": old_attempt["attemptId"],
+                "threadId": old_attempt["threadId"],
+                "revision": old_attempt["revision"],
+                "commandMessageId": old_attempt["commandMessageId"],
+                "sourceHeadMessageId": old_attempt["sourceHeadMessageId"],
+                "summaryMessageId": old_attempt["summaryMessageId"],
+                "sourceHash": old_attempt["sourceHash"],
+                "requestHash": old_attempt["requestHash"],
+                "requestMessageCount": old_attempt["requestMessageCount"],
+                "projectInstructionDigest": old_attempt["projectInstructionDigest"],
+                "projectInstructionRevision": old_attempt["projectInstructionRevision"],
+                "contextDigest": old_attempt["contextDigest"],
+                "archivePayloadHash": old_attempt["archivePayloadHash"],
+                "outputSummaryHash": old_attempt["outputSummaryHash"],
+                "outputFinishReason": old_attempt["outputFinishReason"],
+                "summaryHash": old_attempt["summaryHash"],
+            }
+            if raw != expected_active:
+                continue
+            _require_command_hash(old_attempt, command_message, state = "summary_saved")
+        except ManualCompactionError:
+            continue
+
+        next_attempt_id = (
+            "fork-"
+            + hashlib.sha256(
+                f"{new_thread_id}\0{raw.get('attemptId', '')}\0{id_map[summary_old]}".encode()
+            ).hexdigest()[:32]
         )
-        if source_index is None:
-            raise ManualCompactionConflict("Forked compaction source head is not an ancestor")
+        next_source_hash = canonical_source_hash(cloned[:command_index])
         next_raw = dict(raw)
         next_raw.update(
             {
-                "attemptId": "fork-"
-                + hashlib.sha256(
-                    f"{new_thread_id}\0{raw.get('attemptId', '')}\0{id_map[summary_old]}".encode()
-                ).hexdigest()[:32],
+                "attemptId": next_attempt_id,
                 "threadId": new_thread_id,
                 "commandMessageId": id_map[command_old],
                 "sourceHeadMessageId": id_map[source_head_old],
                 "summaryMessageId": id_map[summary_old],
-                "sourceHash": canonical_source_hash(cloned[: source_index + 1]),
+                "sourceHash": next_source_hash,
             }
         )
         next_metadata = dict(metadata)
         next_metadata["manualCompaction"] = next_raw
+        cloned[index]["metadata"] = next_metadata
         rewritten[summary_old] = _strict_json_dumps(next_metadata)
+
+        next_envelope = dict(client["envelope"])
+        next_envelope.update(
+            {
+                "attemptId": next_attempt_id,
+                "threadId": new_thread_id,
+                "commandMessageId": id_map[command_old],
+                "expectedHeadMessageId": id_map[command_old],
+                "sourceHash": next_source_hash,
+            }
+        )
+        next_client = dict(client)
+        next_client.update(
+            {
+                "threadId": new_thread_id,
+                "commandMessageId": id_map[command_old],
+                "attemptId": next_attempt_id,
+                "summaryMessageId": id_map[summary_old],
+                "attemptSequence": 1,
+                "expectedHeadMessageId": id_map[command_old],
+                "sourceHeadMessageId": id_map[source_head_old],
+                "envelope": next_envelope,
+            }
+        )
+        command_metadata = dict(command_message.get("metadata") or {})
+        command_metadata.pop("manualCompaction", None)
+        command_metadata[MANUAL_COMPACTION_CLIENT_KEY] = next_client
+        cloned[command_index]["metadata"] = command_metadata
+        rewritten[command_old] = _strict_json_dumps(command_metadata)
     return rewritten

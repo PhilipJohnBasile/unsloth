@@ -1127,14 +1127,14 @@ def test_a_corrupt_self_link_resolves_to_the_root_rather_than_itself(tmp_path, m
 
 
 def test_an_empty_stored_parent_reads_as_the_root(tmp_path, monkeypatch):
-    # parent_id is nullable, so '' is only reachable through a direct writer, but the helper and
-    # the caller's `or None` normalization must agree about it either way.
+    # Both values terminate ancestry, but a protected-row comparison must retain the exact stored
+    # representation so a stale NULL/empty rewrite cannot pass as a no-op.
     _, messages = _research_thread(tmp_path, monkeypatch)
     conn = studio_db.get_connection()
     try:
         conn.execute("UPDATE chat_messages SET parent_id = '' WHERE id = 'a0'")
         conn.commit()
-        assert studio_db._surviving_parent_id(conn, "src", "a0", set()) is None
+        assert studio_db._surviving_parent_id(conn, "src", "a0", set()) == ""
     finally:
         conn.close()
 

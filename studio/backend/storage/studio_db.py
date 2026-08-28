@@ -128,6 +128,9 @@ _MANUAL_COMPACTION_REQUIRED_COLUMNS = {
     "output_recorded_at",
     "revision",
     "state",
+    "command_hash",
+    "command_hash_state",
+    "claim_token_hash",
     "summary_message_id",
     "summary_hash",
     "archive_status",
@@ -141,14 +144,39 @@ _MANUAL_COMPACTION_REQUIRED_COLUMNS = {
 }
 _MANUAL_COMPACTION_STATE_CHECK = "check(statein('pending','running','active','cancelled','failed'))"
 _MANUAL_COMPACTION_LIFECYCLE_CHECK = (
-    "check((state='pending'andstarted_atisnullandlease_expires_atisnull)"
-    "or(state='running'andstarted_atisnotnullandlease_expires_atisnotnull)"
-    "orstatein('active','cancelled','failed'))"
+    "check((state='pending'andstarted_atisnullandlease_expires_atisnull"
+    "andclaim_token_hashisnull)"
+    "or(state='running'andstarted_atisnotnullandlease_expires_atisnotnull"
+    "andclaim_token_hashisnotnull)"
+    "or(state='active'andclaim_token_hashisnull)"
+    "orstatein('cancelled','failed'))"
+)
+_MANUAL_COMPACTION_COMMAND_HASH_CHECK = (
+    "check((statein('pending','running')andcommand_hashisnotnull"
+    "andlength(command_hash)=64andcommand_hashnotglob'*[^0-9a-f]*'"
+    "andcommand_hash_state='prepared')"
+    "or(state='active'andcommand_hashisnotnullandlength(command_hash)=64"
+    "andcommand_hashnotglob'*[^0-9a-f]*'andcommand_hash_state='summary_saved')"
+    "or(statein('cancelled','failed')and((command_hashisnullandcommand_hash_stateisnull)"
+    "or(command_hashisnotnullandlength(command_hash)=64"
+    "andcommand_hashnotglob'*[^0-9a-f]*'"
+    "andcommand_hash_statein('prepared','summary_saved')))))"
 )
 _MANUAL_COMPACTION_SUPPORTED_CHECKS = (
     _MANUAL_COMPACTION_STATE_CHECK,
     _MANUAL_COMPACTION_LIFECYCLE_CHECK,
+    _MANUAL_COMPACTION_COMMAND_HASH_CHECK,
 )
+_MANUAL_COMPACTION_RESERVATION_REQUIRED_COLUMNS = {
+    "attempt_id",
+    "thread_id",
+    "command_message_id",
+    "summary_message_id",
+    "attempt_sequence",
+    "created_at",
+    "retired_at",
+}
+_MANUAL_COMPACTION_RESERVATION_RETIRE_TRIGGER = "retire_manual_compaction_attempt_reservations"
 
 
 def _quoted_sql_identifier(value: str) -> str:
@@ -225,6 +253,9 @@ def _create_manual_compactions_table(conn: sqlite3.Connection) -> None:
             revision INTEGER NOT NULL,
             state TEXT NOT NULL
                 CHECK(state IN ('pending', 'running', 'active', 'cancelled', 'failed')),
+            command_hash TEXT,
+            command_hash_state TEXT,
+            claim_token_hash TEXT,
             summary_message_id TEXT,
             summary_hash TEXT,
             archive_status TEXT NOT NULL DEFAULT 'pending',
@@ -236,19 +267,579 @@ def _create_manual_compactions_table(conn: sqlite3.Connection) -> None:
             terminal_reason TEXT,
             finished_at INTEGER,
             CHECK(
-                (state = 'pending' AND started_at IS NULL AND lease_expires_at IS NULL)
-                OR (state = 'running' AND started_at IS NOT NULL AND lease_expires_at IS NOT NULL)
-                OR state IN ('active', 'cancelled', 'failed')
+                (state = 'pending' AND started_at IS NULL AND lease_expires_at IS NULL
+                    AND claim_token_hash IS NULL)
+                OR (state = 'running' AND started_at IS NOT NULL
+                    AND lease_expires_at IS NOT NULL AND claim_token_hash IS NOT NULL)
+                OR (state = 'active' AND claim_token_hash IS NULL)
+                OR state IN ('cancelled', 'failed')
+            ),
+            CHECK(
+                (state IN ('pending', 'running')
+                    AND command_hash IS NOT NULL AND length(command_hash) = 64
+                    AND command_hash NOT GLOB '*[^0-9a-f]*'
+                    AND command_hash_state = 'prepared')
+                OR (state = 'active'
+                    AND command_hash IS NOT NULL AND length(command_hash) = 64
+                    AND command_hash NOT GLOB '*[^0-9a-f]*'
+                    AND command_hash_state = 'summary_saved')
+                OR (state IN ('cancelled', 'failed') AND (
+                    (command_hash IS NULL AND command_hash_state IS NULL)
+                    OR (command_hash IS NOT NULL AND length(command_hash) = 64
+                        AND command_hash NOT GLOB '*[^0-9a-f]*'
+                        AND command_hash_state IN ('prepared', 'summary_saved'))
+                ))
             )
         )
         """
     )
 
 
+def _create_manual_compaction_attempt_reservations_table(conn: sqlite3.Connection) -> None:
+    """Reserve client attempt identities before prepare creates lifecycle state."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS manual_compaction_attempt_reservations (
+            attempt_id TEXT NOT NULL PRIMARY KEY,
+            thread_id TEXT NOT NULL,
+            command_message_id TEXT NOT NULL,
+            summary_message_id TEXT NOT NULL,
+            attempt_sequence INTEGER NOT NULL
+                CHECK(attempt_sequence >= 1 AND attempt_sequence <= 9007199254740991),
+            created_at INTEGER NOT NULL,
+            retired_at INTEGER,
+            UNIQUE(thread_id, command_message_id, attempt_sequence)
+        )
+        """
+    )
+
+
+def _create_manual_compaction_attempt_reservation_retire_trigger(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS {_MANUAL_COMPACTION_RESERVATION_RETIRE_TRIGGER}
+        BEFORE DELETE ON chat_threads
+        FOR EACH ROW
+        BEGIN
+            UPDATE manual_compaction_attempt_reservations
+            SET retired_at = COALESCE(
+                retired_at,
+                CAST(strftime('%s', 'now') AS INTEGER) * 1000
+            )
+            WHERE thread_id = OLD.id;
+        END
+        """
+    )
+
+
+def _validate_manual_compaction_summary_reservations(conn: sqlite3.Connection) -> None:
+    """Keep each reserved summary id bound to exactly one command identity."""
+    owners: dict[str, tuple[str, str]] = {}
+    rows = conn.execute(
+        "SELECT summary_message_id, thread_id, command_message_id "
+        "FROM manual_compaction_attempt_reservations "
+        "ORDER BY summary_message_id, thread_id, command_message_id, attempt_id"
+    ).fetchall()
+    for row in rows:
+        summary_message_id = str(row["summary_message_id"])
+        owner = (str(row["thread_id"]), str(row["command_message_id"]))
+        previous = owners.setdefault(summary_message_id, owner)
+        if previous != owner:
+            raise ValueError("stored manual compaction summary reservation conflicts")
+
+
+def _ensure_manual_compaction_attempt_reservations_schema(conn: sqlite3.Connection) -> None:
+    """Make bound attempt ids permanent, including after their owning thread is deleted."""
+    table = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'manual_compaction_attempt_reservations'"
+    ).fetchone()
+    if table is None:
+        _create_manual_compaction_attempt_reservations_table(conn)
+        _create_manual_compaction_attempt_reservation_retire_trigger(conn)
+        return
+
+    columns = {
+        str(row["name"])
+        for row in conn.execute(
+            "PRAGMA table_info(manual_compaction_attempt_reservations)"
+        ).fetchall()
+    }
+    foreign_keys = conn.execute(
+        "PRAGMA foreign_key_list(manual_compaction_attempt_reservations)"
+    ).fetchall()
+    normalized = "".join(str(table["sql"] or "").lower().split())
+    compatible = bool(
+        columns >= _MANUAL_COMPACTION_RESERVATION_REQUIRED_COLUMNS
+        and not foreign_keys
+        and "unique(thread_id,command_message_id,attempt_sequence)" in normalized
+        and "check(attempt_sequence>=1andattempt_sequence<=9007199254740991)" in normalized
+    )
+    if compatible:
+        _validate_manual_compaction_summary_reservations(conn)
+        _create_manual_compaction_attempt_reservation_retire_trigger(conn)
+        return
+
+    legacy_required = _MANUAL_COMPACTION_RESERVATION_REQUIRED_COLUMNS - {"retired_at"}
+    if not columns >= legacy_required:
+        missing = ", ".join(sorted(legacy_required - columns))
+        raise RuntimeError(
+            "manual compaction reservation schema cannot be migrated; missing columns: " + missing
+        )
+    conn.execute(f"DROP TRIGGER IF EXISTS {_MANUAL_COMPACTION_RESERVATION_RETIRE_TRIGGER}")
+    suffix = 0
+    while True:
+        legacy_name = "manual_compaction_attempt_reservations_legacy"
+        if suffix:
+            legacy_name += f"_{suffix}"
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (legacy_name,),
+        ).fetchone()
+        if exists is None:
+            break
+        suffix += 1
+    conn.execute(
+        "ALTER TABLE manual_compaction_attempt_reservations RENAME TO "
+        + _quoted_sql_identifier(legacy_name)
+    )
+    _create_manual_compaction_attempt_reservations_table(conn)
+    retired_at = "retired_at" if "retired_at" in columns else "NULL"
+    conn.execute(
+        "INSERT INTO manual_compaction_attempt_reservations "
+        "(attempt_id, thread_id, command_message_id, summary_message_id, attempt_sequence, "
+        "created_at, retired_at) SELECT attempt_id, thread_id, command_message_id, "
+        f"summary_message_id, attempt_sequence, created_at, {retired_at} FROM "
+        + _quoted_sql_identifier(legacy_name)
+    )
+    _validate_manual_compaction_summary_reservations(conn)
+    conn.execute("DROP TABLE " + _quoted_sql_identifier(legacy_name))
+    _create_manual_compaction_attempt_reservation_retire_trigger(conn)
+
+
+def _backfill_manual_compaction_attempt_reservations(conn: sqlite3.Connection) -> None:
+    """Recover durable reservations for valid client fences written by an older build."""
+    from core.manual_compaction import (
+        MANUAL_COMPACTION_CLIENT_KEY,
+        _manual_compaction_client_record,
+        _message_dict,
+    )
+
+    _validate_manual_compaction_summary_reservations(conn)
+    rows = conn.execute(
+        "SELECT id, thread_id, parent_id, role, content_json, attachments_json, "
+        "metadata_json, created_at FROM chat_messages WHERE metadata_json IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        message = _message_dict(row)
+        metadata = message.get("metadata")
+        if not isinstance(metadata, dict) or MANUAL_COMPACTION_CLIENT_KEY not in metadata:
+            continue
+        record = _manual_compaction_client_record(message)
+        if record is None:
+            raise ValueError("stored manual compaction reservation metadata is missing")
+        identity = (
+            record["attemptId"],
+            record["threadId"],
+            record["commandMessageId"],
+            record["summaryMessageId"],
+            record["attemptSequence"],
+        )
+        existing = conn.execute(
+            "SELECT attempt_id, thread_id, command_message_id, summary_message_id, "
+            "attempt_sequence, retired_at FROM manual_compaction_attempt_reservations "
+            "WHERE attempt_id = ?",
+            (record["attemptId"],),
+        ).fetchone()
+        if existing is not None:
+            if existing["retired_at"] is not None or tuple(existing)[:5] != identity:
+                raise ValueError("stored manual compaction attempt reservation conflicts")
+            continue
+        occupied = conn.execute(
+            "SELECT attempt_id FROM manual_compaction_attempt_reservations "
+            "WHERE thread_id = ? AND command_message_id = ? AND attempt_sequence = ?",
+            (record["threadId"], record["commandMessageId"], record["attemptSequence"]),
+        ).fetchone()
+        if occupied is not None:
+            raise ValueError("stored manual compaction sequence reservation conflicts")
+        occupied_summary = conn.execute(
+            "SELECT thread_id, command_message_id FROM manual_compaction_attempt_reservations "
+            "WHERE summary_message_id = ? LIMIT 1",
+            (record["summaryMessageId"],),
+        ).fetchone()
+        if occupied_summary is not None and (
+            str(occupied_summary["thread_id"]) != record["threadId"]
+            or str(occupied_summary["command_message_id"]) != record["commandMessageId"]
+        ):
+            raise ValueError("stored manual compaction summary reservation conflicts")
+        conn.execute(
+            "INSERT INTO manual_compaction_attempt_reservations "
+            "(attempt_id, thread_id, command_message_id, summary_message_id, attempt_sequence, "
+            "created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (*identity, max(1, int(row["created_at"]))),
+        )
+
+
+def _register_manual_compaction_command_hash_function(conn: sqlite3.Connection) -> None:
+    messages: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in conn.execute(
+        "SELECT id, thread_id, parent_id, role, content_json, attachments_json, "
+        "metadata_json, created_at FROM chat_messages"
+    ).fetchall():
+        message = {
+            "id": str(row["id"]),
+            "threadId": str(row["thread_id"]),
+            "parentId": row["parent_id"],
+            "role": str(row["role"]),
+            "content": _strict_stored_json_loads(row["content_json"]),
+            "attachments": _strict_optional_stored_json_loads(row["attachments_json"], None),
+            "metadata": _strict_optional_stored_json_loads(row["metadata_json"], None),
+            "createdAt": int(row["created_at"]),
+        }
+        messages[(message["threadId"], message["id"])] = message
+
+    conn.create_function(
+        "manual_compaction_command_hash",
+        3,
+        lambda thread_id, command_id, state: (
+            canonical_chat_message_hash(message, state = str(state))
+            if (message := messages.get((str(thread_id), str(command_id)))) is not None
+            else None
+        ),
+        deterministic = True,
+    )
+
+
+def _migration_source_hash(messages: list[dict[str, Any]]) -> str:
+    canonical = []
+    for message in messages:
+        metadata = message.get("metadata")
+        custom = metadata.get("custom") if isinstance(metadata, dict) else None
+        replay = None
+        if isinstance(custom, dict):
+            relevant = {
+                key: custom[key]
+                for key in ("anthropicRefusal", "openaiCodexReasoning", "incomplete")
+                if key in custom
+            }
+            replay = {"custom": relevant} if relevant else None
+        canonical.append(
+            {
+                "id": message["id"],
+                "parentId": message.get("parentId"),
+                "role": message["role"],
+                "content": message.get("content", []),
+                "attachments": message.get("attachments"),
+                "replayMetadata": replay,
+            }
+        )
+    encoded = _strict_stored_json_dumps(canonical, sort_keys = True).encode("utf-8", errors = "strict")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _migration_literal_compact(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
+            str(part["text"])
+            for part in content
+            if isinstance(part, dict)
+            and part.get("type") in ("text", "input_text", "output_text")
+            and isinstance(part.get("text"), str)
+        )
+    else:
+        text = ""
+    return message.get("role") == "user" and text == "/compact"
+
+
+def _migration_summary_hash(message: dict[str, Any]) -> str | None:
+    content = message.get("content")
+    if not (
+        message.get("role") == "assistant"
+        and isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and set(content[0]) == {"type", "text"}
+        and content[0].get("type") == "text"
+        and isinstance(content[0].get("text"), str)
+        and content[0]["text"].strip()
+        and message.get("attachments") is None
+    ):
+        return None
+    payload = _strict_stored_json_dumps(
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": content[0]["text"]}],
+            "attachments": None,
+            "providerMetadata": None,
+        },
+        sort_keys = True,
+    ).encode("utf-8", errors = "strict")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _migration_client_proves_attempt(
+    command: dict[str, Any], row: dict[str, Any], *, state: str
+) -> bool:
+    metadata = command.get("metadata")
+    client = metadata.get("manualCompactionClient") if isinstance(metadata, dict) else None
+    expected_state = "summary_saved" if state == "summary_saved" else "prepared"
+    client_keys = {
+        "schemaVersion",
+        "state",
+        "threadId",
+        "commandMessageId",
+        "attemptId",
+        "summaryMessageId",
+        "attemptSequence",
+        "expectedHeadMessageId",
+        "sourceHeadMessageId",
+        "envelope",
+    }
+    if state == "summary_saved":
+        client_keys.add("summaryHash")
+    if (
+        not isinstance(client, dict)
+        or set(client) != client_keys
+        or client.get("state") != expected_state
+    ):
+        return False
+    if any(
+        client.get(key) != value
+        for key, value in {
+            "schemaVersion": 1,
+            "threadId": row.get("thread_id"),
+            "commandMessageId": row.get("command_message_id"),
+            "attemptId": row.get("attempt_id"),
+            "expectedHeadMessageId": row.get("expected_head_message_id"),
+        }.items()
+    ):
+        return False
+    sequence = client.get("attemptSequence")
+    if (
+        not isinstance(sequence, int)
+        or isinstance(sequence, bool)
+        or not 1 <= sequence <= 2**53 - 1
+    ):
+        return False
+    summary_message_id = client.get("summaryMessageId")
+    if not isinstance(summary_message_id, str) or not summary_message_id:
+        return False
+    if state == "summary_saved" and summary_message_id != row.get("summary_message_id"):
+        return False
+    if client.get("sourceHeadMessageId") != row.get("source_head_message_id"):
+        return False
+    envelope = client.get("envelope")
+    envelope_values = {
+        "attemptId": row.get("attempt_id"),
+        "threadId": row.get("thread_id"),
+        "commandMessageId": row.get("command_message_id"),
+        "expectedHeadMessageId": row.get("expected_head_message_id"),
+        "sourceHash": row.get("source_hash"),
+        "requestHash": row.get("request_hash"),
+        "requestMessageCount": row.get("request_message_count"),
+        "projectInstructionDigest": row.get("project_instruction_digest"),
+        "projectInstructionRevision": row.get("project_instruction_revision"),
+        "contextDigest": row.get("context_digest"),
+        "revision": row.get("revision"),
+    }
+    if (
+        not isinstance(envelope, dict)
+        or set(envelope) != set(envelope_values)
+        or any(envelope.get(key) != value for key, value in envelope_values.items())
+    ):
+        return False
+    if state == "summary_saved" and client.get("summaryHash") != row.get("summary_hash"):
+        return False
+    return True
+
+
+def _migration_proven_command_hashes(
+    conn: sqlite3.Connection, source_table: str
+) -> dict[tuple[str, str], str]:
+    messages: dict[tuple[str, str], dict[str, Any]] = {}
+    for stored in conn.execute(
+        "SELECT id, thread_id, parent_id, role, content_json, attachments_json, "
+        "metadata_json, created_at FROM chat_messages"
+    ).fetchall():
+        message = {
+            "id": str(stored["id"]),
+            "threadId": str(stored["thread_id"]),
+            "parentId": stored["parent_id"],
+            "role": str(stored["role"]),
+            "content": _strict_stored_json_loads(stored["content_json"]),
+            "attachments": _strict_optional_stored_json_loads(stored["attachments_json"], None),
+            "metadata": _strict_optional_stored_json_loads(stored["metadata_json"], None),
+            "createdAt": int(stored["created_at"]),
+        }
+        if (
+            not isinstance(message["content"], (str, list))
+            or message["attachments"] is not None
+            and not isinstance(message["attachments"], list)
+            or message["metadata"] is not None
+            and not isinstance(message["metadata"], dict)
+        ):
+            continue
+        messages[(message["threadId"], message["id"])] = message
+
+    proven: dict[tuple[str, str], str] = {}
+    source = _quoted_sql_identifier(source_table)
+    for stored in conn.execute(f"SELECT * FROM {source}").fetchall():
+        row = dict(stored)
+        attempt_id = str(row.get("attempt_id") or "")
+        thread_id = str(row.get("thread_id") or "")
+        command_id = str(row.get("command_message_id") or "")
+        command = messages.get((thread_id, command_id))
+        if not all(
+            isinstance(row.get(column), str)
+            for column in (
+                "source_message_ids_json",
+                "effective_source_message_ids_json",
+                "archive_payload_json",
+            )
+        ):
+            continue
+        try:
+            source_ids = _strict_stored_json_loads(row.get("source_message_ids_json"))
+            effective_source_ids = _strict_stored_json_loads(
+                row.get("effective_source_message_ids_json")
+            )
+            archive_payload = _strict_stored_json_loads(row.get("archive_payload_json"))
+        except (TypeError, ValueError, UnicodeEncodeError):
+            continue
+        valid_hash = lambda value: (  # noqa: E731 - compact migration predicate
+            isinstance(value, str)
+            and len(value) == 64
+            and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+        )
+        try:
+            archive_encoded = _strict_stored_json_dumps(archive_payload, sort_keys = True).encode(
+                "utf-8", errors = "strict"
+            )
+        except (TypeError, ValueError, UnicodeEncodeError):
+            continue
+        if (
+            command is None
+            or not _migration_literal_compact(command)
+            or row.get("expected_head_message_id") != command_id
+            or not isinstance(source_ids, list)
+            or not source_ids
+            or not all(isinstance(message_id, str) and message_id for message_id in source_ids)
+            or not isinstance(effective_source_ids, list)
+            or not effective_source_ids
+            or not all(
+                isinstance(message_id, str) and message_id for message_id in effective_source_ids
+            )
+            or source_ids[-len(effective_source_ids) :] != effective_source_ids
+            or not isinstance(archive_payload, list)
+            or not all(
+                isinstance(item, dict)
+                and item.get("role") in ("user", "assistant")
+                and "content" in item
+                for item in archive_payload
+            )
+            or hashlib.sha256(archive_encoded).hexdigest() != row.get("archive_payload_hash")
+            or not all(
+                valid_hash(row.get(column))
+                for column in (
+                    "source_hash",
+                    "request_hash",
+                    "project_instruction_digest",
+                    "context_digest",
+                    "archive_payload_hash",
+                )
+            )
+            or not isinstance(row.get("request_message_count"), int)
+            or isinstance(row.get("request_message_count"), bool)
+            or row["request_message_count"] < 1
+            or not isinstance(row.get("project_instruction_revision"), int)
+            or isinstance(row.get("project_instruction_revision"), bool)
+            or row["project_instruction_revision"] < 0
+            or not isinstance(row.get("revision"), int)
+            or isinstance(row.get("revision"), bool)
+            or row["revision"] < 1
+        ):
+            continue
+        source_messages = [messages.get((thread_id, message_id)) for message_id in source_ids]
+        if any(message is None for message in source_messages):
+            continue
+        source_messages = [message for message in source_messages if message is not None]
+        if source_messages[0].get("parentId") not in (None, "") or any(
+            message.get("parentId") != previous_id
+            for message, previous_id in zip(source_messages[1:], source_ids[:-1])
+        ):
+            continue
+        if (
+            source_ids[-1] != row.get("source_head_message_id")
+            or command.get("parentId") != source_ids[-1]
+            or _migration_source_hash(source_messages) != row.get("source_hash")
+        ):
+            continue
+        if _migration_client_proves_attempt(command, row, state = "prepared"):
+            proven[(attempt_id, "prepared")] = canonical_chat_message_hash(
+                command, state = "prepared"
+            )
+
+        summary_id = row.get("summary_message_id")
+        summary = messages.get((thread_id, str(summary_id))) if summary_id is not None else None
+        active = (
+            summary.get("metadata", {}).get("manualCompaction")
+            if isinstance(summary, dict) and isinstance(summary.get("metadata"), dict)
+            else None
+        )
+        summary_hash = _migration_summary_hash(summary) if isinstance(summary, dict) else None
+        if not (
+            isinstance(summary, dict)
+            and summary.get("parentId") == command_id
+            and isinstance(active, dict)
+            and set(summary.get("metadata") or {}) == {"manualCompaction"}
+            and active.get("state") == "active"
+            and active.get("schemaVersion") == 1
+            and summary_hash == row.get("summary_hash")
+            and _migration_client_proves_attempt(command, row, state = "summary_saved")
+        ):
+            continue
+        expected_active = {
+            "attemptId": row.get("attempt_id"),
+            "threadId": row.get("thread_id"),
+            "revision": row.get("revision"),
+            "commandMessageId": row.get("command_message_id"),
+            "sourceHeadMessageId": row.get("source_head_message_id"),
+            "summaryMessageId": row.get("summary_message_id"),
+            "sourceHash": row.get("source_hash"),
+            "requestHash": row.get("request_hash"),
+            "requestMessageCount": row.get("request_message_count"),
+            "projectInstructionDigest": row.get("project_instruction_digest"),
+            "projectInstructionRevision": row.get("project_instruction_revision"),
+            "contextDigest": row.get("context_digest"),
+            "archivePayloadHash": row.get("archive_payload_hash"),
+            "outputSummaryHash": row.get("output_summary_hash"),
+            "outputFinishReason": row.get("output_finish_reason"),
+            "summaryHash": row.get("summary_hash"),
+        }
+        if set(active) != {"schemaVersion", "state", *expected_active} or any(
+            active.get(key) != value for key, value in expected_active.items()
+        ):
+            continue
+        proven[(attempt_id, "summary_saved")] = canonical_chat_message_hash(
+            command, state = "summary_saved"
+        )
+    return proven
+
+
 def _copy_manual_compaction_rows(
     conn: sqlite3.Connection, source_table: str, source_columns: set[str]
 ) -> None:
     source = _quoted_sql_identifier(source_table)
+    proven_command_hashes = _migration_proven_command_hashes(conn, source_table)
+    conn.create_function(
+        "manual_compaction_proven_command_hash",
+        2,
+        lambda attempt_id, state: proven_command_hashes.get((str(attempt_id), str(state))),
+        deterministic = True,
+    )
 
     json_columns = ["source_message_ids_json"]
     if "effective_source_message_ids_json" in source_columns:
@@ -267,6 +858,53 @@ def _copy_manual_compaction_rows(
     zero_digest_sql = repr("0" * 64)
     started = value("started_at", "NULL")
     lease = value("lease_expires_at", "NULL")
+    stored_command_hash = value("command_hash", "NULL")
+    stored_command_hash_state = value("command_hash_state", "NULL")
+    current_prepared_command_hash = (
+        "manual_compaction_proven_command_hash(legacy.attempt_id, 'prepared')"
+    )
+    current_summary_saved_command_hash = (
+        "manual_compaction_proven_command_hash(legacy.attempt_id, 'summary_saved')"
+    )
+    current_terminal_prepared_command_hash = (
+        "manual_compaction_command_hash(legacy.thread_id, legacy.command_message_id, 'prepared')"
+    )
+    current_terminal_summary_saved_command_hash = (
+        "manual_compaction_command_hash(legacy.thread_id, legacy.command_message_id, "
+        "'summary_saved')"
+    )
+    valid_stored_command_hash = (
+        f"{stored_command_hash} IS NOT NULL AND length({stored_command_hash}) = 64 "
+        f"AND {stored_command_hash} NOT GLOB '*[^0-9a-f]*'"
+    )
+    valid_current_prepared_command_hash = (
+        f"{current_prepared_command_hash} IS NOT NULL "
+        f"AND length({current_prepared_command_hash}) = 64 "
+        f"AND {current_prepared_command_hash} NOT GLOB '*[^0-9a-f]*'"
+    )
+    valid_current_summary_saved_command_hash = (
+        f"{current_summary_saved_command_hash} IS NOT NULL "
+        f"AND length({current_summary_saved_command_hash}) = 64 "
+        f"AND {current_summary_saved_command_hash} NOT GLOB '*[^0-9a-f]*'"
+    )
+    fallback_terminal_command_hash = (
+        f"CASE WHEN {stored_command_hash_state} = 'summary_saved' "
+        f"AND {current_terminal_summary_saved_command_hash} IS NOT NULL "
+        f"THEN {current_terminal_summary_saved_command_hash} "
+        f"WHEN {current_terminal_prepared_command_hash} IS NOT NULL "
+        f"THEN {current_terminal_prepared_command_hash} "
+        f"WHEN {valid_stored_command_hash} THEN {stored_command_hash} ELSE NULL END"
+    )
+    valid_terminal_command_hash = (
+        f"{fallback_terminal_command_hash} IS NOT NULL "
+        f"AND length({fallback_terminal_command_hash}) = 64 "
+        f"AND {fallback_terminal_command_hash} NOT GLOB '*[^0-9a-f]*'"
+    )
+    claim_token_hash = value("claim_token_hash", "NULL")
+    valid_claim_token_hash = (
+        f"{claim_token_hash} IS NOT NULL AND length({claim_token_hash}) = 64 "
+        f"AND {claim_token_hash} NOT GLOB '*[^0-9a-f]*'"
+    )
     state = value("state", "'failed'")
     active_provenance_columns = {
         "output_summary_hash",
@@ -288,10 +926,12 @@ def _copy_manual_compaction_rows(
     )
     mapped_state = (
         "CASE "
-        f"WHEN {state} = 'active' AND {active_is_complete} THEN 'active' "
+        f"WHEN {state} = 'active' AND {active_is_complete} "
+        f"AND {valid_current_summary_saved_command_hash} THEN 'active' "
         f"WHEN {state} = 'running' AND {started} IS NOT NULL AND {lease} IS NOT NULL "
+        f"AND {valid_claim_token_hash} AND {valid_current_prepared_command_hash} "
         "THEN 'running' "
-        f"WHEN {state} = 'pending' THEN 'pending' "
+        f"WHEN {state} = 'pending' AND {valid_current_prepared_command_hash} THEN 'pending' "
         f"WHEN {state} = 'cancelled' THEN 'cancelled' "
         "ELSE 'failed' END"
     )
@@ -319,7 +959,9 @@ def _copy_manual_compaction_rows(
             request_message_count, project_instruction_digest,
             project_instruction_revision, context_digest, archive_payload_json,
             archive_payload_hash, output_summary_hash, output_finish_reason,
-            output_recorded_at, revision, state, summary_message_id, summary_hash,
+            output_recorded_at, revision, state, command_hash, command_hash_state,
+            claim_token_hash,
+            summary_message_id, summary_hash,
             archive_status, created_at, started_at, lease_expires_at, cancelled_at,
             committed_at, terminal_reason, finished_at
         )
@@ -343,6 +985,26 @@ def _copy_manual_compaction_rows(
             CASE WHEN {mapped_state} = 'pending' THEN NULL
                 ELSE {value("output_recorded_at", "NULL")} END,
             legacy.revision, {mapped_state},
+            CASE
+                WHEN {mapped_state} IN ('pending', 'running')
+                    THEN {current_prepared_command_hash}
+                WHEN {mapped_state} = 'active' THEN {current_summary_saved_command_hash}
+                WHEN {valid_terminal_command_hash} THEN {fallback_terminal_command_hash}
+                ELSE NULL
+            END,
+            CASE
+                WHEN {mapped_state} IN ('pending', 'running') THEN 'prepared'
+                WHEN {mapped_state} = 'active' THEN 'summary_saved'
+                WHEN {valid_terminal_command_hash} THEN
+                    CASE WHEN {stored_command_hash_state} IN ('prepared', 'summary_saved')
+                        THEN {stored_command_hash_state} ELSE 'prepared' END
+                ELSE NULL
+            END,
+            CASE
+                WHEN {mapped_state} IN ('pending', 'active') THEN NULL
+                WHEN {valid_claim_token_hash} THEN {claim_token_hash}
+                ELSE NULL
+            END,
             CASE WHEN {mapped_state} = 'active'
                 THEN {value("summary_message_id", "NULL")} ELSE NULL END,
             CASE WHEN {mapped_state} = 'active'
@@ -367,9 +1029,11 @@ def _copy_manual_compaction_rows(
 
 def _ensure_manual_compactions_schema(conn: sqlite3.Connection) -> None:
     """Evolve manual compactions atomically and recover any legacy orphan left by old builds."""
-    conn.commit()
-    conn.execute("BEGIN IMMEDIATE")
+    previous_row_factory = conn.row_factory
+    conn.row_factory = sqlite3.Row
     try:
+        conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
         tables = {
             str(row["name"]): str(row["sql"] or "")
             for row in conn.execute(
@@ -426,8 +1090,11 @@ def _ensure_manual_compactions_schema(conn: sqlite3.Connection) -> None:
             )
 
         _create_manual_compactions_table(conn)
+        _ensure_manual_compaction_attempt_reservations_schema(conn)
         conn.execute("DROP INDEX IF EXISTS idx_manual_compactions_thread_state")
         conn.execute("DROP INDEX IF EXISTS idx_manual_compactions_live_branch")
+        if sources:
+            _register_manual_compaction_command_hash_function(conn)
         for name, columns in sorted(sources.items(), key = lambda item: len(item[1]), reverse = True):
             _copy_manual_compaction_rows(conn, name, columns)
         for name in sources:
@@ -475,7 +1142,8 @@ def _ensure_manual_compactions_schema(conn: sqlite3.Connection) -> None:
             reconcile_all_manual_compaction_attempts_in_connection,
         )
 
-        reconcile_all_manual_compaction_attempts_in_connection(conn)
+        reconcile_all_manual_compaction_attempts_in_connection(conn, process_restart = True)
+        _backfill_manual_compaction_attempt_reservations(conn)
         conn.execute(
             "CREATE INDEX idx_manual_compactions_thread_state "
             "ON manual_compactions(thread_id, state, revision)"
@@ -489,6 +1157,8 @@ def _ensure_manual_compactions_schema(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.row_factory = previous_row_factory
 
 
 def _project_slug(name: str) -> str:
@@ -2181,6 +2851,26 @@ def _strict_stored_json_dumps(value: Any, *, sort_keys: bool = False) -> str:
     )
 
 
+def canonical_chat_message_hash(message: dict[str, Any], *, state: str) -> str:
+    """Hash every persisted field plus the lifecycle state with stable JSON semantics."""
+    if state not in ("prepared", "summary_saved"):
+        raise ValueError("manual compaction command hash state is invalid")
+    canonical = {
+        "id": str(message["id"]),
+        "threadId": str(message["threadId"]),
+        "parentId": message.get("parentId"),
+        "role": str(message["role"]),
+        "content": message.get("content", []),
+        "attachments": message.get("attachments"),
+        "metadata": message.get("metadata"),
+        "createdAt": int(message["createdAt"]),
+    }
+    encoded = _strict_stored_json_dumps(
+        {"state": state, "message": canonical}, sort_keys = True
+    ).encode("utf-8", errors = "strict")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _strict_optional_stored_json_loads(value: str | None, fallback: Any) -> Any:
     if value is None:
         return fallback
@@ -3405,6 +4095,171 @@ def _guard_active_manual_compaction_messages(
     return protected
 
 
+def _live_manual_compaction_message_ids(conn: sqlite3.Connection, thread_id: str) -> set[str]:
+    """Return every row whose exact value is covered by a live command fence."""
+    protected: set[str] = set()
+    for row in conn.execute(
+        "SELECT attempt_id, command_message_id, source_message_ids_json, "
+        "summary_message_id, state FROM manual_compactions WHERE thread_id = ?",
+        (thread_id,),
+    ).fetchall():
+        state = str(row["state"])
+        if state not in ("pending", "running", "active"):
+            continue
+        try:
+            source_ids = _strict_stored_json_loads(row["source_message_ids_json"])
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise ChatMessageProtectedError("live manual compaction ancestry is corrupt") from exc
+        if not isinstance(source_ids, list) or not all(
+            isinstance(message_id, str) and message_id for message_id in source_ids
+        ):
+            raise ChatMessageProtectedError("live manual compaction ancestry is corrupt")
+        protected.update(source_ids)
+        protected.add(str(row["command_message_id"]))
+        if state == "active" and row["summary_message_id"] is not None:
+            protected.add(str(row["summary_message_id"]))
+
+    rows = conn.execute(
+        "SELECT id, thread_id, parent_id, role, content_json, attachments_json, "
+        "metadata_json, created_at FROM chat_messages WHERE thread_id = ?",
+        (thread_id,),
+    ).fetchall()
+    parents = {
+        str(row["id"]): (str(row["parent_id"]) if row["parent_id"] else None) for row in rows
+    }
+    try:
+        from core.manual_compaction import _manual_compaction_client_record, _message_dict
+        bound_commands: set[str] = set()
+        for row in rows:
+            message = _message_dict(row)
+            metadata = message.get("metadata")
+            if not isinstance(metadata, dict) or "manualCompactionClient" not in metadata:
+                continue
+            try:
+                record = _manual_compaction_client_record(message)
+            except Exception:
+                raise
+            if record is None:
+                raise ValueError("missing manual compaction client record")
+            # A command fence remains authoritative after its attempt terminalizes. The
+            # command and its complete ancestry are released only when bind atomically
+            # replaces this client record with the next proven attempt identity.
+            bound_commands.add(str(message["id"]))
+    except Exception as exc:
+        if isinstance(exc, ChatMessageProtectedError):
+            raise
+        raise ChatMessageProtectedError("manual compaction command metadata is corrupt") from exc
+
+    for command_id in bound_commands:
+        cursor: str | None = command_id
+        seen: set[str] = set()
+        while cursor is not None:
+            if cursor in seen or cursor not in parents:
+                raise ChatMessageProtectedError("manual compaction ancestry is corrupt")
+            seen.add(cursor)
+            protected.add(cursor)
+            cursor = parents[cursor]
+    return protected
+
+
+def _guard_manual_compaction_client_records(
+    conn: sqlite3.Connection, thread_id: str, messages: list[dict]
+) -> set[str]:
+    """Reject writes that bypass a fence or change any row protected by a live fence."""
+    absent = object()
+
+    def client_value(metadata: object) -> object:
+        if not isinstance(metadata, dict):
+            return absent
+        return metadata.get("manualCompactionClient", absent)
+
+    def canonical(value: object) -> str:
+        try:
+            return _strict_stored_json_dumps(value, sort_keys = True)
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise ChatMessageProtectedError("manual compaction client metadata is invalid") from exc
+
+    stored: dict[str, object] = {}
+    fenced_ids: set[str] = set()
+    for row in conn.execute(
+        "SELECT id, metadata_json FROM chat_messages WHERE thread_id = ?",
+        (thread_id,),
+    ).fetchall():
+        try:
+            metadata = (
+                _strict_stored_json_loads(row["metadata_json"])
+                if row["metadata_json"] is not None
+                else None
+            )
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            raise ChatMessageProtectedError("chat message metadata is corrupt") from exc
+        if metadata is not None and not isinstance(metadata, dict):
+            raise ChatMessageProtectedError("chat message metadata is corrupt")
+        value = client_value(metadata)
+        message_id = str(row["id"])
+        stored[message_id] = value
+        if value is not absent:
+            fenced_ids.add(message_id)
+
+    protected = _live_manual_compaction_message_ids(conn, thread_id)
+    for message in messages:
+        message_id = str(message["id"])
+        before = stored.get(message_id, absent)
+        after = client_value(message.get("metadata"))
+        if not (before is absent and after is absent) and (
+            before is absent or after is absent or canonical(before) != canonical(after)
+        ):
+            raise ChatMessageProtectedError(
+                "manual compaction client metadata must use the fenced transition endpoint"
+            )
+        if message_id in protected and _research_message_would_change(conn, thread_id, message):
+            raise ChatMessageProtectedError(
+                "live manual compaction checkpoint ancestry cannot be edited"
+            )
+    return fenced_ids | protected
+
+
+def guard_manual_compaction_message_metadata_update(
+    conn: sqlite3.Connection, message_id: str, metadata: object
+) -> None:
+    """Apply the ordinary full-row compaction fence to an internal metadata-only write."""
+    row = conn.execute(
+        "SELECT id, thread_id, parent_id, role, content_json, attachments_json, "
+        "metadata_json, created_at FROM chat_messages WHERE id = ?",
+        (message_id,),
+    ).fetchone()
+    if row is None:
+        return
+    try:
+        candidate = {
+            "id": str(row["id"]),
+            "threadId": str(row["thread_id"]),
+            "parentId": row["parent_id"],
+            "role": str(row["role"]),
+            "content": _strict_stored_json_loads(row["content_json"]),
+            "attachments": _strict_optional_stored_json_loads(row["attachments_json"], None),
+            "metadata": metadata,
+            "createdAt": int(row["created_at"]),
+        }
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise ChatMessageProtectedError("chat message storage is corrupt") from exc
+    thread_id = str(row["thread_id"])
+    _guard_manual_compaction_client_records(conn, thread_id, [candidate])
+    _guard_active_manual_compaction_messages(conn, thread_id, [candidate])
+
+
+def guard_manual_compaction_lifecycle_activation(
+    conn: sqlite3.Connection, thread_id: str, message_ids: Iterable[str | None]
+) -> None:
+    """Reject a producer activation that touches command-fenced ancestry."""
+    protected = _live_manual_compaction_message_ids(conn, thread_id)
+    touched = {
+        str(message_id) for message_id in message_ids if isinstance(message_id, str) and message_id
+    }
+    if touched & protected:
+        raise ChatMessageProtectedError("manual compaction protects this lifecycle ancestry")
+
+
 def _surviving_parent_id(
     conn: sqlite3.Connection, thread_id: str, message_id: str, pruned: set
 ) -> "str | None":
@@ -3430,9 +4285,9 @@ def _surviving_parent_id(
             (thread_id, str(parent)),
         ).fetchone()
         parent = row["parent_id"] if row is not None else None
-    # Normalized the way the caller reads parentId (`or None`), so an empty stored parent_id
-    # cannot make the two disagree, and a self-link left by a corrupt chain resolves to the root.
-    survivor = str(parent) if parent else None
+    # Preserve the stored root representation. NULL and the legacy empty string both terminate
+    # ancestry, but changing one into the other is still a protected-row edit.
+    survivor = str(parent) if parent is not None else None
     return None if survivor == message_id else survivor
 
 
@@ -3454,8 +4309,8 @@ def _research_message_would_change(
     def canon(value: object) -> str | None:
         return _strict_stored_json_dumps(value, sort_keys = True) if value is not None else None
 
-    stored_parent = row["parent_id"] or None
-    sent_parent = message.get("parentId") or None
+    stored_parent = row["parent_id"]
+    sent_parent = message.get("parentId")
     parent_changed = sent_parent != stored_parent
     if parent_changed and stored_parent is not None and str(stored_parent) in pruned:
         # The same sync is deleting this message's parent, so the client is repairing a link this
@@ -3498,7 +4353,7 @@ def _safe_generation_assistant_update(
     ).fetchone()
     if row is None or str(message.get("role")) != "assistant":
         return False
-    if (message.get("parentId") or None) != (row["parent_id"] or None):
+    if message.get("parentId") != row["parent_id"]:
         return False
     if int(message.get("createdAt", row["created_at"])) != int(row["created_at"]):
         return False
@@ -3630,7 +4485,7 @@ def _detach_terminal_generation_for_edit(
         or isinstance(incoming_metadata, dict)
         and incoming_metadata.get("serverManaged") is True
         or str(message.get("role")) != str(row["role"])
-        or (message.get("parentId") or None) != (row["parent_id"] or None)
+        or message.get("parentId") != row["parent_id"]
         or int(message.get("createdAt", row["created_at"])) != int(row["created_at"])
     ):
         return False
@@ -3945,6 +4800,7 @@ def upsert_chat_message(
             raise ChatMessageProtectedError(
                 "deleted server-managed generation messages cannot be restored"
             )
+        _guard_manual_compaction_client_records(conn, message["threadId"], [message])
         _guard_active_manual_compaction_messages(conn, message["threadId"], [message])
         if allow_generation_edit:
             _detach_terminal_generation_for_edit(conn, message["threadId"], message)
@@ -4051,6 +4907,9 @@ def sync_chat_messages(
         generation_ids = _generation_message_ids(conn, thread_id)
         managed_ids = research_ids | generation_ids
         requested_ids = {str(m["id"]) for m in messages}
+        fenced_compaction_ids = _guard_manual_compaction_client_records(conn, thread_id, messages)
+        if prune_missing and fenced_compaction_ids - requested_ids:
+            raise ChatMessageProtectedError("manual compaction protected messages cannot be pruned")
         active_compaction_ids = _guard_active_manual_compaction_messages(conn, thread_id, messages)
         if prune_missing and active_compaction_ids - requested_ids:
             raise ChatMessageProtectedError(
@@ -4066,6 +4925,8 @@ def sync_chat_messages(
             research_ids
             | (generation_ids - explicitly_deleted_terminal_ids)
             | (tombstoned_ids - explicitly_deleted_ids)
+            | fenced_compaction_ids
+            | active_compaction_ids
         )
         # The rows this sync will delete, computed before the upsert so a relink forced by
         # that deletion can be told apart from an edit. Research ids are subtracted because
@@ -4350,10 +5211,12 @@ def fork_chat_thread(
         # compaction either reuses the wrong revision or fails hash validation.
         from core.manual_compaction import (
             _attempt_from_row,
+            _manual_compaction_client_record,
             rewrite_forked_manual_compaction_metadata,
         )
 
         rewritten_compaction_metadata = rewrite_forked_manual_compaction_metadata(
+            conn = conn,
             source_rows = ancestry,
             id_map = id_map,
             new_thread_id = new_thread_id,
@@ -4395,7 +5258,11 @@ def fork_chat_thread(
                 (
                     id_map[row["id"]],
                     new_thread_id,
-                    id_map.get(row["parent_id"]) if row["parent_id"] else None,
+                    (
+                        row["parent_id"]
+                        if row["parent_id"] in (None, "")
+                        else id_map.get(row["parent_id"])
+                    ),
                     row["role"],
                     content_json,
                     attachments_json,
@@ -4418,7 +5285,9 @@ def fork_chat_thread(
             old_active = old_metadata.get("manualCompaction")
             new_metadata = _strict_stored_json_loads(rewritten_json)
             new_active = new_metadata.get("manualCompaction")
-            if not isinstance(old_active, dict) or not isinstance(new_active, dict):
+            if not isinstance(new_active, dict) or new_active.get("state") != "active":
+                continue
+            if not isinstance(old_active, dict):
                 raise ChatMessageProtectedError("forked manual compaction metadata is invalid")
             old_attempt = conn.execute(
                 "SELECT * FROM manual_compactions WHERE attempt_id = ? AND state = 'active'",
@@ -4436,6 +5305,30 @@ def fork_chat_thread(
                 and all(str(message_id) in id_map for message_id in old_effective_ids)
             ):
                 raise ChatMessageProtectedError("forked manual compaction ancestry is incomplete")
+            new_command_row = conn.execute(
+                "SELECT id, thread_id, parent_id, role, content_json, attachments_json, "
+                "metadata_json, created_at FROM chat_messages WHERE thread_id = ? AND id = ?",
+                (new_thread_id, new_active["commandMessageId"]),
+            ).fetchone()
+            if new_command_row is None:
+                raise ChatMessageProtectedError("forked manual compaction command is missing")
+            new_command_hash = canonical_chat_message_hash(
+                {
+                    "id": str(new_command_row["id"]),
+                    "threadId": str(new_command_row["thread_id"]),
+                    "parentId": new_command_row["parent_id"],
+                    "role": str(new_command_row["role"]),
+                    "content": _strict_stored_json_loads(new_command_row["content_json"]),
+                    "attachments": _strict_optional_stored_json_loads(
+                        new_command_row["attachments_json"], None
+                    ),
+                    "metadata": _strict_optional_stored_json_loads(
+                        new_command_row["metadata_json"], None
+                    ),
+                    "createdAt": int(new_command_row["created_at"]),
+                },
+                state = "summary_saved",
+            )
             conn.execute(
                 """
                 INSERT INTO manual_compactions (
@@ -4446,9 +5339,11 @@ def fork_chat_thread(
                     project_instruction_revision, context_digest, archive_payload_json,
                     archive_payload_hash, output_summary_hash, output_finish_reason,
                     output_recorded_at, revision, state,
-                    summary_message_id, summary_hash, archive_status, created_at,
+                    command_hash, command_hash_state, summary_message_id, summary_hash,
+                    archive_status, created_at,
                     started_at, committed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active',
+                    ?, 'summary_saved', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     new_active["attemptId"],
@@ -4474,12 +5369,43 @@ def fork_chat_thread(
                     old_attempt_data["outputFinishReason"],
                     old_attempt_data["outputRecordedAt"],
                     new_active["revision"],
+                    new_command_hash,
                     new_active["summaryMessageId"],
                     new_active["summaryHash"],
                     "pending",
                     old_attempt_data["createdAt"],
                     old_attempt_data["startedAt"],
                     old_attempt_data["committedAt"],
+                ),
+            )
+            new_command = {
+                "id": str(new_command_row["id"]),
+                "threadId": str(new_command_row["thread_id"]),
+                "parentId": new_command_row["parent_id"],
+                "role": str(new_command_row["role"]),
+                "content": _strict_stored_json_loads(new_command_row["content_json"]),
+                "attachments": _strict_optional_stored_json_loads(
+                    new_command_row["attachments_json"], None
+                ),
+                "metadata": _strict_optional_stored_json_loads(
+                    new_command_row["metadata_json"], None
+                ),
+                "createdAt": int(new_command_row["created_at"]),
+            }
+            new_client = _manual_compaction_client_record(new_command)
+            if new_client is None:
+                raise ChatMessageProtectedError("forked manual compaction binding is missing")
+            conn.execute(
+                "INSERT INTO manual_compaction_attempt_reservations "
+                "(attempt_id, thread_id, command_message_id, summary_message_id, "
+                "attempt_sequence, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    new_client["attemptId"],
+                    new_client["threadId"],
+                    new_client["commandMessageId"],
+                    new_client["summaryMessageId"],
+                    new_client["attemptSequence"],
+                    old_attempt_data["createdAt"],
                 ),
             )
         for row in ancestry:
@@ -4803,6 +5729,7 @@ def delete_chat_attachment(message_id: str, attachment_id: str) -> bool:
             conn, str(row["thread_id"])
         ) - _terminal_generation_message_ids(conn, str(row["thread_id"]))
         protected_message_ids |= _active_manual_compaction_message_ids(conn, str(row["thread_id"]))
+        protected_message_ids |= _live_manual_compaction_message_ids(conn, str(row["thread_id"]))
         if str(message_id) in protected_message_ids:
             conn.rollback()
             raise ChatMessageProtectedError(
