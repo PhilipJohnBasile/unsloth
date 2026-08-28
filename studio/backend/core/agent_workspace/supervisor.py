@@ -22,6 +22,7 @@ import contextlib
 import codecs
 import ctypes
 import functools
+import hashlib
 import json
 import math
 import os
@@ -65,8 +66,18 @@ MAX_TIMEOUT_SECONDS = 3600.0
 MAX_ARGV_ITEMS = 256
 MAX_ARGV_BYTES = 64 * 1024
 MAX_PYTHON_SOURCE_BYTES = 4 * 1024 * 1024
+MAX_STDIN_BYTES = 256 * 1024
 _READ_CHUNK_BYTES = 64 * 1024
 _READ_CHUNKS_PER_POLL = 16
+_PREPARATION_WORKERS = 4
+# A caller may abandon a preparation owner after its absolute deadline. Keep
+# normal concurrent work small, but retain a separate hard cap for owners that
+# are still unwinding an uninterruptible filesystem or host probe. This lets a
+# single stuck owner release admission capacity without permitting unbounded
+# daemon-thread growth.
+_PREPARATION_CAPACITY = threading.BoundedSemaphore(_PREPARATION_WORKERS)
+_PREPARATION_TOTAL_OWNERS = 16
+_PREPARATION_OWNER_CAPACITY = threading.BoundedSemaphore(_PREPARATION_TOTAL_OWNERS)
 _POLL_SECONDS = 0.02
 _GRACEFUL_STOP_SECONDS = 0.5
 _FORCED_STOP_SECONDS = 5.0
@@ -92,6 +103,20 @@ class ProjectProcessResult:
     output_bytes: int
     output_truncated: bool
     truncation_notice: str = ""
+    stderr: str = ""
+    stderr_bytes: int = 0
+    stderr_truncated: bool = False
+
+
+@dataclass(frozen = True)
+class _ProjectCommandCapability:
+    project_id: str
+    command: str
+    argv: tuple[str, ...]
+    policy_hash: str
+    workspace_identity: tuple[int, int]
+    workspace_revision: int
+    approved: bool
 
 
 class _SpawnCancelledBeforeStart(RuntimeError):
@@ -209,6 +234,8 @@ class _QuarantinedRun:
     lifecycle_closed: bool = False
     boundary_closed: bool = False
     lease_released: bool = False
+    execution_fence_fd: Optional[int] = None
+    execution_fence_released: bool = False
 
 
 _QUARANTINE_LOCK = threading.Lock()
@@ -242,6 +269,158 @@ class _StopSignal:
         elif bounded:
             time.sleep(bounded)
         return self.is_set()
+
+
+def _bounded_preparation(
+    callback,
+    *,
+    cancel_event: Optional[threading.Event],
+    deadline: float,
+    label: str,
+    close_late_result = None,
+    on_detach = None,
+    on_late_finish = None,
+):
+    """Run potentially blocking pre-spawn setup under bounded global ownership."""
+    if not _PREPARATION_CAPACITY.acquire(blocking = False):
+        raise ProjectExecutionUnavailable(f"Project process {label} capacity is full.")
+    if not _PREPARATION_OWNER_CAPACITY.acquire(blocking = False):
+        _PREPARATION_CAPACITY.release()
+        raise ProjectExecutionUnavailable(f"Project process {label} owner capacity is full.")
+
+    lock = threading.Lock()
+    done = _new_preparation_event()
+    state = {
+        "active_released": False,
+        "disposition": "unclaimed",
+        "finished": False,
+        "result": None,
+        "error": None,
+    }
+
+    def release_active() -> None:
+        with lock:
+            if state["active_released"]:
+                return
+            state["active_released"] = True
+        _PREPARATION_CAPACITY.release()
+
+    def close_late(value) -> None:
+        if close_late_result is None:
+            return
+        try:
+            close_late_result(value)
+        except BaseException:
+            pass
+
+    def finish_late() -> None:
+        if on_late_finish is None:
+            return
+        try:
+            on_late_finish()
+        except BaseException:
+            pass
+
+    def owned() -> None:
+        value = None
+        error = None
+        try:
+            value = callback()
+        except BaseException as exc:
+            error = exc
+        with lock:
+            state["result"] = value
+            state["error"] = error
+            state["finished"] = True
+            detached = state["disposition"] == "detached"
+        release_active()
+        if detached:
+            if error is None:
+                close_late(value)
+            finish_late()
+        _PREPARATION_OWNER_CAPACITY.release()
+        done.set()
+
+    try:
+        threading.Thread(
+            target = owned,
+            name = f"unsloth-project-{label.replace(' ', '-')}",
+            daemon = True,
+        ).start()
+    except BaseException:
+        release_active()
+        _PREPARATION_OWNER_CAPACITY.release()
+        raise
+
+    def detach():
+        value = None
+        error = None
+        finished = False
+        with lock:
+            if state["disposition"] == "claimed":
+                return None, None, False
+            if state["disposition"] != "detached":
+                state["disposition"] = "detached"
+                if on_detach is not None:
+                    try:
+                        on_detach()
+                    except BaseException:
+                        pass
+            if state["finished"]:
+                finished = True
+                value = state["result"]
+                error = state["error"]
+        # The owner retains the global total-owner slot until it exits, but it
+        # no longer consumes one of the normal concurrent preparation slots.
+        release_active()
+        return value, error, finished
+
+    def abandon(kind: str) -> None:
+        value, error, finished = detach()
+        # A result published just before the caller detached is now owned by
+        # this path. Closing it here is the atomic counterpart to the worker
+        # closing a result published just after detachment.
+        if error is None and value is not None:
+            close_late(value)
+        if finished:
+            finish_late()
+        if kind == "cancelled":
+            raise InterruptedError(f"Project process {label} was cancelled.")
+        raise TimeoutError(f"Project process {label} exceeded its deadline.")
+
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            abandon("cancelled")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            abandon("timed_out")
+        if not done.wait(min(_POLL_SECONDS, remaining)):
+            continue
+        stop_kind = None
+        with lock:
+            if state["disposition"] == "detached":
+                continue
+            # A successful wake only proves publication. The caller may have
+            # been descheduled after that wake until cancellation or the
+            # absolute deadline had already won. Claiming here without a fresh
+            # check would let late preparation mutate admission state.
+            if cancel_event is not None and cancel_event.is_set():
+                stop_kind = "cancelled"
+            elif time.monotonic() >= deadline:
+                stop_kind = "timed_out"
+            else:
+                state["disposition"] = "claimed"
+                error = state["error"]
+                value = state["result"]
+        if stop_kind is not None:
+            abandon(stop_kind)
+        if error is not None:
+            raise error
+        return value
+
+
+def _new_preparation_event():
+    return threading.Event()
 
 
 class _OutputBuffer:
@@ -371,19 +550,38 @@ class _BubblewrapLifecycle:
         self._released = False
         self._unbound_group_proven = False
         self._closed = False
+        self._execution_fence_fd: Optional[int] = None
+
+    def attach_execution_fence(self, descriptor: int) -> None:
+        """Keep the interprocess finalizer lock alive in bubblewrap itself."""
+        if self._execution_fence_fd is not None or self._released:
+            raise ProjectProcessContainmentError(
+                "The project execution fence cannot be replaced after lifecycle setup."
+            )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ProjectExecutionUnavailable("Project execution fence file is unsafe.")
+        self._execution_fence_fd = descriptor
 
     def wrap_argv(self, argv: Sequence[str]) -> list[str]:
         command = list(argv)
         if not command:
             raise ProjectExecutionUnavailable("The bubblewrap command is unavailable.")
-        return [
+        lifecycle_options = [
             command[0],
             "--json-status-fd",
             str(self._status_write),
             "--block-fd",
             str(self._block_read),
-            *command[1:],
         ]
+        if self._execution_fence_fd is not None:
+            # bubblewrap retains --sync-fd in its namespace monitor until every
+            # sandbox process is gone. The inherited flock therefore survives
+            # a Studio owner crash and cannot be reclaimed while the old hook
+            # tree remains alive.
+            lifecycle_options.extend(("--sync-fd", str(self._execution_fence_fd)))
+        lifecycle_options.extend(command[1:])
+        return lifecycle_options
 
     def add_popen_options(self, options: dict) -> dict:
         prepared = dict(options)
@@ -394,7 +592,15 @@ class _BubblewrapLifecycle:
         # The retained writer instead leaves the setup child safely blocked;
         # its recorded process group is reaped by startup crash recovery.
         prepared["pass_fds"] = tuple(
-            dict.fromkeys((*passed, self._status_write, self._block_read, self._block_write))
+            dict.fromkeys(
+                (
+                    *passed,
+                    self._status_write,
+                    self._block_read,
+                    self._block_write,
+                    *((self._execution_fence_fd,) if self._execution_fence_fd is not None else ()),
+                )
+            )
         )
         return prepared
 
@@ -467,9 +673,13 @@ class _BubblewrapLifecycle:
         self,
         process: subprocess.Popen,
         cancel_event: Optional[threading.Event] = None,
+        deadline: Optional[float] = None,
     ) -> bool:
         """Read child-pid while --block-fd keeps the sandboxed command stopped."""
-        deadline = time.monotonic() + _LIFECYCLE_START_SECONDS
+        deadline = min(
+            time.monotonic() + _LIFECYCLE_START_SECONDS,
+            deadline if deadline is not None else math.inf,
+        )
         pending = bytearray()
         cancelled = cancel_event is not None and cancel_event.is_set()
         poller = select.poll()
@@ -477,9 +687,7 @@ class _BubblewrapLifecycle:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise ProjectExecutionUnavailable(
-                    "bubblewrap did not establish a supervised PID namespace in time."
-                )
+                raise TimeoutError("Project command lifecycle binding exceeded its deadline.")
             try:
                 events = poller.poll(max(1, min(50, int(remaining * 1000))))
             except InterruptedError:
@@ -1080,13 +1288,20 @@ def _terminate_and_reap(process: subprocess.Popen) -> int:
     return int(return_code)
 
 
-def _popen_options(boundary, environment: dict[str, str], lifecycle: _BubblewrapLifecycle) -> dict:
+def _popen_options(
+    boundary,
+    environment: dict[str, str],
+    lifecycle: _BubblewrapLifecycle,
+    *,
+    input_pipe: bool = False,
+    separate_stderr: bool = False,
+) -> dict:
     lifetime = child_popen_kwargs(_sandbox_preexec)
     options = {
         "bufsize": 0,
         "env": environment,
-        "stderr": subprocess.STDOUT,
-        "stdin": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE if separate_stderr else subprocess.STDOUT,
+        "stdin": subprocess.PIPE if input_pipe else subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "start_new_session": True,
     }
@@ -1107,6 +1322,7 @@ def _quarantine_run(
     adopted: bool = False,
     after_spawn_done: bool = False,
     lifecycle_bound: bool = False,
+    execution_fence_fd: Optional[int] = None,
 ) -> None:
     run = _QuarantinedRun(
         lease = lease,
@@ -1119,6 +1335,7 @@ def _quarantine_run(
         adopted = adopted,
         after_spawn_done = after_spawn_done,
         lifecycle_bound = lifecycle_bound,
+        execution_fence_fd = execution_fence_fd,
     )
     _register_quarantined_run(run)
 
@@ -1190,9 +1407,11 @@ def _advance_quarantined_run(run: _QuarantinedRun) -> None:
             run.lifecycle.terminate_and_prove(process)
         run.tree_proven = True
     if not run.stdout_closed:
-        if process is not None and process.stdout is not None:
-            with contextlib.suppress(OSError, ValueError):
-                process.stdout.close()
+        if process is not None:
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    with contextlib.suppress(OSError, ValueError):
+                        stream.close()
         run.stdout_closed = True
     if not run.scratch_removed:
         if run.scratch_script is not None:
@@ -1204,6 +1423,11 @@ def _advance_quarantined_run(run: _QuarantinedRun) -> None:
             with contextlib.suppress(Exception):
                 forget_pid(process.pid)
         run.pid_forgotten = True
+    if not run.execution_fence_released:
+        if run.execution_fence_fd is not None:
+            _release_project_execution_fence(run.execution_fence_fd)
+            run.execution_fence_fd = None
+        run.execution_fence_released = True
     if not run.lifecycle_closed:
         run.lifecycle.close()
         run.lifecycle_closed = True
@@ -1277,12 +1501,11 @@ def run_project_process(
 ) -> ProjectProcessResult:
     """Run argv under the persisted project's lease and secure process boundary.
 
-    ``timeout_seconds`` bounds the command only after bubblewrap has reported its
-    namespace init, that exact process has been bound to a pidfd, and the blocked
-    command has been released. Capability probing, workspace lease acquisition,
-    boundary construction, and hard-link scanning are preparation. They either
-    complete, fail with a preparation error, or honor ``cancel_event`` at their
-    explicit cancellation points; they are not reported as command timeouts.
+    ``timeout_seconds`` is one absolute deadline from the security probe through
+    workspace admission, boundary construction, hard-link scanning, spawn,
+    namespace binding, output collection, and proven teardown. Preparation runs
+    under bounded owners so timeout or cancellation can release caller capacity
+    without permitting a late project process spawn.
     """
     return _run_project_process(
         _project_id(project_id),
@@ -1291,6 +1514,9 @@ def run_project_process(
         output_limit_bytes = output_limit_bytes,
         cancel_event = cancel_event,
         output_callback = output_callback,
+        input_bytes = None,
+        separate_stderr = False,
+        before_spawn = None,
     )
 
 
@@ -1312,7 +1538,253 @@ def run_project_python(
         output_limit_bytes = output_limit_bytes,
         cancel_event = cancel_event,
         output_callback = output_callback,
+        input_bytes = None,
+        separate_stderr = False,
+        before_spawn = None,
     )
+
+
+def _run_trusted_project_hook_process(
+    invocation,
+    *,
+    timeout_seconds: float,
+    output_limit_bytes: int,
+    cancel_event: Optional[threading.Event],
+    end_snapshot = None,
+) -> ProjectProcessResult:
+    """Run one hash-bound hook without exposing a configurable security boundary."""
+    from .hook_runtime import (
+        _HookInvocation,
+        HookSessionEndSnapshot,
+        _END_SNAPSHOT_SEAL,
+        _hook_invocation_process_spec,
+        _revalidate_hook_invocation,
+    )
+
+    if not isinstance(invocation, _HookInvocation):
+        raise AgentWorkspaceError("Project hook invocation authority is invalid.")
+    argv, event_input = _hook_invocation_process_spec(invocation)
+    if not isinstance(event_input, bytes) or len(event_input) > MAX_STDIN_BYTES:
+        raise AgentWorkspaceError("Project hook input exceeds the supported size limit.")
+    workspace_override = None
+    captured_end = end_snapshot is not None
+    execution_fence_id = None
+    if captured_end:
+        if (
+            not isinstance(end_snapshot, HookSessionEndSnapshot)
+            or end_snapshot._seal is not _END_SNAPSHOT_SEAL
+            or invocation not in end_snapshot.invocations
+            or end_snapshot.token.project_id != invocation.project_id
+            or invocation.event != "SessionEnd"
+        ):
+            raise AgentWorkspaceError("Project hook end authority is invalid.")
+        workspace_override = end_snapshot.workspace
+        try:
+            payload = json.loads(event_input)
+        except (TypeError, ValueError) as exc:
+            raise AgentWorkspaceError("Project hook input authority is invalid.") from exc
+        delivery_id = payload.get("delivery_id") if isinstance(payload, dict) else None
+        expected_delivery_id = f"{end_snapshot.token.generation}:SessionEnd"
+        if delivery_id != expected_delivery_id:
+            raise AgentWorkspaceError("Project hook end delivery identity is invalid.")
+        # A delivery fans out to sibling handlers. The client-visible id stays
+        # identical across all of them and every retry, while the internal
+        # owner-death fence must serialize only retries of the same handler.
+        execution_fence_id = json.dumps(
+            (delivery_id, invocation.handler_id),
+            ensure_ascii = False,
+            separators = (",", ":"),
+        )
+
+    def revalidate(workspace) -> None:
+        _revalidate_hook_invocation(invocation, workspace, captured_end = captured_end)
+
+    return _run_project_process(
+        _project_id(invocation.project_id),
+        _normalized_argv(argv),
+        timeout_seconds = timeout_seconds,
+        output_limit_bytes = output_limit_bytes,
+        cancel_event = cancel_event,
+        output_callback = None,
+        input_bytes = event_input,
+        separate_stderr = True,
+        before_spawn = revalidate,
+        workspace_override = workspace_override,
+        absolute_deadline = invocation.deadline_monotonic,
+        execution_fence_id = execution_fence_id,
+    )
+
+
+def _bind_project_command_capability(
+    project_id: str, command: str, argv: Sequence[str], proof: dict
+) -> _ProjectCommandCapability:
+    """Bind one reviewed full-access command to its exact policy snapshot."""
+    normalized_project_id = _project_id(project_id)
+    normalized_argv = _normalized_argv(argv)
+    if not isinstance(command, str) or not command.strip() or "\x00" in command:
+        raise AgentWorkspaceError("Project command authority is invalid.")
+    if not isinstance(proof, dict):
+        raise AgentWorkspaceError("Project command approval proof is missing.")
+    if proof.get("projectId") != normalized_project_id or proof.get("command") != command:
+        raise AgentWorkspaceError("Project command approval does not match this command.")
+    if tuple(proof.get("argv") or ()) != normalized_argv:
+        raise AgentWorkspaceError("Project command approval does not match this argv.")
+    identity = proof.get("workspaceIdentity")
+    if not isinstance(identity, (list, tuple)) or len(identity) != 2:
+        raise AgentWorkspaceError("Project command workspace proof is invalid.")
+    policy_hash = proof.get("policyHash")
+    if not isinstance(policy_hash, str) or not policy_hash:
+        raise AgentWorkspaceError("Project command policy proof is invalid.")
+    return _ProjectCommandCapability(
+        project_id = normalized_project_id,
+        command = command,
+        argv = normalized_argv,
+        policy_hash = policy_hash,
+        workspace_identity = (int(identity[0]), int(identity[1])),
+        workspace_revision = int(proof.get("workspaceRevision")),
+        approved = proof.get("approved") is True,
+    )
+
+
+def _revalidate_project_command_capability(
+    capability: _ProjectCommandCapability, workspace
+) -> None:
+    from .rules import (
+        discover_project_command_rules,
+        evaluate_terminal_command_rules,
+        secure_command_rule_traversal_supported,
+    )
+
+    identity = (int(workspace.device_id), int(workspace.file_id))
+    if (
+        workspace.project_id != capability.project_id
+        or identity != capability.workspace_identity
+        or int(workspace.revision) != capability.workspace_revision
+    ):
+        raise AgentWorkspaceError("Project command workspace changed before execution.")
+    if not secure_command_rule_traversal_supported():
+        raise ProjectExecutionUnavailable(
+            "Secure project command policy is unavailable on this platform."
+        )
+    discovered = discover_project_command_rules(
+        workspace.root,
+        expected_identity = identity,
+        project_trusted = True,
+    )
+    policy = evaluate_terminal_command_rules(discovered, capability.command)
+    if policy.get("policyHash") != capability.policy_hash:
+        raise AgentWorkspaceError("Project command policy changed before execution.")
+    decision = policy.get("decision")
+    if decision == "forbidden":
+        raise AgentWorkspaceError("Project command is forbidden by the current policy.")
+    if decision == "prompt" and not capability.approved:
+        raise AgentWorkspaceError("Project command approval is missing for the current policy.")
+
+
+def _spawn_authorized_project_host_command(
+    capability: _ProjectCommandCapability,
+    popen_options: dict,
+    cancel_event: Optional[threading.Event] = None,
+) -> subprocess.Popen:
+    """Spawn one full-access project command after lifetime-thread revalidation."""
+    if not isinstance(capability, _ProjectCommandCapability):
+        raise AgentWorkspaceError("Project command capability is invalid.")
+    if not isinstance(popen_options, dict):
+        raise AgentWorkspaceError("Project command process options are invalid.")
+    if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+        raise AgentWorkspaceError("Project command cancellation must use a threading event.")
+    options = dict(popen_options)
+
+    def spawn() -> subprocess.Popen:
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("Project command was cancelled before launch.")
+        with common.project_workspace_access(capability.project_id) as workspace:
+            _revalidate_project_command_capability(capability, workspace)
+            if os.path.realpath(str(options.get("cwd") or "")) != os.path.realpath(
+                str(workspace.root)
+            ):
+                raise AgentWorkspaceError("Project command working directory changed.")
+            # Revalidation can block on filesystem and policy reads. Cancellation
+            # that wins while those checks run must prevent the host process from
+            # crossing the final launch boundary.
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Project command was cancelled before launch.")
+            return subprocess.Popen(capability.argv, **options)
+
+    return spawn_on_lifetime_thread(spawn)
+
+
+def _project_execution_fence_path(fence_id: str) -> str:
+    if (
+        not isinstance(fence_id, str)
+        or not fence_id
+        or len(fence_id.encode("utf-8", errors = "strict")) > 1024
+    ):
+        raise AgentWorkspaceError("Project execution fence identity is invalid.")
+    from utils.paths.storage_roots import studio_root  # noqa: PLC0415
+
+    directory = os.path.join(str(studio_root()), "project-hook-execution-fences")
+    os.makedirs(directory, mode = 0o700, exist_ok = True)
+    directory_metadata = os.lstat(directory)
+    if not stat.S_ISDIR(directory_metadata.st_mode) or stat.S_ISLNK(directory_metadata.st_mode):
+        raise ProjectExecutionUnavailable("Project execution fence directory is unsafe.")
+    # Keep the complete digest. Deliberately sharding identities onto a small
+    # fixed lock set lets unrelated sibling handlers serialize and can make one
+    # miss its deadline behind another. The full digest gives every stable
+    # composite delivery/handler identity its own process-shared inode.
+    digest = hashlib.sha256(fence_id.encode("utf-8")).hexdigest()
+    return os.path.join(directory, f"{digest}.lock")
+
+
+def _acquire_project_execution_fence(
+    fence_id: str, cancel_event: Optional[threading.Event], deadline: float
+) -> int:
+    """Acquire a process-wide finalizer fence until the prior tree is dead."""
+    if os.name != "posix":
+        raise ProjectExecutionUnavailable(
+            "Project execution fencing is unavailable on this platform."
+        )
+    try:
+        import fcntl  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover - non-POSIX fails above
+        raise ProjectExecutionUnavailable(
+            "Project execution fencing is unavailable on this platform."
+        ) from exc
+    path = _project_execution_fence_path(fence_id)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise ProjectExecutionUnavailable("Project execution fence file is unsafe.")
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Project execution fence wait was cancelled.")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Project execution fence wait exceeded its deadline.")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return descriptor
+            except BlockingIOError:
+                if cancel_event is not None:
+                    cancel_event.wait(min(_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+                else:
+                    time.sleep(min(_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _release_project_execution_fence(descriptor: int) -> None:
+    try:
+        import fcntl  # noqa: PLC0415
+        with contextlib.suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
 
 
 def _run_project_process(
@@ -1324,21 +1796,61 @@ def _run_project_process(
     output_limit_bytes: int,
     cancel_event: Optional[threading.Event],
     output_callback,
+    input_bytes: Optional[bytes],
+    separate_stderr: bool,
+    before_spawn,
+    workspace_override = None,
+    absolute_deadline: Optional[float] = None,
+    execution_fence_id: Optional[str] = None,
 ) -> ProjectProcessResult:
     timeout = _timeout(timeout_seconds)
+    deadline = (
+        absolute_deadline
+        if absolute_deadline is not None
+        else math.inf
+        if timeout is None
+        else time.monotonic() + timeout
+    )
     limit = _output_limit(output_limit_bytes)
+    if input_bytes is not None:
+        if not isinstance(input_bytes, bytes) or len(input_bytes) > MAX_STDIN_BYTES:
+            raise AgentWorkspaceError("Project command input exceeds the supported size limit.")
+    if not isinstance(separate_stderr, bool):
+        raise AgentWorkspaceError("Project command output mode is invalid.")
     if cancel_event is not None and not isinstance(cancel_event, threading.Event):
         raise AgentWorkspaceError("Project command cancellation must use a threading event.")
     if cancel_event is not None and cancel_event.is_set():
         return ProjectProcessResult("cancelled", None, "", 0, False)
 
-    status = supervised_process_status()
+    try:
+        status = _bounded_preparation(
+            supervised_process_status,
+            cancel_event = cancel_event,
+            deadline = deadline,
+            label = "security probe",
+        )
+    except InterruptedError:
+        return ProjectProcessResult("cancelled", None, "", 0, False)
+    except TimeoutError:
+        return ProjectProcessResult("timed_out", None, "", 0, False)
     if not status.available:
         raise ProjectExecutionUnavailable(
             status.reason or "Secure supervised project commands are unavailable."
         )
 
-    lease = common.project_workspace_access(project_id)
+    if workspace_override is not None:
+        if (
+            not isinstance(workspace_override, common.ProjectWorkspace)
+            or workspace_override.project_id != project_id
+        ):
+            raise AgentWorkspaceError("Project workspace snapshot is invalid.")
+        lease = contextlib.nullcontext(workspace_override)
+    else:
+        lease = common.project_workspace_access(
+            project_id,
+            cancel_event = cancel_event,
+            deadline = deadline,
+        )
     lease_entered = False
     boundary = None
     lifecycle: Optional[_BubblewrapLifecycle] = None
@@ -1350,26 +1862,96 @@ def _run_project_process(
     after_spawn_done = False
     lifecycle_bound = False
     output = _OutputBuffer(limit, output_callback)
+    stderr_output = _OutputBuffer(limit)
     scratch_script: Optional[str] = None
+    execution_fence_fd: Optional[int] = None
+    popen_preparation_detached = False
     result_status = "failed"
     exit_code: Optional[int] = None
+
+    def close_pre_spawn_resources() -> None:
+        nonlocal lease_entered, boundary, lifecycle, scratch_script, execution_fence_fd
+        try:
+            if lifecycle is not None:
+                lifecycle.close()
+        finally:
+            lifecycle = None
+            try:
+                if scratch_script is not None:
+                    with contextlib.suppress(OSError):
+                        os.unlink(scratch_script)
+                    scratch_script = None
+                if boundary is not None:
+                    try:
+                        boundary.close()
+                    finally:
+                        boundary = None
+            finally:
+                try:
+                    if lease_entered:
+                        lease.__exit__(None, None, None)
+                        lease_entered = False
+                finally:
+                    if execution_fence_fd is not None:
+                        _release_project_execution_fence(execution_fence_fd)
+                        execution_fence_fd = None
+
+    def mark_popen_preparation_detached() -> None:
+        nonlocal popen_preparation_detached
+        popen_preparation_detached = True
+
     try:
-        workspace = lease.__enter__()
+        workspace = _bounded_preparation(
+            lease.__enter__,
+            cancel_event = cancel_event,
+            deadline = deadline,
+            label = "workspace lease acquisition",
+            close_late_result = lambda _workspace: lease.__exit__(None, None, None),
+        )
         lease_entered = True
+        if time.monotonic() >= deadline:
+            return ProjectProcessResult("timed_out", None, "", 0, False)
         if cancel_event is not None and cancel_event.is_set():
             return ProjectProcessResult("cancelled", None, "", 0, False)
 
-        boundary = execution.ProjectExecutionBoundary.open(workspace)
+        boundary = _bounded_preparation(
+            lambda: execution.ProjectExecutionBoundary.open(
+                workspace,
+                cancel_event = cancel_event,
+                deadline = deadline,
+            ),
+            cancel_event = cancel_event,
+            deadline = deadline,
+            label = "execution boundary setup",
+            close_late_result = lambda opened: opened.close(),
+        )
         if boundary.backend != "bubblewrap":
             raise ProjectExecutionUnavailable(
                 "The opened project boundary cannot contain detached processes."
             )
-        if not boundary.acquire_execution_slot(cancel_event):
-            return ProjectProcessResult("cancelled", None, "", 0, False)
+        if not boundary.acquire_execution_slot(cancel_event, deadline):
+            return ProjectProcessResult(
+                "cancelled" if cancel_event is not None and cancel_event.is_set() else "timed_out",
+                None,
+                "",
+                0,
+                False,
+            )
         if cancel_event is not None and cancel_event.is_set():
             return ProjectProcessResult("cancelled", None, "", 0, False)
 
+        if execution_fence_id is not None:
+            execution_fence_fd = _acquire_project_execution_fence(
+                execution_fence_id,
+                cancel_event,
+                deadline,
+            )
+            if cancel_event is not None and cancel_event.is_set():
+                return ProjectProcessResult("cancelled", None, "", 0, False)
+
         lifecycle = _BubblewrapLifecycle()
+        if execution_fence_fd is not None:
+            lifecycle.attach_execution_fence(execution_fence_fd)
         if python_source is not None:
             descriptor, scratch_script = tempfile.mkstemp(
                 suffix = ".py",
@@ -1389,7 +1971,20 @@ def _run_project_process(
             command = (os.path.realpath(sys.executable), "-u", scratch_script)
         wrapped = lifecycle.wrap_argv(boundary.wrap_argv(command))
         environment = _minimal_environment(boundary, workspace, workspace.project_id)
-        options = _popen_options(boundary, environment, lifecycle)
+        options = _bounded_preparation(
+            lambda: _popen_options(
+                boundary,
+                environment,
+                lifecycle,
+                input_pipe = input_bytes is not None,
+                separate_stderr = separate_stderr,
+            ),
+            cancel_event = cancel_event,
+            deadline = deadline,
+            label = "process option preparation",
+            on_detach = mark_popen_preparation_detached,
+            on_late_finish = close_pre_spawn_resources,
+        )
         if cancel_event is not None and cancel_event.is_set():
             return ProjectProcessResult("cancelled", None, "", 0, False)
 
@@ -1404,14 +1999,31 @@ def _run_project_process(
             lifecycle.after_spawn(spawned)
             spawn_ownership.after_spawn_done = True
 
-        spawn_attempt = _SpawnAttempt(
-            lambda: subprocess.Popen(wrapped, **options),
-            own_spawned_process,
+        def spawn_process() -> subprocess.Popen:
+            # Hook authority is checked on the lifetime thread in the same call
+            # that creates the process. No queue wait can sit between this check
+            # and Popen.
+            if before_spawn is not None:
+                before_spawn(workspace)
+            # Revalidation may block. Authority expiring while it runs must not
+            # leave a late lifetime-thread Popen after the caller has already
+            # returned timeout or cancellation and quarantined the boundary.
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Project process was cancelled before spawn.")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Project process deadline expired before spawn.")
+            return subprocess.Popen(wrapped, **options)
+
+        spawn_attempt = _SpawnAttempt(spawn_process, own_spawned_process)
+        spawn_state = spawn_attempt.wait(
+            cancel_event,
+            max(0.0, min(_SPAWN_WAIT_SECONDS, deadline - time.monotonic())),
         )
-        spawn_state = spawn_attempt.wait(cancel_event, _SPAWN_WAIT_SECONDS)
         if spawn_state == "cancelled":
             return ProjectProcessResult("cancelled", None, "", 0, False)
         if spawn_state == "not_started":
+            if time.monotonic() >= deadline:
+                return ProjectProcessResult("timed_out", None, "", 0, False)
             raise ProjectExecutionUnavailable(
                 "The project process spawn did not start within its preparation limit."
             )
@@ -1423,10 +2035,14 @@ def _run_project_process(
                 spawn_attempt = spawn_attempt,
                 spawn_ownership = spawn_ownership,
                 scratch_script = scratch_script,
+                execution_fence_fd = execution_fence_fd,
             )
+            execution_fence_fd = None
             quarantined = True
             if cancel_event is not None and cancel_event.is_set():
                 return ProjectProcessResult("cancelled", None, "", 0, False)
+            if time.monotonic() >= deadline:
+                return ProjectProcessResult("timed_out", None, "", 0, False)
             raise ProjectProcessContainmentError(
                 "The project process spawn is still resolving. Its workspace lease and "
                 "mutation slot remain locked."
@@ -1435,20 +2051,49 @@ def _run_project_process(
         adopted = spawn_ownership.adopted
         after_spawn_done = spawn_ownership.after_spawn_done
         process = spawn_attempt.result()
-        bound_without_cancellation = lifecycle.bind(process, cancel_event)
+        bound_without_cancellation = lifecycle.bind(process, cancel_event, deadline)
         lifecycle_bound = True
         if process.stdout is None:
             raise RuntimeError("The supervised process has no output pipe.")
         descriptor = process.stdout.fileno()
         os.set_blocking(descriptor, False)
+        stderr_descriptor = None
+        if separate_stderr:
+            if process.stderr is None:
+                raise RuntimeError("The supervised process has no stderr pipe.")
+            stderr_descriptor = process.stderr.fileno()
+            os.set_blocking(stderr_descriptor, False)
+        stdin_descriptor = None
+        input_offset = 0
+        if input_bytes is not None:
+            if process.stdin is None:
+                raise RuntimeError("The supervised process has no input pipe.")
+            stdin_descriptor = process.stdin.fileno()
+            os.set_blocking(stdin_descriptor, False)
+            if not input_bytes:
+                process.stdin.close()
+                stdin_descriptor = None
 
         if not bound_without_cancellation or not lifecycle.release(cancel_event):
             result_status = "cancelled"
         else:
-            deadline = math.inf if timeout is None else time.monotonic() + timeout
             stop = _StopSignal(cancel_event, deadline)
             while True:
                 output.read_available(descriptor)
+                if stderr_descriptor is not None:
+                    stderr_output.read_available(stderr_descriptor)
+                if stdin_descriptor is not None:
+                    try:
+                        written = os.write(stdin_descriptor, input_bytes[input_offset:])
+                    except (BlockingIOError, InterruptedError):
+                        written = 0
+                    except BrokenPipeError:
+                        written = len(input_bytes) - input_offset
+                    input_offset += written
+                    if input_offset >= len(input_bytes):
+                        with contextlib.suppress(OSError, ValueError):
+                            process.stdin.close()
+                        stdin_descriptor = None
                 observed_exit = process.poll()
                 if observed_exit is not None:
                     exit_code = int(observed_exit)
@@ -1459,6 +2104,10 @@ def _run_project_process(
                     result_status = reason
                     break
                 stop.wait(_POLL_SECONDS)
+    except TimeoutError:
+        result_status = "timed_out"
+    except InterruptedError:
+        result_status = "cancelled"
     finally:
         if process is not None:
             cleanup_run = _QuarantinedRun(
@@ -1470,7 +2119,9 @@ def _run_project_process(
                 adopted = adopted or spawn_ownership.adopted,
                 after_spawn_done = after_spawn_done or spawn_ownership.after_spawn_done,
                 lifecycle_bound = lifecycle_bound,
+                execution_fence_fd = execution_fence_fd,
             )
+            execution_fence_fd = None
             try:
                 if lifecycle is None:
                     raise ProjectProcessContainmentError(
@@ -1489,6 +2140,9 @@ def _run_project_process(
                 if process.stdout is not None:
                     with contextlib.suppress(OSError, ValueError):
                         output.read_available(process.stdout.fileno(), max_chunks = 64)
+                if separate_stderr and process.stderr is not None:
+                    with contextlib.suppress(OSError, ValueError):
+                        stderr_output.read_available(process.stderr.fileno(), max_chunks = 64)
                 _advance_quarantined_run(cleanup_run)
             except BaseException as exc:
                 if (
@@ -1507,22 +2161,11 @@ def _run_project_process(
                 exit_code = reaped_code
                 result_status = "passed" if exit_code == 0 else "failed"
             quarantined = True
-        if not quarantined:
-            try:
-                if lifecycle is not None:
-                    lifecycle.close()
-            finally:
-                try:
-                    if scratch_script is not None:
-                        with contextlib.suppress(OSError):
-                            os.unlink(scratch_script)
-                    if boundary is not None:
-                        boundary.close()
-                finally:
-                    if lease_entered:
-                        lease.__exit__(None, None, None)
+        if not quarantined and not popen_preparation_detached:
+            close_pre_spawn_resources()
 
     rendered, output_bytes, truncated, truncation_notice = output.result()
+    rendered_stderr, stderr_bytes, stderr_truncated, _stderr_notice = stderr_output.result()
     if result_status in {"cancelled", "timed_out"}:
         exit_code = None
     return ProjectProcessResult(
@@ -1532,6 +2175,9 @@ def _run_project_process(
         output_bytes = output_bytes,
         output_truncated = truncated,
         truncation_notice = truncation_notice,
+        stderr = rendered_stderr,
+        stderr_bytes = stderr_bytes,
+        stderr_truncated = stderr_truncated,
     )
 
 

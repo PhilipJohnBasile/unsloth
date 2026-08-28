@@ -3553,12 +3553,27 @@ class TestGgufVisionMessages:
 
 class TestGgufVisionToolRouting:
     class _Request:
-        state = SimpleNamespace()
         url = SimpleNamespace(path = "/v1/chat/completions")
         method = "POST"
 
+        def __init__(self):
+            self.state = SimpleNamespace()
+
         async def is_disconnected(self):
             return False
+
+    def test_synthetic_requests_do_not_share_generation_cancel_event(self):
+        import routes.inference as inf_mod
+
+        first = self._Request()
+        second = self._Request()
+        first_event = inf_mod._chat_cancel_event(first)
+        first_event.set()
+        second_event = inf_mod._chat_cancel_event(second)
+
+        assert first.state is not second.state
+        assert first_event is not second_event
+        assert not second_event.is_set()
 
     @staticmethod
     def _drive(coro):
@@ -5341,9 +5356,11 @@ class TestGgufVisionToolRouting:
 
 class TestApiMonitorProviderAndCompletionStreams:
     class _Request:
-        state = SimpleNamespace()
         url = SimpleNamespace(path = "/v1/chat/completions")
         method = "POST"
+
+        def __init__(self):
+            self.state = SimpleNamespace()
 
         async def is_disconnected(self):
             return False
@@ -6234,11 +6251,11 @@ class TestApiMonitorProviderAndCompletionStreams:
             )
 
             response = await _proxy_to_external_provider(payload, self._Request())
-            chunks = []
-            async for chunk in response.body_iterator:
-                chunks.append(chunk)
+            data = json.loads(response.body)
 
-            assert chunks[-1] == "data: [DONE]\n\n"
+            assert response.media_type == "application/json"
+            assert data["choices"][0]["message"]["content"] == "provider [DONE] reply"
+            assert data["usage"]["total_tokens"] == 7
             [entry] = monitor.snapshot()
             assert entry["status"] == "completed"
             assert entry["reply"] == "provider [DONE] reply"
@@ -8262,9 +8279,11 @@ class TestApiMonitorProviderAndCompletionStreams:
 
 class TestApiMonitorSafetensorsUsage:
     class _Request:
-        state = SimpleNamespace()
         url = SimpleNamespace(path = "/v1/chat/completions")
         method = "POST"
+
+        def __init__(self):
+            self.state = SimpleNamespace()
 
     def test_non_streaming_safetensors_keeps_event_loop_responsive(self, monkeypatch):
         async def _run():
@@ -8931,9 +8950,11 @@ class TestResponsesChatTemplateKwargs:
 
     class _Request:
         app = SimpleNamespace(state = SimpleNamespace(llama_parallel_slots = 1))
-        state = SimpleNamespace()
         url = SimpleNamespace(path = "/v1/responses")
         method = "POST"
+
+        def __init__(self):
+            self.state = SimpleNamespace()
 
         async def is_disconnected(self):
             return False

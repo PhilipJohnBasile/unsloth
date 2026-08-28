@@ -28,6 +28,10 @@ _backend = os.path.join(os.path.dirname(__file__), "..")
 sys.path.insert(0, _backend)
 
 import routes.inference as inf_mod
+from core.agent_workspace.hook_runtime import (
+    HookEventResult,
+    activate_project_hook_turn,
+)
 from models.inference import ChatCompletionRequest, ChatMessage
 from routes.inference import (
     _is_lost_upstream_connection,
@@ -122,14 +126,77 @@ class _FakeNonStreamingClient:
         )
 
 
+class _StopTurn:
+    def __init__(self, results):
+        self.cancel_event = threading.Event()
+        self._results = list(results)
+        self.candidates = []
+        self.stop_calls = 0
+
+    def stop(self, *, last_assistant_message):
+        self.candidates.append(last_assistant_message)
+        self.stop_calls += 1
+        if self._results:
+            return self._results.pop(0)
+        return HookEventResult(event = "Stop")
+
+
+def _continue(reason, handler_id):
+    return HookEventResult(
+        event = "Stop",
+        blocked = True,
+        continuation_reason = reason,
+        continuation_reasons = (reason,),
+        continuation_fragments = ((handler_id, reason),),
+    )
+
+
+def _completion(
+    content,
+    *,
+    usage = None,
+    finish_reason = "stop",
+    tool_calls = None,
+):
+    message = {"role": "assistant", "content": content}
+    if tool_calls is not None:
+        message["tool_calls"] = tool_calls
+    return {
+        "id": f"chatcmpl-{content or 'tool'}",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "gguf",
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": usage or {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    }
+
+
+class _SequenceNonStreamingClient:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    async def aclose(self):
+        pass
+
+    async def post(self, url, **kwargs):
+        self.requests.append((url, kwargs["json"]))
+        return httpx.Response(200, json = self.responses.pop(0))
+
+
 def _install_stream_transport(monkeypatch, calls):
     def handler(request: httpx.Request) -> httpx.Response:
         calls.append(str(request.url))
         if str(request.url).startswith(_DEAD):
             raise httpx.ConnectError("connection refused")
         content = (
-            f"data: {json.dumps({'choices': [{'delta': {'content': 'hi'}}]})}\n\n"
-            "data: [DONE]\n\n"
+            f"data: {json.dumps({'choices': [{'delta': {'content': 'hi'}}]})}\n\ndata: [DONE]\n\n"
         )
         return httpx.Response(
             200,
@@ -164,11 +231,13 @@ async def _run_non_streaming(backend):
 
 
 async def _run_stream(backend, lease = None):
+    payload = _payload()
+    payload.stream = True
     response = await _openai_passthrough_stream_admitted(
         _Request(),
         threading.Event(),
         backend,
-        _payload(),
+        payload,
         "test-model",
         "chatcmpl-local",
         admission_lease = lease or _Lease(),
@@ -248,6 +317,121 @@ def test_non_streaming_respawns_at_most_once(monkeypatch):
     assert client.urls == [f"{_DEAD}/v1/chat/completions"] * 2
 
 
+def test_non_streaming_runs_two_real_stop_continuations(monkeypatch):
+    client = _SequenceNonStreamingClient(
+        [
+            _completion("A", usage = {"total_tokens": 2}),
+            _completion("B", usage = {"total_tokens": 3}),
+            _completion("C", usage = {"total_tokens": 5}),
+        ]
+    )
+    monkeypatch.setattr(inf_mod, "_cancelable_nonstreaming_client", lambda: client)
+    turn = _StopTurn(
+        [
+            _continue("repair one", "first"),
+            _continue("repair two", "second"),
+            HookEventResult(event = "Stop"),
+        ]
+    )
+
+    with activate_project_hook_turn(turn):
+        response = asyncio.run(_run_non_streaming(_Backend()))
+
+    data = json.loads(response.body)
+    assert data["choices"][0]["message"]["content"] == "ABC"
+    assert data["usage"]["total_tokens"] == 10
+    assert turn.candidates == ["A", "B", "C"]
+    assert len(client.requests) == 3
+    first_continuation = client.requests[1][1]["messages"]
+    second_continuation = client.requests[2][1]["messages"]
+    assert first_continuation[-2] == {"role": "assistant", "content": "A"}
+    assert "repair one" in first_continuation[-1]["content"]
+    assert [message["role"] for message in second_continuation[-4:]] == [
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert "repair two" in second_continuation[-1]["content"]
+
+
+def test_non_streaming_continue_false_finalizes_without_dispatch(monkeypatch):
+    client = _SequenceNonStreamingClient([_completion("final")])
+    monkeypatch.setattr(inf_mod, "_cancelable_nonstreaming_client", lambda: client)
+    turn = _StopTurn([HookEventResult(event = "Stop", stop_requested = True)])
+
+    with activate_project_hook_turn(turn):
+        response = asyncio.run(_run_non_streaming(_Backend()))
+
+    assert json.loads(response.body)["choices"][0]["message"]["content"] == "final"
+    assert turn.candidates == ["final"]
+    assert len(client.requests) == 1
+
+
+def test_non_streaming_pending_tool_call_skips_stop(monkeypatch):
+    tool_call = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+    client = _SequenceNonStreamingClient(
+        [_completion(None, finish_reason = "tool_calls", tool_calls = [tool_call])]
+    )
+    monkeypatch.setattr(inf_mod, "_cancelable_nonstreaming_client", lambda: client)
+    turn = _StopTurn([_continue("must not run", "bad")])
+
+    with activate_project_hook_turn(turn):
+        response = asyncio.run(_run_non_streaming(_Backend()))
+
+    assert json.loads(response.body)["choices"][0]["finish_reason"] == "tool_calls"
+    assert turn.candidates == []
+    assert len(client.requests) == 1
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"choices": []},
+        {
+            "choices": [
+                {"message": {"content": "one"}, "finish_reason": "stop"},
+                {"message": {"content": "two"}, "finish_reason": "stop"},
+            ]
+        },
+        {"choices": [{"message": {"content": "unfinished"}, "finish_reason": None}]},
+    ],
+)
+def test_non_streaming_project_stop_rejects_ambiguous_or_incomplete_json(monkeypatch, response):
+    client = _SequenceNonStreamingClient([response])
+    monkeypatch.setattr(inf_mod, "_cancelable_nonstreaming_client", lambda: client)
+    turn = _StopTurn([_continue("must not run", "bad")])
+
+    with activate_project_hook_turn(turn):
+        with pytest.raises(RuntimeError):
+            asyncio.run(_run_non_streaming(_Backend()))
+
+    assert turn.candidates == []
+    assert len(client.requests) == 1
+
+
+def test_non_streaming_project_stop_rejects_unparseable_success(monkeypatch):
+    class Client(_SequenceNonStreamingClient):
+        async def post(self, url, **kwargs):
+            self.requests.append((url, kwargs["json"]))
+            return httpx.Response(200, content = b"not-json")
+
+    client = Client([])
+    monkeypatch.setattr(inf_mod, "_cancelable_nonstreaming_client", lambda: client)
+    turn = _StopTurn([_continue("must not run", "bad")])
+
+    with activate_project_hook_turn(turn):
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(_run_non_streaming(_Backend()))
+
+    assert exc.value.status_code == 502
+    assert turn.candidates == []
+
+
 # ── Streaming ─────────────────────────────────────────────────
 
 
@@ -263,6 +447,290 @@ def test_streaming_retries_against_the_new_port(monkeypatch):
     # The retried stream really produced the turn, not just a clean-looking stop.
     assert "hi" in blob
     assert "[DONE]" in blob
+
+
+def test_streaming_holds_terminal_and_runs_two_stop_continuations(monkeypatch):
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        if body.get("stream"):
+            content = "".join(
+                [
+                    'data: {"id":"chatcmpl-a","model":"gguf","created":1,'
+                    '"choices":[{"index":0,"delta":{"content":"A"},'
+                    '"finish_reason":null}]}\n\n',
+                    'data: {"id":"chatcmpl-a","model":"gguf","created":1,'
+                    '"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+                    'data: {"id":"chatcmpl-a","model":"gguf","created":1,'
+                    '"choices":[],"usage":{"total_tokens":2}}\n\n',
+                    "data: [DONE]\n\n",
+                ]
+            )
+            return httpx.Response(
+                200,
+                content = content.encode(),
+                headers = {"content-type": "text/event-stream"},
+            )
+        content = "B" if len(requests) == 2 else "C"
+        return httpx.Response(
+            200,
+            json = _completion(content, usage = {"total_tokens": len(requests) + 1}),
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inf_mod.httpx,
+        "AsyncClient",
+        lambda *_args, **kwargs: real_client(
+            transport = transport,
+            timeout = kwargs.get("timeout", 600),
+        ),
+    )
+    turn = _StopTurn(
+        [
+            _continue("repair one", "first"),
+            _continue("repair two", "second"),
+            HookEventResult(event = "Stop"),
+        ]
+    )
+
+    with activate_project_hook_turn(turn):
+        blob = asyncio.run(_run_stream(_Backend()))
+
+    assert turn.candidates == ["A", "B", "C"], blob
+    assert len(requests) == 3
+    assert blob.count("data: [DONE]") == 1
+    assert blob.count('"finish_reason": "stop"') == 1
+    assert '"content":"A"' in blob
+    assert '"content": "B"' in blob
+    assert '"content": "C"' in blob
+    assert "repair one" in requests[1]["messages"][-1]["content"]
+    assert "repair two" in requests[2]["messages"][-1]["content"]
+
+
+@pytest.mark.parametrize("interrupt", ["cancel", "disconnect"])
+def test_streaming_interrupts_a_slow_stop_continuation_post(monkeypatch, interrupt):
+    class DisconnectableRequest(_Request):
+        def __init__(self):
+            self.disconnected = False
+
+        async def is_disconnected(self):
+            return self.disconnected
+
+    class WorkspaceLease:
+        def __init__(self):
+            self.release_calls = 0
+
+        async def release(self):
+            self.release_calls += 1
+
+    async def exercise():
+        content = "".join(
+            [
+                'data: {"id":"chatcmpl-a","model":"gguf","created":1,'
+                '"choices":[{"index":0,"delta":{"content":"A"},'
+                '"finish_reason":null}]}\n\n',
+                'data: {"id":"chatcmpl-a","model":"gguf","created":1,'
+                '"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+                "data: [DONE]\n\n",
+            ]
+        )
+        transport = httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                content = content.encode(),
+                headers = {"content-type": "text/event-stream"},
+            )
+        )
+        real_client = httpx.AsyncClient(transport = transport, timeout = 600)
+
+        class SlowContinuationClient:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.closed = asyncio.Event()
+                self.close_calls = 0
+
+            async def post(self, _url, **_kwargs):
+                self.started.set()
+                await self.closed.wait()
+                raise httpx.ReadError("continuation client closed")
+
+            async def aclose(self):
+                self.close_calls += 1
+                self.closed.set()
+
+        slow_client = SlowContinuationClient()
+        clients = iter((real_client, slow_client))
+        monkeypatch.setattr(inf_mod.httpx, "AsyncClient", lambda *_args, **_kwargs: next(clients))
+        request = DisconnectableRequest()
+        cancel_event = threading.Event()
+        admission_lease = _Lease()
+        workspace_lease = WorkspaceLease()
+        payload = _payload()
+        payload.stream = True
+        turn = _StopTurn([_continue("repair", "stop-handler")])
+
+        with activate_project_hook_turn(turn):
+            response = await _openai_passthrough_stream_admitted(
+                request,
+                cancel_event,
+                _Backend(),
+                payload,
+                "test-model",
+                "chatcmpl-local",
+                admission_lease = admission_lease,
+                tracker = _Tracker(),
+            )
+            inf_mod._attach_project_workspace_lease(response, workspace_lease)
+
+            async def consume_body():
+                async for _chunk in response.body_iterator:
+                    pass
+
+            consume = asyncio.create_task(consume_body())
+            await asyncio.wait_for(slow_client.started.wait(), timeout = 1)
+            if interrupt == "cancel":
+                cancel_event.set()
+            else:
+                request.disconnected = True
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(consume, timeout = 2)
+
+        assert cancel_event.is_set()
+        assert slow_client.close_calls >= 1
+        assert admission_lease.released
+        assert workspace_lease.release_calls == 1
+
+    asyncio.run(exercise())
+
+
+def test_streaming_continue_false_finalizes_once(monkeypatch):
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        content = "".join(
+            [
+                'data: {"choices":[{"index":0,"delta":{"content":"final"},'
+                '"finish_reason":null}]}\n\n',
+                'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+                "data: [DONE]\n\n",
+            ]
+        )
+        return httpx.Response(
+            200,
+            content = content.encode(),
+            headers = {"content-type": "text/event-stream"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inf_mod.httpx,
+        "AsyncClient",
+        lambda *_args, **kwargs: real_client(
+            transport = transport,
+            timeout = kwargs.get("timeout", 600),
+        ),
+    )
+    turn = _StopTurn([HookEventResult(event = "Stop", stop_requested = True)])
+
+    with activate_project_hook_turn(turn):
+        blob = asyncio.run(_run_stream(_Backend()))
+
+    assert turn.candidates == ["final"]
+    assert len(requests) == 1
+    assert blob.count("data: [DONE]") == 1
+    assert blob.count('"finish_reason": "stop"') == 1
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",
+        "data: [DONE]\n\n",
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+        (
+            'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            'data: {"choices":[],"usage":{"total_tokens":2}}\n\n'
+        ),
+        (
+            'data: {"choices":['
+            '{"index":0,"delta":{},"finish_reason":"stop"},'
+            '{"index":1,"delta":{},"finish_reason":"stop"}]}\n\n'
+            "data: [DONE]\n\n"
+        ),
+    ],
+)
+def test_streaming_project_stop_requires_finish_and_done(monkeypatch, content):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content = content.encode(),
+            headers = {"content-type": "text/event-stream"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inf_mod.httpx,
+        "AsyncClient",
+        lambda *_args, **kwargs: real_client(
+            transport = transport,
+            timeout = kwargs.get("timeout", 600),
+        ),
+    )
+    turn = _StopTurn([_continue("must not run", "bad")])
+
+    with activate_project_hook_turn(turn):
+        blob = asyncio.run(_run_stream(_Backend()))
+
+    assert turn.candidates == []
+    assert '"error"' in blob
+    assert blob.count("data: [DONE]") == 1
+
+
+def test_streaming_project_stop_rejects_finish_then_read_timeout(monkeypatch):
+    class TimeoutStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield (
+                b'data: {"choices":[{"index":0,"delta":{"content":"partial"},'
+                b'"finish_reason":null}]}\n\n'
+                b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            )
+            raise httpx.ReadTimeout("missing DONE")
+
+        async def aclose(self):
+            return None
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream = TimeoutStream(),
+            headers = {"content-type": "text/event-stream"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inf_mod.httpx,
+        "AsyncClient",
+        lambda *_args, **kwargs: real_client(
+            transport = transport,
+            timeout = kwargs.get("timeout", 600),
+        ),
+    )
+    turn = _StopTurn([_continue("must not run", "bad")])
+
+    with activate_project_hook_turn(turn):
+        blob = asyncio.run(_run_stream(_Backend()))
+
+    assert turn.candidates == []
+    assert '"error"' in blob
+    assert blob.count("data: [DONE]") == 1
 
 
 def test_streaming_still_502s_when_the_server_stays_dead(monkeypatch):
@@ -431,9 +899,9 @@ def test_non_streaming_retry_uses_the_respawned_api_key(monkeypatch):
     resp = asyncio.run(_run_non_streaming(backend))
 
     assert resp.status_code == 200
-    assert (
-        client.sent[-1][1]["Authorization"] == "Bearer key-after-the-respawn"
-    ), "the retry presented the pre-crash key, which the new server 401s"
+    assert client.sent[-1][1]["Authorization"] == "Bearer key-after-the-respawn", (
+        "the retry presented the pre-crash key, which the new server 401s"
+    )
 
 
 def test_streaming_retry_uses_the_respawned_api_key(monkeypatch):
@@ -444,8 +912,7 @@ def test_streaming_retry_uses_the_respawned_api_key(monkeypatch):
         if str(request.url).startswith(_DEAD):
             raise httpx.ConnectError("connection refused")
         content = (
-            f"data: {json.dumps({'choices': [{'delta': {'content': 'hi'}}]})}\n\n"
-            "data: [DONE]\n\n"
+            f"data: {json.dumps({'choices': [{'delta': {'content': 'hi'}}]})}\n\ndata: [DONE]\n\n"
         )
         return httpx.Response(
             200, content = content.encode(), headers = {"content-type": "text/event-stream"}
@@ -492,8 +959,7 @@ class _SlowDeadTransport(httpx.AsyncBaseTransport):
             await asyncio.sleep(self.delay)
             raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
         content = (
-            f"data: {json.dumps({'choices': [{'delta': {'content': 'hi'}}]})}\n\n"
-            "data: [DONE]\n\n"
+            f"data: {json.dumps({'choices': [{'delta': {'content': 'hi'}}]})}\n\ndata: [DONE]\n\n"
         )
         return httpx.Response(
             200, content = content.encode(), headers = {"content-type": "text/event-stream"}

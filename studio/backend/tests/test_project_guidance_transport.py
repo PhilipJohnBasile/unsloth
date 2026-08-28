@@ -4,6 +4,7 @@
 """Transport parity tests for authoritative project guidance injection."""
 
 import asyncio
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -350,6 +351,178 @@ def test_project_request_lease_unstarted_same_task_cleanup_releases_fence(monkey
         tools.begin_project_workspace_change(project_id)
         tools.finish_project_workspace_change(project_id)
         await response.body_iterator.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_project_request_lease_cancellation_during_enter_releases_late_acquisition(monkeypatch):
+    project_id = "context-cancelled-enter"
+    entered = threading.Event()
+    release_enter = threading.Event()
+    exited = threading.Event()
+    state = {"active": False, "exits": 0}
+
+    class BlockedContext:
+        def __enter__(self):
+            entered.set()
+            assert release_enter.wait(2)
+            state["active"] = True
+            return self
+
+        def __exit__(self, *_args):
+            assert state["active"] is True
+            state["active"] = False
+            state["exits"] += 1
+            exited.set()
+
+    monkeypatch.setattr(
+        workspace_lease,
+        "project_id_from_session",
+        lambda _session_id: project_id,
+    )
+    monkeypatch.setattr(tools, "project_workspace_in_flight", lambda _project_id: BlockedContext())
+
+    async def scenario():
+        task = asyncio.create_task(workspace_lease.ProjectWorkspaceRequestLease.acquire("session"))
+        assert await asyncio.to_thread(entered.wait, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert state == {"active": False, "exits": 0}
+        release_enter.set()
+        assert await asyncio.to_thread(exited.wait, 1)
+        assert state == {"active": False, "exits": 1}
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release_enter.set()
+
+
+def test_project_request_lease_completion_cancel_race_releases_exactly_once(monkeypatch):
+    project_id = "context-completion-cancel"
+    exited = threading.Event()
+    state = {"active": False, "exits": 0}
+    acquiring = {}
+    publish = workspace_lease._publish_context_acquisition
+
+    class Context:
+        def __enter__(self):
+            state["active"] = True
+            return self
+
+        def __exit__(self, *_args):
+            assert state["active"] is True
+            state["active"] = False
+            state["exits"] += 1
+            exited.set()
+
+    def cancel_before_delivery(publication):
+        acquiring["task"].cancel()
+        publish(publication)
+
+    monkeypatch.setattr(
+        workspace_lease,
+        "project_id_from_session",
+        lambda _session_id: project_id,
+    )
+    monkeypatch.setattr(tools, "project_workspace_in_flight", lambda _project_id: Context())
+    monkeypatch.setattr(
+        workspace_lease,
+        "_publish_context_acquisition",
+        cancel_before_delivery,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(workspace_lease.ProjectWorkspaceRequestLease.acquire("session"))
+        acquiring["task"] = task
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await asyncio.to_thread(exited.wait, 1)
+        assert state == {"active": False, "exits": 1}
+
+    asyncio.run(scenario())
+
+
+def test_project_request_lease_owner_releases_when_loop_stops_before_publication(monkeypatch):
+    state = {"active": False, "exits": 0}
+    exited = threading.Event()
+    loop = asyncio.new_event_loop()
+
+    class Context:
+        def __enter__(self):
+            state["active"] = True
+            return self
+
+        def __exit__(self, *_args):
+            assert state["active"] is True
+            state["active"] = False
+            state["exits"] += 1
+            exited.set()
+
+    monkeypatch.setattr(workspace_lease, "_ACQUISITION_ACK_SECONDS", 0.1)
+    monkeypatch.setattr(
+        workspace_lease,
+        "_publish_context_acquisition",
+        lambda _publication: loop.stop(),
+    )
+    asyncio.set_event_loop(loop)
+    task = loop.create_task(workspace_lease._acquire_context_owned(Context()))
+    try:
+        loop.run_forever()
+        assert task.done() is False
+        assert exited.wait(1)
+        assert state == {"active": False, "exits": 1}
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            loop.run_until_complete(task)
+    finally:
+        if not task.done():
+            task.cancel()
+            loop.run_until_complete(asyncio.gather(task, return_exceptions = True))
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+def test_project_request_lease_release_retries_submission_and_execution_failures(monkeypatch):
+    state = {"active": True, "exit_calls": 0}
+    real_submit = workspace_lease._submit_release_owner
+    submissions = 0
+
+    class Context:
+        def __exit__(self, *_args):
+            state["exit_calls"] += 1
+            if state["exit_calls"] == 1:
+                raise RuntimeError("exit failed")
+            assert state["active"] is True
+            state["active"] = False
+
+    def reject_once(loop, callback):
+        nonlocal submissions
+        submissions += 1
+        if submissions == 1:
+            raise RuntimeError("executor rejected release")
+        return real_submit(loop, callback)
+
+    monkeypatch.setattr(workspace_lease, "_submit_release_owner", reject_once)
+    lease = workspace_lease.ProjectWorkspaceRequestLease(Context())
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match = "executor rejected release"):
+            await lease.release()
+        assert lease._released is False
+        assert state == {"active": True, "exit_calls": 0}
+
+        with pytest.raises(RuntimeError, match = "exit failed"):
+            await lease.release()
+        assert lease._released is False
+        assert state == {"active": True, "exit_calls": 1}
+
+        await lease.release()
+        assert lease._released is True
+        assert state == {"active": False, "exit_calls": 2}
+        await lease.release()
+        assert state["exit_calls"] == 2
 
     asyncio.run(scenario())
 

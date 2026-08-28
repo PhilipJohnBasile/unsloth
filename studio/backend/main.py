@@ -630,6 +630,31 @@ def clear_compiled_cache_unless_shared(app: FastAPI) -> None:
     _clear_compiled_cache_unless_shared(getattr(app.state, "live_sibling_backend", None))
 
 
+_PROJECT_HOOK_RECOVERY_JOIN_TIMEOUT_S = 5.0
+
+
+@asynccontextmanager
+async def _project_hook_recovery_worker(thread, stop_event, logger):
+    """Own the periodic SessionEnd worker for exactly one app lifespan."""
+    thread.start()
+    try:
+        yield
+    finally:
+        stop_event.set()
+        try:
+            await asyncio.to_thread(
+                thread.join,
+                _PROJECT_HOOK_RECOVERY_JOIN_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 - shutdown must keep unwinding
+            logger.warning("project SessionEnd recovery worker join failed: %s", exc)
+        if thread.is_alive():
+            logger.warning(
+                "project SessionEnd recovery worker exceeded %.1fs shutdown bound",
+                _PROJECT_HOOK_RECOVERY_JOIN_TIMEOUT_S,
+            )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: detect hardware, seed default admin if needed. Shutdown: clean up compiled cache."""
@@ -671,6 +696,43 @@ async def lifespan(app: FastAPI):
         cleanup_orphaned_runs()
     except Exception as exc:
         _lifespan_log.warning("cleanup_orphaned_runs failed at startup: %s", exc)
+
+    _project_hook_end_recovery_stop = threading.Event()
+
+    def _recover_project_hook_session_ends_once() -> None:
+        try:
+            from core.agent_workspace.hook_runtime import (
+                recover_pending_project_hook_session_ends,
+            )
+
+            recovered = recover_pending_project_hook_session_ends(
+                stop_event = _project_hook_end_recovery_stop,
+            )
+            failures = sum(bool(result.errors) for result in recovered)
+            if recovered:
+                _lifespan_log.info(
+                    "Recovered %s pending project SessionEnd record(s), %s failed.",
+                    len(recovered),
+                    failures,
+                )
+        except Exception as exc:  # noqa: BLE001 - startup remains available
+            _lifespan_log.warning("project SessionEnd recovery failed at startup: %s", exc)
+
+    # Complete the crash-recovery ordering barrier before the app can admit a
+    # new generation for one of the same persisted thread ids.
+    _recover_project_hook_session_ends_once()
+
+    def _recover_project_hook_session_ends() -> None:
+        # Keep draining after startup so transient failures become eligible after
+        # their persisted backoff without requiring another process restart.
+        while not _project_hook_end_recovery_stop.wait(1.0):
+            _recover_project_hook_session_ends_once()
+
+    _project_hook_end_recovery_thread = threading.Thread(
+        target = _recover_project_hook_session_ends,
+        name = "project-hook-session-end-recovery",
+        daemon = True,
+    )
 
     try:
         from storage.chat_generation_runs_db import reconcile_orphaned_runs
@@ -776,12 +838,39 @@ async def lifespan(app: FastAPI):
 
     _api_usage_writer_lease = _acquire_api_usage_writer()
     _api_usage_callback_lease = _api_monitor.acquire_terminal_callback(_enqueue_api_usage)
-    yield
+    async with _project_hook_recovery_worker(
+        _project_hook_end_recovery_thread,
+        _project_hook_end_recovery_stop,
+        _lifespan_log,
+    ):
+        yield
 
     # Remove only this lifespan's callback. A concurrently live sibling keeps
     # both the monitor sink and the shared serialized writer. The final owner
     # drains accepted receipts off the event loop before stopping the worker.
     _api_monitor.release_terminal_callback(_api_usage_callback_lease)
+
+    try:
+        from core.agent_workspace.hook_runtime import end_all_project_hook_sessions
+
+        shutdown_hook_results = await asyncio.to_thread(
+            end_all_project_hook_sessions,
+            reason = "shutdown",
+            durable = True,
+        )
+        shutdown_hook_failures = [
+            result
+            for result in shutdown_hook_results
+            if result.errors
+            or any(run.status in {"failed", "timed_out", "cancelled"} for run in result.runs)
+        ]
+        if shutdown_hook_failures:
+            _lifespan_log.error(
+                "project hook shutdown left %s durable finalization failure(s)",
+                len(shutdown_hook_failures),
+            )
+    except Exception as exc:
+        _lifespan_log.warning("project hook shutdown cleanup failed: %s", exc)
 
     # Before any shutdown await: a warm finishing during one would still read the lifespan as current.
     _stop_post_warm_thread()

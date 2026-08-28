@@ -99,6 +99,7 @@ def _install_stream_transport(monkeypatch, calls):
             raise httpx.ConnectError("connection refused")
         content = (
             f"data: {json.dumps({'choices': [{'delta': {'content': 'hi'}}]})}\n\n"
+            f"data: {json.dumps({'choices': [{'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
             "data: [DONE]\n\n"
         )
         return httpx.Response(

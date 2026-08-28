@@ -510,8 +510,37 @@ class AnthropicStreamEmitter:
         elif etype == "metadata":
             self._usage = event.get("usage", {})
             return []
+        elif etype == "hook_continuation_boundary":
+            return self._handle_continuation_boundary()
         # status events — no Anthropic equivalent
         return []
+
+    def _handle_continuation_boundary(self) -> list[str]:
+        """Close one assistant candidate without ending the Anthropic message."""
+        events = []
+        if self._tag_buf:
+            held, self._tag_buf = self._tag_buf, ""
+            if self._route_mode == "thinking":
+                events.extend(self._emit_thinking_delta(held))
+            else:
+                events.extend(self._emit_text_delta(held))
+        if (
+            self._text_block_open
+            or self._thinking_block_open
+            or self._open_tool_call_id is not None
+        ):
+            events.append(self._close_block())
+        self._open_tool_call_id = None
+        self._open_tool_use_id = None
+        self._open_tool_args_sent = False
+        self._prev_text = ""
+        self._route_mode = "text"
+        self._think_consumed = False
+        self._turn_has_text = False
+        self._active_wrap = None
+        self._wrap_chars = 0
+        self._close_skip = 0
+        return events
 
     def finish(
         self,
@@ -1115,6 +1144,30 @@ class AnthropicPassthroughEmitter:
             )
         )
         return events
+
+    def continuation_boundary(self, *, reset_stop: bool = True) -> tuple[list[str], bool]:
+        """Finalize one candidate and optionally prepare for a continuation."""
+        events: list[str] = []
+        if self._reasoning_text_open:
+            self._reasoning_text_open = False
+            events.extend(self._emit_text_delta("</think>"))
+        if self._healer is not None:
+            for kind, value in self._healer.finalize():
+                if kind == "text" and value:
+                    events.extend(self._emit_text_delta(value))
+                elif kind == "tool_call":
+                    events.extend(self._emit_healed_tool_use(value))
+        has_tool_use = self._healed_tool_use or bool(self._tool_call_states)
+        if has_tool_use:
+            return events, True
+        if not reset_stop:
+            return events, False
+        if self._current_block_type is not None:
+            events.append(self._close_current_block())
+        self._tool_call_states.clear()
+        self._stop_reason = "end_turn"
+        self._stop_sequence = None
+        return events, False
 
     def _emit_text_delta(self, content: str) -> list[str]:
         events: list[str] = []

@@ -338,7 +338,12 @@ def test_full_access_terminal_rechecks_policy_immediately_before_legacy_popen(
         "git status",
         session_id = "project-example",
         disable_sandbox = True,
-        project_rule_proof = {"policyHash": policy["policyHash"], "approved": False},
+        project_rule_proof = {
+            "policyHash": policy["policyHash"],
+            "command": "git status",
+            "argv": list(tools._get_shell_cmd("git status")),
+            "approved": False,
+        },
     )
 
     assert "Execution error: popen reached" in result

@@ -19,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -238,7 +239,13 @@ def _open_directory(path: Path) -> tuple[int, tuple[int, int]]:
         ) from exc
 
 
-def _assert_regular_file_links_are_internal(root_fd: int, root_identity: tuple[int, int]) -> None:
+def _assert_regular_file_links_are_internal(
+    root_fd: int,
+    root_identity: tuple[int, int],
+    *,
+    cancel_event = None,
+    deadline: float | None = None,
+) -> None:
     """Reject project files with a hardlink outside the writable boundary."""
     try:
         root_metadata = os.fstat(root_fd)
@@ -266,12 +273,20 @@ def _assert_regular_file_links_are_internal(root_fd: int, root_identity: tuple[i
             follow_symlinks = False,
             dir_fd = root_fd,
         ):
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Project command preparation was cancelled.")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError("Project command preparation timed out.")
             directory_metadata = os.fstat(directory_fd)
             if int(directory_metadata.st_dev) != root_device:
                 raise ProjectExecutionUnavailable(
                     "Mounted directories inside project workspaces cannot run commands."
                 )
             for name in names:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise InterruptedError("Project command preparation was cancelled.")
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("Project command preparation timed out.")
                 metadata = os.stat(name, dir_fd = directory_fd, follow_symlinks = False)
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink == 1:
                     continue
@@ -287,7 +302,7 @@ def _assert_regular_file_links_are_internal(root_fd: int, root_identity: tuple[i
                 "A project file is hard-linked outside the workspace. Remove the external "
                 "hardlink before running commands."
             )
-    except ProjectExecutionUnavailable:
+    except (ProjectExecutionUnavailable, TimeoutError, InterruptedError):
         raise
     except OSError as exc:
         raise ProjectExecutionUnavailable(
@@ -407,7 +422,12 @@ class ProjectExecutionBoundary:
         self,
         root: Path | str,
         expected_identity: Optional[tuple[int, int]] = None,
+        *,
+        cancel_event = None,
+        deadline: float | None = None,
     ) -> None:
+        self._cancel_event = cancel_event
+        self._deadline = deadline
         status = execution_boundary_status()
         if not status.available or status.backend is None:
             raise ProjectExecutionUnavailable(status.reason or "Project execution is unavailable.")
@@ -491,8 +511,16 @@ class ProjectExecutionBoundary:
         cls,
         root: Path | str,
         expected_identity: Optional[tuple[int, int]] = None,
+        *,
+        cancel_event = None,
+        deadline: float | None = None,
     ) -> "ProjectExecutionBoundary":
-        return cls(root, expected_identity)
+        return cls(
+            root,
+            expected_identity,
+            cancel_event = cancel_event,
+            deadline = deadline,
+        )
 
     def __enter__(self) -> "ProjectExecutionBoundary":
         return self
@@ -517,11 +545,20 @@ class ProjectExecutionBoundary:
                 os.close(descriptor)
         shutil.rmtree(self._container, ignore_errors = True)
 
-    def acquire_execution_slot(self, cancel_event = None) -> bool:
+    def acquire_execution_slot(
+        self,
+        cancel_event = None,
+        deadline: float | None = None,
+    ) -> bool:
         if self._slot:
             return True
         self.recheck()
-        if not acquire_workspace_mutation_slot(self.root_identity, cancel_event):
+        effective_deadline = self._deadline if deadline is None else deadline
+        if not acquire_workspace_mutation_slot(
+            self.root_identity,
+            cancel_event,
+            effective_deadline,
+        ):
             return False
         try:
             self.recheck()
@@ -636,7 +673,12 @@ class ProjectExecutionBoundary:
 
     def popen_kwargs(self, preexec_fn: Optional[Callable[[], None]] = None) -> dict:
         self.recheck()
-        _assert_regular_file_links_are_internal(self._root_fd, self.root_identity)
+        _assert_regular_file_links_are_internal(
+            self._root_fd,
+            self.root_identity,
+            cancel_event = self._cancel_event,
+            deadline = self._deadline,
+        )
         self.recheck()
         descriptors = [
             self._root_fd,

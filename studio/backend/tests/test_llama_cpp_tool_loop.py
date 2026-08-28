@@ -29,6 +29,8 @@ from core.inference.llama_cpp import (
     GgufLoadIntent,
     LlamaCppBackend,
 )
+from core.agent_workspace import hook_runtime
+from core.inference import llama_cpp as llama_cpp_mod
 from core.inference.tool_call_parser import NUDGE_TOOL_CALLS_STATUS
 from state import tool_approvals
 from state.tool_approvals import TOOL_REJECTED_MESSAGE, resolve_tool_decision
@@ -177,6 +179,52 @@ def test_plain_stream_reports_request_scoped_live_prompt_and_generation_timings(
     assert samples[-1]["predicted_per_second"] == 200
 
 
+def test_plain_stream_compaction_hook_abort_never_opens_generation(monkeypatch):
+    payloads: list[dict] = []
+    backend = _make_backend(monkeypatch, [], payloads)
+    monkeypatch.setattr(
+        llama_cpp_mod,
+        "_fit_with_instruction_pins",
+        lambda messages, **_kwargs: (
+            messages,
+            {
+                "fits": False,
+                "dropped_messages": 0,
+                "hook_blocked": True,
+                "hook_reason": "keep the current context",
+            },
+        ),
+    )
+    monkeypatch.setattr(llama_cpp_mod, "_sticky_compaction_state", lambda *_a, **_k: (0, False))
+    monkeypatch.setattr(
+        llama_cpp_mod,
+        "_archive_and_recall",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("blocked PreCompact reached archive persistence")
+        ),
+    )
+
+    events = list(
+        backend.generate_chat_completion(
+            messages = [{"role": "user", "content": "do not compact"}],
+            context_overflow = "truncate_oldest",
+            session_id = "project-project",
+            thread_id = "thread-1",
+        )
+    )
+
+    assert payloads == []
+    assert events == [
+        {
+            "type": "context_truncated",
+            "fits": False,
+            "dropped_messages": 0,
+            "hook_blocked": True,
+            "hook_reason": "keep the current context",
+        }
+    ]
+
+
 def test_tool_stream_reports_progress_without_leaking_a_content_event(monkeypatch):
     stream = [
         _progress(processed = 512, cached = 0, time_ms = 64),
@@ -263,6 +311,118 @@ def _structured_tool_call(tool_name: str, arguments: dict, call_id: str) -> list
         ),
         _done(),
     ]
+
+
+@pytest.mark.parametrize(
+    ("max_tool_iterations", "terminal_path"),
+    [(1, "final_synthesis"), (3, "in_loop")],
+)
+def test_empty_post_tool_candidate_replaces_preface_and_proves_terminal_completion(
+    monkeypatch, max_tool_iterations, terminal_path
+):
+    preface = "INTERMEDIATE TOOL PREFACE: I am checking now. "
+    streams = [
+        [
+            _sse({"content": preface}),
+            _sse(
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call_search",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": '{"query":"status"}',
+                            },
+                        }
+                    ]
+                }
+            ),
+            _finish("tool_calls"),
+            _done(),
+        ],
+        [_finish("stop"), _done()],
+    ]
+    payloads: list[dict] = []
+    backend = _make_backend(monkeypatch, streams, payloads)
+    monkeypatch.setattr(backend, "count_chat_tokens", lambda *_args, **_kwargs: 100)
+    monkeypatch.setattr(
+        "core.inference.tools.execute_tool",
+        lambda _name, _arguments, **_kwargs: "ok",
+    )
+
+    stop_calls = []
+
+    def run(_project_id, event, payload, **_kwargs):
+        if event == "Stop":
+            stop_calls.append(payload["last_assistant_message"])
+        return hook_runtime.HookEventResult(event = event)
+
+    monkeypatch.setattr(hook_runtime, "run_project_hook_event", run)
+    turn = hook_runtime.ProjectHookTurn(
+        project_id = "project",
+        session_id = "thread",
+        turn_id = f"turn-{terminal_path}",
+        model = "gguf",
+        permission_mode = "off",
+        cancel_event = threading.Event(),
+    )
+
+    with hook_runtime.activate_project_hook_turn(turn):
+        events = list(
+            backend.generate_chat_completion_with_tools(
+                messages = [{"role": "user", "content": "check status"}],
+                tools = [{"type": "function", "function": {"name": "web_search"}}],
+                max_tool_iterations = max_tool_iterations,
+                session_id = "project-project",
+                thread_id = "thread",
+                cancel_event = turn.cancel_event,
+                permission_mode = "off",
+            )
+        )
+
+    assert len(payloads) == 2
+    assert stop_calls == [""]
+    assert any(
+        event.get("type") == "metadata" and event.get("finish_reason") == "stop" for event in events
+    )
+
+
+def test_each_gguf_provider_candidate_has_an_internal_boundary(monkeypatch):
+    streams = [
+        [
+            *_structured_tool_call("web_search", {"query": "status"}, "call_search")[:-1],
+            _finish("tool_calls"),
+            _done(),
+        ],
+        [_sse({"content": "Partial"}), _finish("length"), _done()],
+        [_sse({"content": " complete"}), _finish("stop"), _done()],
+    ]
+    payloads: list[dict] = []
+    backend = _make_backend(monkeypatch, streams, payloads)
+    monkeypatch.setattr(backend, "count_chat_tokens", lambda *_args, **_kwargs: 100)
+    monkeypatch.setattr(
+        "core.inference.tools.execute_tool",
+        lambda _name, _arguments, **_kwargs: "ok",
+    )
+
+    raw_generate = LlamaCppBackend.generate_chat_completion_with_tools.__wrapped__
+    events = list(
+        raw_generate(
+            backend,
+            messages = [{"role": "user", "content": "check status"}],
+            tools = [{"type": "function", "function": {"name": "web_search"}}],
+            max_tool_iterations = 1,
+            permission_mode = "off",
+        )
+    )
+
+    boundaries = [
+        event for event in events if event.get("type") == "_project_hook_candidate_boundary"
+    ]
+    assert len(payloads) == 3
+    assert len(boundaries) == len(payloads)
 
 
 def test_forced_web_search_tool_choice_is_sent_until_a_tool_runs(monkeypatch):
@@ -6043,8 +6203,9 @@ def test_conversation_search_budget_counts_the_tool_catalogue(monkeypatch):
     monkeypatch.setattr(
         backend,
         "count_chat_tokens",
-        lambda candidate, *_a, **_k: 2800
-        + sum(len(str(message.get("content", ""))) for message in candidate) // 10,
+        lambda candidate, *_a, **_k: (
+            2800 + sum(len(str(message.get("content", ""))) for message in candidate) // 10
+        ),
     )
 
     seen = {}
@@ -6118,10 +6279,9 @@ def test_a_long_tool_run_reports_a_boundary_in_the_requests_own_terms(monkeypatc
     monkeypatch.setattr(
         backend,
         "count_chat_tokens",
-        lambda candidate, *_a, **_k: sum(
-            len(str(message.get("content", ""))) for message in candidate
-        )
-        // 4,
+        lambda candidate, *_a, **_k: (
+            sum(len(str(message.get("content", ""))) for message in candidate) // 4
+        ),
     )
     monkeypatch.setattr(
         "core.inference.tools.execute_tool", lambda name, arguments, **_k: "R" * 3200
@@ -6202,8 +6362,9 @@ def test_conversation_search_budget_is_exact_when_nothing_was_truncated(monkeypa
     monkeypatch.setattr(
         backend,
         "count_chat_tokens",
-        lambda candidate, *_a, **_k: 2800
-        + sum(len(str(message.get("content", ""))) for message in candidate) // 10,
+        lambda candidate, *_a, **_k: (
+            2800 + sum(len(str(message.get("content", ""))) for message in candidate) // 10
+        ),
     )
 
     seen = {}
@@ -6282,8 +6443,9 @@ def test_the_exact_recall_budget_is_recomputed_after_an_intervening_tool(monkeyp
     monkeypatch.setattr(
         backend,
         "count_chat_tokens",
-        lambda candidate, *_a, **_k: 1000
-        + sum(len(str(message.get("content", ""))) for message in candidate) // 10,
+        lambda candidate, *_a, **_k: (
+            1000 + sum(len(str(message.get("content", ""))) for message in candidate) // 10
+        ),
     )
 
     budgets: list = []

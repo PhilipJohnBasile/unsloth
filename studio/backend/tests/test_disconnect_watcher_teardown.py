@@ -43,9 +43,13 @@ def _bounded_stop(monkeypatch, collected):
     """Keep the real bounded stop, record what it was handed, shorten its 5s default."""
     real_stop = inference_route._stop_local_disconnect_cancel_watcher
 
-    def _stop(task, timeout_s = 0.05):
+    def _stop(
+        task,
+        stop_event = None,
+        timeout_s = 0.05,
+    ):
         collected.append(task)
-        return real_stop(task, timeout_s)
+        return real_stop(task, stop_event, timeout_s)
 
     monkeypatch.setattr(inference_route, "_stop_local_disconnect_cancel_watcher", _stop)
 
@@ -87,6 +91,81 @@ async def _release(release, tasks):
             await asyncio.wait({task}, timeout = 2.0)
 
 
+def test_disconnect_watcher_stop_signals_before_cancel_and_joins_normally():
+    """Normal response cleanup stops a live poller without relying on cancellation."""
+
+    async def _run():
+        stop_event = threading.Event()
+        started = asyncio.Event()
+        cancellations = []
+
+        async def _cancel_resistant_watcher():
+            started.set()
+            while not stop_event.is_set():
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    cancellations.append(True)
+                    continue
+
+        watcher = asyncio.create_task(_cancel_resistant_watcher())
+        await started.wait()
+        teardown, finished = await _finished(
+            inference_route._stop_local_disconnect_cancel_watcher(
+                watcher,
+                stop_event,
+                timeout_s = 0.05,
+            ),
+            timeout_s = 0.5,
+        )
+
+        assert finished, "response teardown exceeded both bounded watcher joins"
+        assert teardown.result() is None
+        assert stop_event.is_set()
+        assert watcher.done()
+        assert cancellations == [], "normal stop must be observed before cancellation fallback"
+
+    asyncio.run(_run())
+
+
+def test_disconnect_watcher_timeout_drains_its_late_outcome(monkeypatch):
+    drained = []
+    real_discard = inference_route._discard_task_outcome
+
+    def discard(task):
+        drained.append(task)
+        real_discard(task)
+
+    monkeypatch.setattr(inference_route, "_discard_task_outcome", discard)
+
+    async def _run():
+        release = asyncio.Event()
+
+        async def _cancel_resistant_watcher():
+            while not release.is_set():
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    continue
+            raise RuntimeError("late watcher failure")
+
+        watcher = asyncio.create_task(_cancel_resistant_watcher())
+        await asyncio.sleep(0)
+        await inference_route._stop_local_disconnect_cancel_watcher(
+            watcher,
+            timeout_s = 0.01,
+        )
+        assert not watcher.done()
+
+        release.set()
+        done, _pending = await asyncio.wait({watcher}, timeout = 0.5)
+        assert done == {watcher}
+        await asyncio.sleep(0)
+        assert drained == [watcher]
+
+    asyncio.run(_run())
+
+
 def test_aclose_stream_resources_is_not_blocked_by_a_wedged_watcher(monkeypatch):
     """_aclose_stream_resources runs in the stream's finally; it must stay bounded."""
     stopped = []
@@ -112,9 +191,9 @@ def test_aclose_stream_resources_is_not_blocked_by_a_wedged_watcher(monkeypatch)
             assert finished, "teardown blocked on a watcher that ignores cancel()"
             assert stopped == [watcher], "the watcher must go through the bounded stop"
             assert not watcher.done(), "watcher should have been abandoned, not awaited"
-            assert (
-                iterator.closed and resp.closed and client.closed
-            ), "teardown must still close the upstream resources after abandoning it"
+            assert iterator.closed and resp.closed and client.closed, (
+                "teardown must still close the upstream resources after abandoning it"
+            )
         finally:
             await _release(release, [watcher, teardown])
 

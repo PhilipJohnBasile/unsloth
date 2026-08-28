@@ -236,6 +236,12 @@ def resolve_project_guidance(
 ) -> Optional[ResolvedProjectGuidance]:
     project_id = project_id_from_session(session_id)
     if project_id is None:
+        if (
+            isinstance(session_id, str)
+            and session_id.startswith(PROJECT_SESSION_PREFIX)
+            and get_chat_thread(session_id) is None
+        ):
+            raise ProjectGuidanceUnavailable("The project is missing, archived, or unavailable.")
         return None
     project = get_chat_project(project_id)
     if project is None:

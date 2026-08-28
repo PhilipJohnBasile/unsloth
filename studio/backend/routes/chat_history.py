@@ -9,9 +9,11 @@ mixed handlers explicitly send their database transaction through Starlette's th
 """
 
 import asyncio
+import functools
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Annotated, Any, Literal, Optional, Union
 
@@ -44,6 +46,8 @@ from storage.studio_db import (
     build_chat_history_export,
     clear_chat_history,
     clear_chat_history_with_replay_status,
+    claim_project_hook_session_end_outbox,
+    project_hook_session_end_claim_heartbeat,
     mark_clear_operation_caches_cleared,
     record_clear_operation_reap_scope,
     unreaped_clear_operation_image_ids,
@@ -55,6 +59,7 @@ from storage.studio_db import (
     delete_chat_project,
     delete_chat_threads_with_active_runs,
     disconnect_chat_project_folder,
+    enqueue_project_hook_session_end_outbox,
     ensure_chat_project_workspace,
     fork_chat_thread,
     fork_counts_for_thread,
@@ -675,16 +680,28 @@ def _deleted_thread_error(thread_id: str) -> HTTPException:
 def save_thread(payload: ChatThread, current_subject: str = Depends(get_current_subject)):
     if payload.projectId and get_chat_project(payload.projectId) is None:
         raise _missing_project_error(payload.projectId)
+    from core.agent_workspace.hook_runtime import project_hook_admission_fence
+
+    hook_sessions = []
+    with project_hook_admission_fence():
+        try:
+            row = upsert_chat_thread(
+                payload.model_dump(),
+                hook_session_ledger = _project_hook_session_ledger,
+            )
+            hook_sessions = list(row.pop("hookSessions", ()))
+        except ChatThreadDeletedError as exc:
+            raise _deleted_thread_error(payload.id) from exc
+        except sqlite3.IntegrityError as exc:
+            # The project can be deleted between the check above and this insert, and the foreign key
+            # then fails. Report the same 404 rather than surfacing a 500.
+            if not payload.projectId:
+                raise
+            raise _missing_project_error(payload.projectId) from exc
     try:
-        return thread_from_row(upsert_chat_thread(payload.model_dump()))
-    except ChatThreadDeletedError as exc:
-        raise _deleted_thread_error(payload.id) from exc
-    except sqlite3.IntegrityError as exc:
-        # The project can be deleted between the check above and this insert, and the foreign key
-        # then fails. Report the same 404 rather than surfacing a 500.
-        if not payload.projectId:
-            raise
-        raise _missing_project_error(payload.projectId) from exc
+        return thread_from_row(row)
+    finally:
+        _end_project_hook_sessions(hook_sessions, reason = "other")
 
 
 @router.get("/threads/{thread_id}", response_model = ChatThread)
@@ -710,27 +727,37 @@ def patch_thread(
     if patch.get("projectId") and get_chat_project(patch["projectId"]) is None:
         raise _missing_project_error(patch["projectId"])
     settings_write = _settings_write_from_patch(patch)
+    from core.agent_workspace.hook_runtime import project_hook_admission_fence
+
+    hook_sessions = []
+    with project_hook_admission_fence():
+        try:
+            thread = update_chat_thread(
+                thread_id,
+                patch,
+                expected_title = expected_title,
+                expected_opening_message_id = expected_opening_message_id,
+                settings_write = settings_write,
+                hook_session_ledger = _project_hook_session_ledger,
+            )
+            if thread is not None:
+                hook_sessions = list(thread.pop("hookSessions", ()))
+        except sqlite3.IntegrityError as exc:
+            # Same race as save_thread: the project can go away before this write lands.
+            if not patch.get("projectId"):
+                raise
+            raise _missing_project_error(patch["projectId"]) from exc
+        except ChatThreadPreconditionFailed:
+            raise HTTPException(
+                status_code = 409,
+                detail = f"Thread {thread_id} changed since it was read",
+            )
+        if thread is None:
+            raise HTTPException(status_code = 404, detail = f"Thread {thread_id} not found")
     try:
-        thread = update_chat_thread(
-            thread_id,
-            patch,
-            expected_title = expected_title,
-            expected_opening_message_id = expected_opening_message_id,
-            settings_write = settings_write,
-        )
-    except sqlite3.IntegrityError as exc:
-        # Same race as save_thread: the project can go away before this write lands.
-        if not patch.get("projectId"):
-            raise
-        raise _missing_project_error(patch["projectId"]) from exc
-    except ChatThreadPreconditionFailed:
-        raise HTTPException(
-            status_code = 409,
-            detail = f"Thread {thread_id} changed since it was read",
-        )
-    if thread is None:
-        raise HTTPException(status_code = 404, detail = f"Thread {thread_id} not found")
-    return thread_from_row(thread)
+        return thread_from_row(thread)
+    finally:
+        _end_project_hook_sessions(hook_sessions, reason = "other")
 
 
 def _cancel_deleted_research_runs(request: Request, run_ids: list[str]) -> None:
@@ -821,6 +848,162 @@ def _cancel_active_generations(thread_ids: list[str]) -> None:
             continue
 
 
+def _project_hook_session_records(
+    thread_ids: list[str], *, conn: Optional[sqlite3.Connection] = None
+) -> list[dict[str, str]]:
+    records = []
+    for thread_id in dict.fromkeys(str(value) for value in thread_ids):
+        if conn is None:
+            thread = get_chat_thread(thread_id)
+            project_id = thread.get("projectId") if thread is not None else None
+            model = thread.get("modelId") if thread is not None else None
+        else:
+            row = conn.execute(
+                "SELECT project_id, model_id FROM chat_threads WHERE id = ?",
+                (thread_id,),
+            ).fetchone()
+            project_id = row["project_id"] if row is not None else None
+            model = row["model_id"] if row is not None else None
+        if not project_id:
+            continue
+        records.append(
+            {
+                "project_id": str(project_id),
+                "session_id": thread_id,
+                "model": str(model or ""),
+            }
+        )
+    return records
+
+
+@contextmanager
+def _project_hook_session_ledger(
+    conn: sqlite3.Connection,
+    thread_ids: set[str],
+    *,
+    reason: str = "clear",
+    project_ids: tuple[str, ...] = (),
+    include_all: bool = False,
+    workspace_snapshots = None,
+):
+    from core.agent_workspace.hook_runtime import (
+        capture_project_hook_session_ledgers,
+        serialize_project_hook_session_end_snapshot,
+    )
+
+    ordered = sorted(str(value) for value in thread_ids)
+    records = _project_hook_session_records(ordered, conn = conn)
+    with capture_project_hook_session_ledgers(
+        records,
+        session_ids = tuple(ordered),
+        project_ids = project_ids,
+        include_all = include_all,
+        reason = reason,
+        workspace_snapshots = workspace_snapshots,
+    ) as captured:
+        durable = []
+        fence_scope = "global" if include_all else "project" if project_ids else "session"
+        for record in captured:
+            snapshot = record.get("session_end_snapshot")
+            if snapshot is None:
+                continue
+            record_id, snapshot_json = serialize_project_hook_session_end_snapshot(snapshot)
+            record["session_end_outbox_id"] = record_id
+            durable.append((record_id, snapshot_json, fence_scope))
+        enqueue_project_hook_session_end_outbox(conn, durable)
+        yield captured
+
+
+def _end_project_hook_sessions(records: list[dict[str, Any]], *, reason: str = "clear") -> None:
+    """Cancel pending async hooks and run SessionEnd without breaking deletion."""
+    if not records:
+        return
+    from core.agent_workspace.hook_runtime import end_project_hook_session
+    from storage.studio_db import (
+        mark_project_hook_session_end_outbox_consumed,
+        mark_project_hook_session_end_outbox_failed,
+    )
+
+    for record in records:
+        outbox_id = record.get("session_end_outbox_id")
+        claim_owner = f"immediate:{uuid.uuid4().hex}" if outbox_id else None
+        try:
+            if outbox_id and not claim_project_hook_session_end_outbox(
+                outbox_id,
+                claim_owner,
+            ):
+                # A recovery worker owns this exact durable delivery. It will
+                # perform the same generation quiescence and finalization.
+                continue
+            heartbeat = (
+                project_hook_session_end_claim_heartbeat(outbox_id, claim_owner)
+                if outbox_id
+                else nullcontext()
+            )
+            with heartbeat as ownership_lost:
+                result = end_project_hook_session(
+                    record["project_id"],
+                    session_id = record["session_id"],
+                    model = record["model"],
+                    reason = reason,
+                    session_token = record.get("session_token"),
+                    end_snapshot = record.get("session_end_snapshot"),
+                    delivery_cancel_event = ownership_lost,
+                )
+            if (
+                outbox_id
+                and not ownership_lost.is_set()
+                and not result.errors
+                and all(
+                    run.status not in {"failed", "timed_out", "cancelled"} for run in result.runs
+                )
+            ):
+                consumed = mark_project_hook_session_end_outbox_consumed(
+                    outbox_id,
+                    claim_owner = claim_owner,
+                )
+                if consumed:
+                    from core.inference.tools import collect_orphaned_project_workspaces
+                    try:
+                        collect_orphaned_project_workspaces()
+                    except Exception:  # noqa: BLE001 - orphan record remains retryable
+                        logger.warning(
+                            "Could not collect a consumed project workspace",
+                            exc_info = True,
+                        )
+            elif outbox_id:
+                mark_project_hook_session_end_outbox_failed(
+                    outbox_id,
+                    "; ".join(
+                        (
+                            *result.errors,
+                            *(
+                                run.error or run.status
+                                for run in result.runs
+                                if run.status in {"failed", "timed_out", "cancelled"}
+                            ),
+                        )
+                    )
+                    or "Project SessionEnd delivery failed.",
+                    claim_owner = claim_owner,
+                )
+        except Exception as exc:  # noqa: BLE001 - chat deletion remains authoritative
+            if outbox_id:
+                try:
+                    mark_project_hook_session_end_outbox_failed(
+                        outbox_id,
+                        f"Project SessionEnd delivery failed: {exc}",
+                        claim_owner = claim_owner,
+                    )
+                except Exception:  # noqa: BLE001 - preserve the original cleanup failure
+                    pass
+            logger.warning(
+                "Could not end project hook session for %s",
+                record["session_id"],
+                exc_info = True,
+            )
+
+
 def _cancel_chat_generation_runs(request: Request, run_ids: list[str]) -> None:
     """Cancel durable producers whose rows were captured before thread cascade."""
     if not run_ids:
@@ -850,13 +1033,32 @@ async def delete_threads(
 
     # Before the rows go, so a thread id that comes back in the gap is cut here.
     cutoff = _archive_cutoff()
-    deleted_research_run_ids, deleted_chat_run_ids = await run_in_threadpool(
-        delete_chat_threads_with_active_runs,
-        payload.ids,
+
+    def _delete_rows() -> tuple[list[dict[str, str]], list[str], list[str]]:
+        from core.agent_workspace.hook_runtime import project_hook_admission_fence
+        with project_hook_admission_fence():
+            (
+                deleted_research_run_ids,
+                deleted_chat_run_ids,
+                hook_sessions,
+            ) = delete_chat_threads_with_active_runs(
+                payload.ids,
+                hook_session_ledger = functools.partial(
+                    _project_hook_session_ledger,
+                    reason = "delete",
+                ),
+            )
+        return hook_sessions, deleted_research_run_ids, deleted_chat_run_ids
+
+    hook_sessions, deleted_research_run_ids, deleted_chat_run_ids = await run_in_threadpool(
+        _delete_rows
     )
-    _cancel_research_runs(request, deleted_research_run_ids)
-    _cancel_chat_generation_runs(request, deleted_chat_run_ids)
-    _cancel_active_generations(payload.ids)
+    try:
+        _cancel_research_runs(request, deleted_research_run_ids)
+        _cancel_chat_generation_runs(request, deleted_chat_run_ids)
+        _cancel_active_generations(payload.ids)
+    finally:
+        await run_in_threadpool(_end_project_hook_sessions, hook_sessions, reason = "delete")
     # Keyed by thread id, so nothing can reference the folder once the thread
     # is gone. Clean it up rather than leaking one per chat.
     # In a worker: right after an upgrade this also runs the legacy move, and a
@@ -1149,16 +1351,19 @@ def _resolve_project_folder_lease(native_path_lease: str):
 def _claim_project_folder(
     project: dict,
     *,
-    expected_workspace_revision: int | None = None,
+    expected_workspace_revision: Optional[int] = None,
     reuse_existing_identity: bool = False,
     require_existing: bool = False,
-) -> ChatProject:
+    hook_session_ledger = None,
+    return_hook_sessions: bool = False,
+) -> Union[ChatProject, tuple[ChatProject, list[dict[str, Any]]]]:
     try:
         claimed = claim_chat_project_folder(
             project,
             expected_workspace_revision = expected_workspace_revision,
             reuse_existing_identity = reuse_existing_identity,
             require_existing = require_existing,
+            hook_session_ledger = hook_session_ledger,
         )
     except ProjectWorkspaceOverlapError as exc:
         raise HTTPException(status_code = 409, detail = safe_curated_detail(exc)) from exc
@@ -1174,7 +1379,9 @@ def _claim_project_folder(
         ) from exc
     if claimed is None:
         raise HTTPException(status_code = 404, detail = "Project not found")
-    return _public_project(claimed)
+    hook_sessions = list(claimed.pop("hookSessions", ()))
+    public = _public_project(claimed)
+    return (public, hook_sessions) if return_hook_sessions else public
 
 
 @router.post("/projects/open-folder", response_model = ChatProject)
@@ -1226,28 +1433,42 @@ def change_project_folder(
         finish_project_workspace_change,
         invalidate_project_workdir,
     )
+    from core.agent_workspace.common import project_workspace_change_snapshot
+    from core.agent_workspace.hook_runtime import project_hook_admission_fence
 
+    grant = _resolve_project_folder_lease(payload.nativePathLease)
+    workspace_change_started = False
     try:
         begin_project_workspace_change(project_id)
+        workspace_change_started = True
+        old_workspace = project_workspace_change_snapshot(project_id)
+        with project_hook_admission_fence():
+            changed, hook_sessions = _claim_project_folder(
+                {
+                    "id": project_id,
+                    "workspacePath": str(grant.canonical_path),
+                    "workspaceDeviceId": grant.device_id,
+                    "workspaceFileId": grant.file_id,
+                    "updatedAt": int(time.time() * 1000),
+                },
+                expected_workspace_revision = payload.expectedWorkspaceRevision,
+                require_existing = True,
+                hook_session_ledger = functools.partial(
+                    _project_hook_session_ledger,
+                    reason = "other",
+                    project_ids = (project_id,),
+                    workspace_snapshots = {project_id: old_workspace},
+                ),
+                return_hook_sessions = True,
+            )
+        invalidate_project_workdir(project_id)
+        _end_project_hook_sessions(hook_sessions, reason = "other")
+        return changed
     except ProjectWorkspaceBusy as exc:
         raise HTTPException(status_code = 409, detail = safe_curated_detail(exc)) from exc
-    try:
-        grant = _resolve_project_folder_lease(payload.nativePathLease)
-        changed = _claim_project_folder(
-            {
-                "id": project_id,
-                "workspacePath": str(grant.canonical_path),
-                "workspaceDeviceId": grant.device_id,
-                "workspaceFileId": grant.file_id,
-                "updatedAt": int(time.time() * 1000),
-            },
-            expected_workspace_revision = payload.expectedWorkspaceRevision,
-            require_existing = True,
-        )
-        invalidate_project_workdir(project_id)
-        return changed
     finally:
-        finish_project_workspace_change(project_id)
+        if workspace_change_started:
+            finish_project_workspace_change(project_id)
 
 
 @router.delete("/projects/{project_id}/workspace-folder", response_model = ChatProject)
@@ -1262,18 +1483,27 @@ def disconnect_project_folder(
         finish_project_workspace_change,
         invalidate_project_workdir,
     )
+    from core.agent_workspace.common import project_workspace_change_snapshot
+    from core.agent_workspace.hook_runtime import project_hook_admission_fence
 
+    workspace_change_started = False
     try:
         begin_project_workspace_change(project_id)
-    except ProjectWorkspaceBusy as exc:
-        raise HTTPException(status_code = 409, detail = safe_curated_detail(exc)) from exc
-    try:
+        workspace_change_started = True
+        old_workspace = project_workspace_change_snapshot(project_id)
         try:
-            project = disconnect_chat_project_folder(
-                project_id,
-                expected_workspace_revision = payload.expectedWorkspaceRevision,
-                updated_at = int(time.time() * 1000),
-            )
+            with project_hook_admission_fence():
+                project = disconnect_chat_project_folder(
+                    project_id,
+                    expected_workspace_revision = payload.expectedWorkspaceRevision,
+                    updated_at = int(time.time() * 1000),
+                    hook_session_ledger = functools.partial(
+                        _project_hook_session_ledger,
+                        reason = "other",
+                        project_ids = (project_id,),
+                        workspace_snapshots = {project_id: old_workspace},
+                    ),
+                )
         except ChatProjectWorkspaceRevisionConflictError as exc:
             raise HTTPException(status_code = 409, detail = safe_curated_detail(exc)) from exc
         except ProjectWorkspaceError as exc:
@@ -1284,10 +1514,15 @@ def disconnect_project_folder(
                 event = "chat_history.disconnect_project_folder_failed",
                 log = logger,
             ) from exc
+        hook_sessions = list((project or {}).pop("hookSessions", ()))
         if project is not None:
             invalidate_project_workdir(project_id)
+        _end_project_hook_sessions(hook_sessions, reason = "other")
+    except ProjectWorkspaceBusy as exc:
+        raise HTTPException(status_code = 409, detail = safe_curated_detail(exc)) from exc
     finally:
-        finish_project_workspace_change(project_id)
+        if workspace_change_started:
+            finish_project_workspace_change(project_id)
     if project is None:
         raise HTTPException(status_code = 404, detail = f"Project {project_id} not found")
     return _public_project(project)
@@ -1303,15 +1538,34 @@ def patch_project(
     for field in ("name", "archived", "createdAt", "updatedAt"):
         if field in patch and patch[field] is None:
             raise HTTPException(status_code = 400, detail = f"{field} cannot be null")
-    project = update_chat_project(project_id, patch)
-    if project is not None and project.get("workspaceKind") != "folder":
-        project = ensure_chat_project_workspace(project_id)
-    if project is None:
-        raise HTTPException(
-            status_code = 404,
-            detail = f"Project {project_id} not found",
-        )
-    return _public_project(project)
+    hook_sessions = []
+    if patch.get("archived") is True:
+        from core.agent_workspace.hook_runtime import project_hook_admission_fence
+        with project_hook_admission_fence():
+            project = update_chat_project(
+                project_id,
+                patch,
+                hook_session_ledger = functools.partial(
+                    _project_hook_session_ledger,
+                    reason = "archive",
+                    project_ids = (project_id,),
+                ),
+            )
+        hook_sessions = list((project or {}).pop("hookSessions", ()))
+    else:
+        project = update_chat_project(project_id, patch)
+    try:
+        if project is not None and project.get("workspaceKind") != "folder":
+            project = ensure_chat_project_workspace(project_id)
+        if project is None:
+            raise HTTPException(
+                status_code = 404,
+                detail = f"Project {project_id} not found",
+            )
+        return _public_project(project)
+    finally:
+        if hook_sessions:
+            _end_project_hook_sessions(hook_sessions, reason = "archive")
 
 
 def _delete_project_rag_sources(project_id: str) -> None:
@@ -1345,9 +1599,21 @@ async def delete_project(
     # leaves what it writes next in a directory no project owns.
     cutoff = _archive_cutoff()
     try:
-        project = await run_in_threadpool(
-            lambda: delete_chat_project(project_id, delete_files = False)
-        )
+
+        def _delete_project_rows():
+            from core.agent_workspace.hook_runtime import project_hook_admission_fence
+            with project_hook_admission_fence():
+                return delete_chat_project(
+                    project_id,
+                    delete_files = False,
+                    hook_session_ledger = functools.partial(
+                        _project_hook_session_ledger,
+                        reason = "delete",
+                        project_ids = (project_id,),
+                    ),
+                )
+
+        project = await run_in_threadpool(_delete_project_rows)
     except Exception:
         # the row transaction may still have committed, and an ownerless scope has to be
         # retired by someone; periodic reconciliation is the fallback if this also fails
@@ -1367,12 +1633,20 @@ async def delete_project(
     # The transaction is authoritative about membership and captured the worker ids before its
     # cascades. Signal them before any potentially slow RAG or workspace cleanup.
     member_ids = list(project.get("memberIds") or [])
-    _cancel_research_runs(request, list(project.get("activeResearchRunIds") or []))
-    _cancel_chat_generation_runs(
-        request,
-        list(project.get("activeChatGenerationRunIds") or []),
-    )
-    _cancel_active_generations(member_ids)
+    try:
+        _cancel_research_runs(request, list(project.get("activeResearchRunIds") or []))
+        _cancel_chat_generation_runs(
+            request,
+            list(project.get("activeChatGenerationRunIds") or []),
+        )
+        _cancel_active_generations(member_ids)
+    finally:
+        await run_in_threadpool(
+            lambda: _end_project_hook_sessions(
+                list(project.get("hookSessions") or []),
+                reason = "delete",
+            )
+        )
     # before any workspace work: the row is already gone, so a later failure must not
     # leave the scope owned by nothing
     try:
@@ -1397,6 +1671,7 @@ async def delete_project(
         )
         from storage.studio_db import (
             delete_project_workspace,
+            project_hook_session_end_pending_for_project,
             sandbox_is_referenced_elsewhere,
         )
 
@@ -1412,6 +1687,10 @@ async def delete_project(
         # A chat forked out of the project still shows cards for the shared
         # workspace, and the fork is not one of the ids deleted here.
         referenced = await run_in_threadpool(sandbox_is_referenced_elsewhere, shared, None)
+        finalizer_pending = await run_in_threadpool(
+            project_hook_session_end_pending_for_project,
+            project_id,
+        )
         # The row went first, so another client can create a project with this
         # id in the window. It resolves to the same default path, and a tool
         # call of its own may be writing in there right now.
@@ -1445,7 +1724,12 @@ async def delete_project(
                 "Kept project workspace %s: a surviving chat still shows its files",
                 project_id,
             )
-        if delete_files and idle and not referenced and not recreated:
+        elif finalizer_pending:
+            logger.info(
+                "Kept project workspace %s: SessionEnd delivery still owns it",
+                project_id,
+            )
+        if delete_files and idle and not referenced and not recreated and not finalizer_pending:
             # Written down first: the delete can decline an unexpected path or
             # stop at a locked file, and the row that knew where this workspace
             # lives has already gone. The record is the only way back to it.
@@ -1493,7 +1777,7 @@ async def delete_project(
                 True,
                 managed_root_path,
             )
-            if not idle:
+            if not idle or finalizer_pending:
                 # Nothing else would come back to it: the collection otherwise
                 # waits for some later delete that may never happen.
                 finish_workspace_delete_when_idle(project_id)
@@ -1655,7 +1939,14 @@ async def clear_history(
         else [thread["id"] for thread in await run_in_threadpool(list_chat_threads)]
     )
 
-    def _clear_rows() -> tuple[list[str], list[str], list[str], bool, Optional[set]]:
+    def _clear_rows() -> tuple[
+        list[str],
+        list[str],
+        list[str],
+        bool,
+        Optional[set],
+        list[dict[str, str]],
+    ]:
         """The clear, and the image snapshot the reap will be bounded to.
 
         Both in ONE threadpool call, so there is no await between them. Split across two,
@@ -1672,27 +1963,45 @@ async def clear_history(
         instructions wide and its cost is one chat's thumbnails re-fetching. Not worth it.
         """
         from core.inference.search_images import snapshot_and_fence_registrations
+        from core.agent_workspace.hook_runtime import project_hook_admission_fence
 
         if payload is None:
-            cleared, cleared_runs, cleared_chat_runs = clear_chat_history(
-                include_chat_generation_runs = True
-            )
+            with project_hook_admission_fence():
+                cleared, cleared_runs, cleared_chat_runs, hook_sessions = clear_chat_history(
+                    include_chat_generation_runs = True,
+                    hook_session_ledger = functools.partial(
+                        _project_hook_session_ledger,
+                        include_all = True,
+                    ),
+                )
             return (
                 cleared,
                 cleared_runs,
                 cleared_chat_runs,
                 False,
                 snapshot_and_fence_registrations(),
+                hook_sessions,
             )
         # Answered by the transaction itself. Read separately beforehand it is a guess:
         # a concurrent retry of the same operation id sees the same unrecorded ledger,
         # and the one BEGIN IMMEDIATE puts second replays while still believing it
         # cleared. `replayed` here is whichever the transaction actually did.
-        cleared, cleared_runs, cleared_chat_runs, replayed = clear_chat_history_with_replay_status(
-            payload.ids,
-            operation_id = payload.operationId,
-            include_chat_generation_runs = True,
-        )
+        with project_hook_admission_fence():
+            (
+                cleared,
+                cleared_runs,
+                cleared_chat_runs,
+                replayed,
+                hook_sessions,
+            ) = clear_chat_history_with_replay_status(
+                payload.ids,
+                operation_id = payload.operationId,
+                include_chat_generation_runs = True,
+                hook_session_ledger = functools.partial(
+                    _project_hook_session_ledger,
+                    include_all = True,
+                ),
+            )
         if replayed:
             # A replay takes no snapshot of its own -- the chats created since the original
             # clear are not its to reap. It may still have to FINISH that clear's reap,
@@ -1703,12 +2012,13 @@ async def clear_history(
                 cleared_chat_runs,
                 True,
                 unreaped_clear_operation_image_ids(payload.operationId),
+                hook_sessions,
             )
         snapshot = snapshot_and_fence_registrations()
         # Recorded before the reap runs, so a crash in the seconds of cleanup that follow
         # leaves a retry able to finish exactly this set and nothing wider.
         record_clear_operation_reap_scope(payload.operationId, snapshot)
-        return cleared, cleared_runs, cleared_chat_runs, False, snapshot
+        return cleared, cleared_runs, cleared_chat_runs, False, snapshot, hook_sessions
 
     # The clear reports what it deleted, which is what gets cleaned up: a thread
     # added between the listing above and the delete is gone too, and its
@@ -1719,18 +2029,22 @@ async def clear_history(
         cleared_chat_runs,
         replayed,
         reapable_image_ids,
+        hook_sessions,
     ) = await run_in_threadpool(_clear_rows)
     # A chat started between the listing and the transaction is in `cleared`
     # but was never cancelled, and a generation still running would dispatch a
     # tool and rebuild the sandbox this call is about to remove.
     listed = set(thread_ids)
     late = [thread_id for thread_id in cleared if thread_id not in listed]
-    _cancel_active_generations(thread_ids)
-    if late:
-        _cancel_active_generations(late)
-    # By id: the rows went with the threads, so nothing can look them up now.
-    _cancel_research_runs(request, cleared_runs)
-    _cancel_chat_generation_runs(request, cleared_chat_runs)
+    try:
+        _cancel_active_generations(thread_ids)
+        if late:
+            _cancel_active_generations(late)
+        # By id: the rows went with the threads, so nothing can look them up now.
+        _cancel_research_runs(request, cleared_runs)
+        _cancel_chat_generation_runs(request, cleared_chat_runs)
+    finally:
+        await run_in_threadpool(_end_project_hook_sessions, hook_sessions)
     # Same archive cleanup as DELETE /threads. Without it "Clear all chats" leaves every
     # conversation searchable in rag.db, and a reused thread id reads the old archive.
     await run_in_threadpool(

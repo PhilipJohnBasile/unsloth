@@ -48,6 +48,8 @@ from typing import (
     Union,
 )
 
+from core.agent_workspace.hook_runtime import project_stop_hook
+
 import httpx
 
 from core.inference.context_window import (
@@ -238,7 +240,7 @@ def _request_uses_checkpoint(requested_policy: Optional[str] = None) -> bool:
     return checkpoint.enabled()
 
 
-def _fit_context(messages, **kwargs):
+def _fit_context_without_project_hooks(messages, **kwargs):
     """The context policy in one place, so the five call sites do not each pick one.
 
     Checkpoint mode resets the epoch; rolling mode is the previous behaviour, still
@@ -327,6 +329,206 @@ def _fit_context(messages, **kwargs):
     except Exception:  # noqa: BLE001 -- a policy failure must never break a chat
         logger.warning("Checkpoint fit failed; falling back to the rolling window", exc_info = True)
     return fit_rolling_context(messages, **kwargs)
+
+
+def _fit_context(messages, **kwargs):
+    """Fit context and bracket persisted project compaction with hook events."""
+    project_hook_context = kwargs.pop("project_hook_context", None)
+    fitted, truncation = _fit_context_without_project_hooks(messages, **kwargs)
+    if (
+        not isinstance(project_hook_context, dict)
+        or not truncation
+        or not int(truncation.get("dropped_messages") or 0)
+    ):
+        return fitted, truncation
+
+    from core.agent_workspace.hook_runtime import (
+        current_project_hook_turn,
+        project_hook_control_failure,
+        project_id_from_session_id,
+        run_project_hook_event,
+    )
+
+    project_session_id = project_hook_context.get("project_session_id")
+    project_id = project_id_from_session_id(project_session_id)
+    hook_session_id = project_hook_context.get("thread_id")
+    if project_id is None or not hook_session_id:
+        return fitted, truncation
+    turn = current_project_hook_turn()
+    turn_id = turn.turn_id if turn is not None else f"turn_{uuid.uuid4().hex}"
+    common = {
+        "session_id": hook_session_id,
+        "model": str(project_hook_context.get("model") or ""),
+        "permission_mode": str(project_hook_context.get("permission_mode") or "default"),
+        "cancel_event": project_hook_context.get("cancel_event"),
+        "session_token": turn.session_token if turn is not None else None,
+    }
+    before = run_project_hook_event(
+        project_id,
+        "PreCompact",
+        {"trigger": "auto", "custom_instructions": "", "turn_id": turn_id},
+        **common,
+    )
+    before_failure = project_hook_control_failure(before)
+    if before.blocked or before.stop_requested or before_failure is not None:
+        return messages, {
+            **truncation,
+            "fits": False,
+            "dropped_messages": 0,
+            "hook_blocked": True,
+            "hook_reason": before.reason or before_failure,
+        }
+    # The first fit above is a pure probe. Run the actual fit only after PreCompact
+    # has authorized it, then defer PostCompact until the caller has archived the
+    # evicted turns and recorded the final boundary metadata.
+    fitted, truncation = _fit_context_without_project_hooks(messages, **kwargs)
+    if truncation is not None:
+        truncation = {
+            **truncation,
+            "_project_hook_state": {
+                "project_id": project_id,
+                "turn_id": turn_id,
+                "common": common,
+                "before": before,
+                "feedback_fit": {
+                    "context_length": kwargs.get("context_length"),
+                    "max_tokens": kwargs.get("max_tokens"),
+                    "count_tokens": kwargs.get("count_tokens"),
+                },
+            },
+        }
+    return fitted, truncation
+
+
+def _fit_project_compact_feedback(conversation, feedback, fit):
+    """Inject only the exact hook feedback that still fits the admitted prompt."""
+    if not feedback or not isinstance(fit, dict):
+        return conversation
+    count_tokens = fit.get("count_tokens")
+    context_length = fit.get("context_length")
+    max_tokens = fit.get("max_tokens")
+    if (
+        not callable(count_tokens)
+        or not isinstance(context_length, int)
+        or context_length <= 0
+        or not isinstance(max_tokens, int)
+        or max_tokens < 0
+    ):
+        return conversation
+    from core.agent_workspace.hook_runtime import MAX_HOOK_AGGREGATE_BYTES
+
+    encoded = "\n\n".join(feedback).encode("utf-8", errors = "replace")
+    encoded = encoded[:MAX_HOOK_AGGREGATE_BYTES]
+    text = encoded.decode("utf-8", errors = "ignore")
+    prompt_limit = max(0, context_length - max_tokens)
+
+    def candidate(value):
+        return [{"role": "system", "content": value}, *conversation] if value else conversation
+
+    if count_tokens(candidate(text)) <= prompt_limit:
+        return candidate(text)
+    low = 0
+    high = len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if count_tokens(candidate(text[:middle])) <= prompt_limit:
+            low = middle
+        else:
+            high = middle - 1
+    fitted = text[:low]
+    while fitted and count_tokens(candidate(fitted)) > prompt_limit:
+        fitted = fitted[:-1]
+    return candidate(fitted)
+
+
+def _finish_project_compact_hooks(conversation, truncation):
+    """Emit PostCompact after persistence and feed compact-resume context now."""
+    if not isinstance(truncation, dict):
+        return conversation, truncation
+    state = truncation.pop("_project_hook_state", None)
+    if not isinstance(state, dict):
+        return conversation, truncation
+    from core.agent_workspace.hook_runtime import (
+        HookEventResult,
+        hook_model_feedback,
+        project_hook_control_failure,
+        redact_project_hook_feedback,
+        run_project_hook_event,
+    )
+
+    try:
+        after = run_project_hook_event(
+            state["project_id"],
+            "PostCompact",
+            {"trigger": "auto", "turn_id": state["turn_id"]},
+            **state["common"],
+        )
+    except Exception as exc:  # noqa: BLE001 - compaction already persisted
+        message = redact_project_hook_feedback(f"Project PostCompact hook failed: {exc}")
+        after = HookEventResult(
+            event = "PostCompact",
+            errors = (message,),
+            session_token = state["common"].get("session_token"),
+        )
+    try:
+        compact_start = run_project_hook_event(
+            state["project_id"],
+            "SessionStart",
+            {"source": "compact", "turn_id": state["turn_id"]},
+            **state["common"],
+        )
+    except Exception as exc:  # noqa: BLE001 - compact resume is controlling
+        message = redact_project_hook_feedback(f"Project compact SessionStart hook failed: {exc}")
+        compact_start = HookEventResult(
+            event = "SessionStart",
+            runs = (),
+            errors = (message,),
+            blocked = True,
+            reason = message,
+            session_token = state["common"].get("session_token"),
+        )
+    compact_start_failure = project_hook_control_failure(compact_start)
+    if (
+        after.blocked
+        or after.stop_requested
+        or compact_start.blocked
+        or compact_start.stop_requested
+        or compact_start_failure is not None
+    ):
+        stopped = after if after.blocked or after.stop_requested else compact_start
+        truncation.update(
+            {
+                "hook_stopped_after_compaction": True,
+                "hook_reason": stopped.reason or compact_start_failure,
+            }
+        )
+    feedback = tuple(
+        dict.fromkeys(
+            (
+                *hook_model_feedback(state["before"]),
+                *hook_model_feedback(after),
+                *hook_model_feedback(compact_start),
+            )
+        )
+    )
+    if feedback:
+        original_conversation = conversation
+        try:
+            conversation = _fit_project_compact_feedback(
+                conversation,
+                feedback,
+                state.get("feedback_fit"),
+            )
+        except Exception as exc:  # noqa: BLE001 - persisted compaction remains authoritative
+            logger.warning("Project compact hook feedback fitting failed: %s", exc)
+            warning = "Project compact hook feedback could not be fitted."
+            truncation["hook_feedback"] = [*feedback, warning]
+        else:
+            if conversation is original_conversation:
+                # Preserve bounded advisory feedback for the transport even when
+                # the tokenizer cannot admit any additional model-visible text.
+                truncation["hook_feedback"] = list(feedback)
+    return conversation, truncation
 
 
 def _fit_with_instruction_pins(
@@ -24010,8 +24212,16 @@ class LlamaCppBackend:
         avoid restarting a load the user just cancelled."""
         return self._cancel_event.is_set()
 
-    def unload_model(self) -> bool:
+    def unload_model(self, *, hook_end_reason: str = "other") -> bool:
         """Terminate the subprocess and cancel any in-flight download."""
+        had_concrete_runtime = any(
+            (
+                getattr(self, "_process", None) is not None,
+                getattr(self, "_model_identifier", None) is not None,
+                getattr(self, "_gguf_path", None) is not None,
+                bool(getattr(self, "_healthy", False)),
+            )
+        )
         self._cancel_event.set()
         with self._lock:
             self._unload_epoch += 1
@@ -24136,7 +24346,18 @@ class LlamaCppBackend:
 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-            return True
+        if had_concrete_runtime:
+            try:
+                from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+                    end_project_hook_sessions_for_owner,
+                )
+                end_project_hook_sessions_for_owner(
+                    f"gguf:{id(self)}",
+                    reason = hook_end_reason,
+                )
+            except Exception as exc:  # noqa: BLE001 - model teardown remains authoritative
+                logger.debug("project hook GGUF teardown cleanup failed: %s", exc)
+        return True
 
     @staticmethod
     def _leading_process_group(pid):
@@ -26408,6 +26629,7 @@ class LlamaCppBackend:
                     continue
                 raise
 
+    @project_stop_hook
     def generate_chat_completion(
         self,
         messages: list[dict],
@@ -26434,9 +26656,12 @@ class LlamaCppBackend:
         context_overflow: Optional[str] = None,
         context_policy: Optional[str] = None,
         compaction_headroom_ratio: Optional[float] = None,
+        session_id: Optional[str] = None,
         thread_id: Optional[str] = None,
+        permission_mode: str = "default",
         tools_withheld: bool = False,
         _allow_respawn_retry: bool = True,
+        continuation_state: Optional[dict[str, Any]] = None,
     ) -> Generator[Union[str, dict], None, None]:
         """
         Send a chat completion to llama-server and stream tokens back.
@@ -26448,6 +26673,9 @@ class LlamaCppBackend:
         """
         if not self.is_loaded:
             raise RuntimeError("llama-server is not loaded")
+
+        if continuation_state is not None:
+            continuation_state["messages"] = list(messages)
 
         from core.inference.chat_template_helpers import (
             neutralize_control_markup_in_messages,
@@ -26538,8 +26766,18 @@ class LlamaCppBackend:
                     sticky_is_checkpoint = _sticky_is_checkpoint,
                     keeps_boundary = _keeps_compaction_boundary(thread_id),
                     can_reset = _can_reset,
+                    project_hook_context = {
+                        "project_session_id": session_id,
+                        "thread_id": thread_id,
+                        "model": getattr(self, "_model_identifier", None),
+                        "permission_mode": permission_mode,
+                        "cancel_event": cancel_event,
+                    },
                     **_compaction_fit_kwargs(context_policy, compaction_headroom_ratio),
                 )
+                if truncation and truncation.get("hook_blocked"):
+                    yield {"type": "context_truncated", **truncation}
+                    return
                 if truncation:
                     # Inline, not a forged tool exchange: this path sends no tools array,
                     # and strict templates reject a tool role with no catalogue.
@@ -26580,6 +26818,10 @@ class LlamaCppBackend:
                             openai_messages, _before_fit, compaction_headroom_ratio
                         ),
                     }
+                openai_messages, truncation = _finish_project_compact_hooks(
+                    openai_messages,
+                    truncation,
+                )
                 payload["messages"] = neutralize_control_markup_in_messages(
                     openai_messages, None, self.markup_profile
                 )
@@ -26596,6 +26838,10 @@ class LlamaCppBackend:
                 # single message just sent is the part that does not fit.
                 if truncation:
                     yield {"type": "context_truncated", **truncation}
+                    if truncation.get("hook_blocked") or truncation.get(
+                        "hook_stopped_after_compaction"
+                    ):
+                        return
             except Exception as exc:
                 logger.warning("Could not preflight the rolling context window: %s", exc)
         if stop:
@@ -26738,6 +26984,9 @@ class LlamaCppBackend:
                         "usage": _metadata_usage or {},
                         "timings": _metadata_timings,
                         "finish_reason": _metadata_finish_reason,
+                        "_project_hook_terminal_complete": (
+                            "dict" if _stream_done and _metadata_finish_reason else None
+                        ),
                     }
 
         except _LlamaStreamCancelled:
@@ -26763,7 +27012,8 @@ class LlamaCppBackend:
                     retry_context_overflow = context_overflow
                     if max_tokens is None:
                         retry_max_tokens = None
-                yield from self.generate_chat_completion(
+                yield from type(self).generate_chat_completion.__wrapped__(
+                    self,
                     retry_messages,
                     image_b64 = retry_image_b64,
                     temperature = temperature,
@@ -26788,15 +27038,18 @@ class LlamaCppBackend:
                     context_overflow = retry_context_overflow,
                     context_policy = context_policy,
                     compaction_headroom_ratio = compaction_headroom_ratio,
+                    session_id = session_id,
                     # The retry refits for the replacement window and can evict more than
                     # the first attempt did. Without the thread those extra turns are
                     # archived nowhere and no reserve or boundary applies, on the one path
                     # that deliberately compacts again.
                     thread_id = thread_id,
+                    permission_mode = permission_mode,
                     # The retry refits, so it must be told the same about this request's
                     # tools as the first attempt was.
                     tools_withheld = tools_withheld,
                     _allow_respawn_retry = False,
+                    continuation_state = continuation_state,
                 )
                 return
             raise RuntimeError("Lost connection to llama-server")
@@ -26809,6 +27062,7 @@ class LlamaCppBackend:
 
     # ── Tool-calling agentic loop ──────────────────────────────
 
+    @project_stop_hook
     def generate_chat_completion_with_tools(
         self,
         messages: list[dict],
@@ -26847,6 +27101,7 @@ class LlamaCppBackend:
         context_policy: Optional[str] = None,
         compaction_headroom_ratio: Optional[float] = None,
         tool_choice: Any = None,
+        continuation_state: Optional[dict[str, Any]] = None,
     ) -> Generator[dict, None, None]:
         """
         Agentic loop: let the model call tools, execute them, and continue.
@@ -26873,7 +27128,12 @@ class LlamaCppBackend:
             has_text_only_provisional_card,
             is_always_safe_tool,
             is_high_risk_tool_call,
+            new_project_hook_session_id,
+            new_project_hook_turn_id,
+            prepare_project_tool_hook,
             project_terminal_rule_policy,
+            project_terminal_rule_proof,
+            run_project_permission_hook,
         )
 
         # "full" and bypass_permissions are the same switch, whichever arrives
@@ -26890,10 +27150,19 @@ class LlamaCppBackend:
         elif permission_mode not in ("ask", "auto", "off"):
             permission_mode = "ask"
 
+        hook_session_id = thread_id or (
+            new_project_hook_session_id()
+            if isinstance(session_id, str) and session_id.startswith("project-")
+            else None
+        )
+        hook_turn_id = new_project_hook_turn_id()
+
         if not self.is_loaded:
             raise RuntimeError("llama-server is not loaded")
 
         conversation = list(messages)
+        if continuation_state is not None:
+            continuation_state["messages"] = conversation
         _rolling_anchor_ids: set[int] = set()
         # The loop refits on every iteration; recall must fire once per request, or each
         # pass stacks another block of recalled turns onto the prompt.
@@ -27064,6 +27333,9 @@ class LlamaCppBackend:
                 "usage": _usage,
                 "timings": _mt,
                 "finish_reason": finish_reason,
+                "_project_hook_terminal_complete": (
+                    "dict" if _stream_done and finish_reason else None
+                ),
             }
 
         def _flush_reasoning_and_buffer():
@@ -27438,9 +27710,21 @@ class LlamaCppBackend:
                         reserve_tokens = _conversation_recall_reserve(thread_id),
                         sticky_dropped = _iteration_sticky,
                         sticky_is_checkpoint = _iteration_sticky_is_checkpoint,
+                        project_hook_context = {
+                            "project_session_id": session_id,
+                            "thread_id": thread_id,
+                            "model": getattr(self, "_model_identifier", None),
+                            "permission_mode": permission_mode,
+                            "cancel_event": cancel_event,
+                        },
                         **_compaction_fit_kwargs(context_policy, compaction_headroom_ratio),
                     )
+                    if truncation and truncation.get("hook_blocked"):
+                        yield {"type": "context_truncated", **truncation}
+                        return
                     # Accounted for in this request now, whatever the fit decided.
+                    if continuation_state is not None:
+                        continuation_state["messages"] = conversation
                     _sticky_boundary_applied = True
                     if truncation and truncation.get("fits"):
                         # Before the recall injection, so both sides describe the same
@@ -27486,6 +27770,8 @@ class LlamaCppBackend:
                             ),
                         )
                         conversation = _recalled["conversation"]
+                        if continuation_state is not None:
+                            continuation_state["messages"] = conversation
                         truncation = {**truncation, **_recalled["counts"]}
                         if _recalled["recalled"]:
                             _conversation_recall_done = True
@@ -27505,9 +27791,19 @@ class LlamaCppBackend:
                                 conversation, _request_branch, compaction_headroom_ratio
                             ),
                         }
+                    conversation, truncation = _finish_project_compact_hooks(
+                        conversation,
+                        truncation,
+                    )
+                    if continuation_state is not None:
+                        continuation_state["messages"] = conversation
                     # `fits` False too: it carries the does-not-fit diagnosis.
                     if truncation:
                         yield {"type": "context_truncated", **truncation}
+                        if truncation.get("hook_blocked") or truncation.get(
+                            "hook_stopped_after_compaction"
+                        ):
+                            return
                     _preflight_succeeded = True
                 except Exception as exc:
                     logger.warning("Could not preflight the rolling context window: %s", exc)
@@ -27604,8 +27900,22 @@ class LlamaCppBackend:
                             _backend_supports_tools(self),
                             tools_withheld = _memory_tool_withheld(thread_id, tools),
                         ),
+                        project_hook_context = {
+                            "project_session_id": session_id,
+                            "thread_id": thread_id,
+                            "model": getattr(self, "_model_identifier", None),
+                            "permission_mode": permission_mode,
+                            "cancel_event": cancel_event,
+                        },
                         **_compaction_fit_kwargs(context_policy, compaction_headroom_ratio),
                     )
+                    if truncation and truncation.get("hook_blocked"):
+                        raise RuntimeError(
+                            truncation.get("hook_reason")
+                            or "Project hook stopped automatic compaction."
+                        )
+                    if continuation_state is not None:
+                        continuation_state["messages"] = conversation
                     # Recorded here, not left to the forwarding below. That list is
                     # drained from INSIDE the reopened stream, so a replacement server
                     # that came back with a smaller window and then refused this prompt
@@ -27638,6 +27948,22 @@ class LlamaCppBackend:
                                 _boundary_metadata(
                                     conversation, _request_branch, compaction_headroom_ratio
                                 )
+                            )
+                        conversation, truncation = _finish_project_compact_hooks(
+                            conversation,
+                            truncation,
+                        )
+                        payload["messages"] = neutralize_control_markup_in_messages(
+                            conversation, _markup_cache, self.markup_profile
+                        )
+                        if continuation_state is not None:
+                            continuation_state["messages"] = conversation
+                        if truncation.get("hook_blocked") or truncation.get(
+                            "hook_stopped_after_compaction"
+                        ):
+                            raise RuntimeError(
+                                truncation.get("hook_reason")
+                                or "Project hook stopped automatic compaction."
                             )
                         # Report every shortened retry, including a rescued refusal.
                         _respawn_truncations.append(truncation)
@@ -27745,6 +28071,10 @@ class LlamaCppBackend:
                                     _reply_target,
                                 )
 
+                # The Stop hook reviews the candidate produced by this provider
+                # stream only. Clear any prose retained from a prior tool round
+                # before every real model attempt, including the first one.
+                yield {"type": "_project_hook_candidate_boundary"}
                 with self._open_chat_stream_with_respawn_retry(
                     payload,
                     cancel_event,
@@ -28340,6 +28670,13 @@ class LlamaCppBackend:
                         _held = strip_llama3_leading_sentinels(content_buffer.lstrip())
                         if _held.startswith("{") and not _suppress_visible_output:
                             yield {"type": "content", "text": _held}
+                        _meta = _build_metadata_event(
+                            _iter_usage,
+                            _iter_timings,
+                            _iter_finish_reason,
+                        )
+                        if _meta is not None:
+                            yield _meta
                         return
 
                 # ── STREAMING path: no tool call ──
@@ -28914,6 +29251,43 @@ class LlamaCppBackend:
                         )
                         continue
 
+                    permission_arguments, pre_hook, tool_use_id = prepare_project_tool_hook(
+                        decision.tool_name,
+                        decision.arguments,
+                        session_id = session_id,
+                        hook_session_id = hook_session_id,
+                        hook_turn_id = hook_turn_id,
+                        tool_use_id = decision.tool_call_id,
+                        permission_mode = permission_mode,
+                        bypass_permissions = bypass_permissions,
+                        cancel_event = cancel_event,
+                    )
+                    decision = tool_controller.reclassify_rewritten_call(
+                        decision,
+                        permission_arguments,
+                    )
+                    decision = replace(decision, tool_call_id = tool_use_id)
+                    if not decision.should_execute:
+                        if provisional_match:
+                            resolved_provisional_tool_call_ids.add(decision.tool_call_id)
+                            yield {
+                                "type": "tool_end",
+                                "tool_name": decision.tool_name,
+                                "tool_call_id": decision.tool_call_id,
+                                "result": "",
+                                "provenance": decision.provenance,
+                            }
+                        completion = tool_controller.record_noop(decision)
+                        deferred_noop_msgs.append(completion.model_message())
+                        deferred_noop_tools.add(decision.tool_name)
+                        if _forced_tool_call_pending:
+                            _forced_tool_call_pending = False
+                        logger.info(
+                            "Suppressed rewritten local GGUF tool call as internal no-op: "
+                            f"action={decision.action} tool={decision.tool_name}"
+                        )
+                        continue
+
                     if not assistant_appended:
                         assistant_msg["tool_calls"] = [decision.as_assistant_tool_call()]
                         # Merges into a resumed partial, so a continued turn that calls
@@ -28939,12 +29313,12 @@ class LlamaCppBackend:
                     )
                     if needs_confirm and permission_mode == "auto":
                         needs_confirm = is_high_risk_tool_call(
-                            decision.tool_name, decision.arguments
+                            decision.tool_name, permission_arguments
                         )
                     if decision.tool_name == "terminal":
                         project_rule = project_terminal_rule_policy(
                             session_id,
-                            str(decision.arguments.get("command") or ""),
+                            str(permission_arguments.get("command") or ""),
                             outside_sandbox = bypass_permissions,
                         )
                         if project_rule is not None and project_rule.get("decision") == "prompt":
@@ -28952,6 +29326,30 @@ class LlamaCppBackend:
                         elif (
                             project_rule is not None and project_rule.get("decision") == "forbidden"
                         ):
+                            needs_confirm = False
+                    hook_verdict = "deny" if pre_hook.blocked else pre_hook.permission_decision
+                    hook_denial_message = pre_hook.reason
+                    if hook_verdict in {"allow", "deny"}:
+                        needs_confirm = False
+                    if needs_confirm:
+                        permission = run_project_permission_hook(
+                            decision.tool_name,
+                            permission_arguments,
+                            session_id = session_id,
+                            thread_id = thread_id,
+                            hook_session_id = hook_session_id,
+                            hook_turn_id = hook_turn_id,
+                            tool_use_id = tool_use_id,
+                            permission_mode = permission_mode,
+                            bypass_permissions = bypass_permissions,
+                            hook_session_token = pre_hook.session_token,
+                            cancel_event = cancel_event,
+                        )
+                        hook_verdict = (
+                            "deny" if permission.blocked else permission.permission_decision
+                        )
+                        hook_denial_message = permission.reason
+                        if hook_verdict in {"allow", "deny"}:
                             needs_confirm = False
                     approval_id = new_approval_id() if needs_confirm else ""
                     decision_slot = (
@@ -28974,7 +29372,7 @@ class LlamaCppBackend:
                         }
                         yield start_event
 
-                        _decision = (
+                        _decision = hook_verdict or (
                             wait_tool_decision(
                                 decision_slot,
                                 approval_id,
@@ -28990,17 +29388,18 @@ class LlamaCppBackend:
                             decision_slot = None
                             _forced_choice_resolved = True
                             resolved_provisional_tool_call_ids.add(decision.tool_call_id)
+                            denial_result = hook_denial_message or TOOL_REJECTED_MESSAGE
                             yield {
                                 "type": "tool_end",
                                 "tool_name": decision.tool_name,
                                 "tool_call_id": decision.tool_call_id,
-                                "result": TOOL_REJECTED_MESSAGE,
+                                "result": denial_result,
                                 "provenance": decision.provenance,
                             }
                             denied_message = {
                                 "role": "tool",
                                 "name": decision.tool_name,
-                                "content": TOOL_REJECTED_MESSAGE,
+                                "content": denial_result,
                             }
                             if decision.tool_call_id:
                                 denied_message["tool_call_id"] = decision.tool_call_id
@@ -29038,12 +29437,13 @@ class LlamaCppBackend:
                         if decision_slot is not None:
                             abort_tool_decision(decision_slot, approval_id)
 
-                    project_rule_proof = (
-                        {
-                            "policyHash": project_rule.get("policyHash"),
-                            "approved": _decision == "allow",
-                        }
-                        if decision.tool_name == "terminal" and project_rule is not None
+                    rule_proof = (
+                        project_terminal_rule_proof(
+                            project_rule,
+                            str(permission_arguments.get("command") or ""),
+                            approved = _decision == "allow",
+                        )
+                        if decision.tool_name == "terminal"
                         else None
                     )
 
@@ -29298,7 +29698,17 @@ class LlamaCppBackend:
                                 disable_sandbox = bypass_permissions,
                             )
                             if accepts_kwarg(execute_tool, "project_rule_proof"):
-                                kwargs["project_rule_proof"] = project_rule_proof
+                                kwargs["project_rule_proof"] = rule_proof
+                            if accepts_kwarg(execute_tool, "tool_use_id"):
+                                kwargs["tool_use_id"] = tool_use_id
+                            if accepts_kwarg(execute_tool, "hook_session_id"):
+                                kwargs["hook_session_id"] = hook_session_id
+                            if accepts_kwarg(execute_tool, "hook_turn_id"):
+                                kwargs["hook_turn_id"] = hook_turn_id
+                            if accepts_kwarg(execute_tool, "project_pre_hook"):
+                                kwargs["project_pre_hook"] = pre_hook
+                            if accepts_kwarg(execute_tool, "permission_mode"):
+                                kwargs["permission_mode"] = permission_mode
                             # Same branch the forced recall is filtered against, so a
                             # model-initiated search cannot reach a sibling response the
                             # forced recall correctly refused.
@@ -29563,7 +29973,7 @@ class LlamaCppBackend:
                             kwargs.update(search_images_kwargs(execute_tool, _decision.tool_name))
                             return execute_tool(
                                 _decision.tool_name,
-                                _decision.arguments,
+                                permission_arguments,
                                 **kwargs,
                             )
 
@@ -29904,8 +30314,20 @@ class LlamaCppBackend:
                     reserve_tokens = _conversation_recall_reserve(thread_id),
                     sticky_dropped = _final_sticky,
                     sticky_is_checkpoint = _final_sticky_is_checkpoint,
+                    project_hook_context = {
+                        "project_session_id": session_id,
+                        "thread_id": thread_id,
+                        "model": getattr(self, "_model_identifier", None),
+                        "permission_mode": permission_mode,
+                        "cancel_event": cancel_event,
+                    },
                     **_compaction_fit_kwargs(context_policy, compaction_headroom_ratio),
                 )
+                if truncation and truncation.get("hook_blocked"):
+                    yield {"type": "context_truncated", **truncation}
+                    return
+                if continuation_state is not None:
+                    continuation_state["messages"] = conversation
                 _sticky_boundary_applied = True
                 if truncation:
                     _recalled = _archive_and_recall(
@@ -29939,6 +30361,8 @@ class LlamaCppBackend:
                         ),
                     )
                     conversation = _recalled["conversation"]
+                    if continuation_state is not None:
+                        continuation_state["messages"] = conversation
                     truncation = {**truncation, **_recalled["counts"]}
                     if _recalled["recalled"]:
                         _conversation_recall_done = True
@@ -29953,12 +30377,22 @@ class LlamaCppBackend:
                             conversation, _request_branch, compaction_headroom_ratio
                         ),
                     }
+                conversation, truncation = _finish_project_compact_hooks(
+                    conversation,
+                    truncation,
+                )
                 # `fits` False too: it carries the diagnosis the client needs to explain
                 # WHY. Otherwise the user only sees llama-server's error, which reports
                 # the whole conversation's size and advises shortening it even when the
                 # single message just sent is the part that does not fit.
+                if continuation_state is not None:
+                    continuation_state["messages"] = conversation
                 if truncation:
                     yield {"type": "context_truncated", **truncation}
+                    if truncation.get("hook_blocked") or truncation.get(
+                        "hook_stopped_after_compaction"
+                    ):
+                        return
                 _final_preflight_succeeded = True
             except Exception as exc:
                 logger.warning("Could not preflight the rolling context window: %s", exc)
@@ -30028,8 +30462,22 @@ class LlamaCppBackend:
                         # The final pass again, so again no tools array is sent.
                         tools_withheld = True,
                     ),
+                    project_hook_context = {
+                        "project_session_id": session_id,
+                        "thread_id": thread_id,
+                        "model": getattr(self, "_model_identifier", None),
+                        "permission_mode": permission_mode,
+                        "cancel_event": cancel_event,
+                    },
                     **_compaction_fit_kwargs(context_policy, compaction_headroom_ratio),
                 )
+                if truncation and truncation.get("hook_blocked"):
+                    raise RuntimeError(
+                        truncation.get("hook_reason")
+                        or "Project hook stopped automatic compaction."
+                    )
+                if continuation_state is not None:
+                    continuation_state["messages"] = conversation
                 if truncation:
                     # Archive only; see the iteration respawn refit above.
                     truncation.update(
@@ -30056,6 +30504,22 @@ class LlamaCppBackend:
                             _boundary_metadata(
                                 conversation, _request_branch, compaction_headroom_ratio
                             )
+                        )
+                    conversation, truncation = _finish_project_compact_hooks(
+                        conversation,
+                        truncation,
+                    )
+                    stream_payload["messages"] = neutralize_control_markup_in_messages(
+                        conversation, None, self.markup_profile
+                    )
+                    if continuation_state is not None:
+                        continuation_state["messages"] = conversation
+                    if truncation.get("hook_blocked") or truncation.get(
+                        "hook_stopped_after_compaction"
+                    ):
+                        raise RuntimeError(
+                            truncation.get("hook_reason")
+                            or "Project hook stopped automatic compaction."
                         )
                     _final_respawn_truncations.append(truncation)
             except Exception as exc:
@@ -30170,6 +30634,10 @@ class LlamaCppBackend:
         _attempt_started_at = ""
         while True:
             try:
+                # Final synthesis and each length continuation are distinct
+                # provider candidates. Do not let an earlier round's text become
+                # the Stop payload when this attempt is empty.
+                yield {"type": "_project_hook_candidate_boundary"}
                 with self._open_chat_stream_with_respawn_retry(
                     stream_payload,
                     cancel_event,

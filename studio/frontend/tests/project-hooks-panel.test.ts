@@ -3,7 +3,10 @@
 
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import test from "node:test";
+
+import { projectHookHandlerPresentation } from "../src/features/chat/components/project-hook-handler-presentation.ts";
 
 const panel = await readFile(
   new URL(
@@ -15,6 +18,13 @@ const panel = await readFile(
 const controls = await readFile(
   new URL(
     "../src/features/chat/components/project-workspace-controls.tsx",
+    import.meta.url,
+  ),
+  "utf8",
+);
+const handlerPresentation = await readFile(
+  new URL(
+    "../src/features/chat/components/project-hook-handler-presentation.ts",
     import.meta.url,
   ),
   "utf8",
@@ -207,32 +217,40 @@ test("handler UI separates saved preference from effective active state", () => 
   assert.match(panel, /checked=\{handler\.enabled\}/);
   assert.match(
     panel,
-    /handler\.enabled \? "Enabled" : "Disabled"[\s\S]*preference,[\s\S]*handler\.active \? "trusted and eligible" : "not eligible"/,
+    /projectHookHandlerPresentation\(\{[\s\S]*trusted,[\s\S]*enabled: handler\.enabled,[\s\S]*active: handler\.active,[\s\S]*background: handler\.async/,
   );
   assert.match(
     panel,
     /setProjectHookHandlerEnabled\(projectId, handler\.id, \{[\s\S]*workspaceRevision,[\s\S]*contentHash,[\s\S]*revision,[\s\S]*enabled/,
   );
-  assert.match(panel, /background requested \(runtime follow-up\)/);
-  assert.match(panel, /foreground requested \(runtime follow-up\)/);
+  assert.match(handlerPresentation, /background, informational only/);
+  assert.match(
+    handlerPresentation,
+    /foreground, may control supported pre-events/,
+  );
+  assert.match(handlerPresentation, /trusted && enabled && active/);
 });
 
-test("copy describes review and trust without claiming every event executes", () => {
+test("copy explains immediate, future, and informational hook execution", () => {
   assert.match(
     panel,
-    /Review configured hook commands and manage exact-file trust\. Hook[\s\S]*execution is a separate lifecycle integration\./,
+    /Trusted foreground hooks can run immediately at supported[\s\S]*lifecycle points\. Background hooks run later and are[\s\S]*informational[\s\S]*only\./,
   );
   assert.match(
     panel,
-    /It[\s\S]*does not run hooks\. Command execution and lifecycle wiring are a[\s\S]*separate integration\./,
+    /allows enabled hooks to run now and on future supported lifecycle[\s\S]*events while the exact file and workspace still match\./,
   );
   assert.match(
     panel,
-    /Trusting resets handler preferences and[\s\S]*enables all configured handlers\./,
+    /Background[\s\S]*hooks are informational and cannot approve, deny, rewrite, or[\s\S]*delay the triggering operation\./,
   );
   assert.match(
     panel,
-    /Any lifecycle integration must require trust for this exact file and workspace\./,
+    /Trusting resets handler[\s\S]*preferences and enables all configured handlers\./,
+  );
+  assert.match(
+    panel,
+    /No configured hook can run until this exact file and workspace are trusted\./,
   );
   assert.doesNotMatch(panel, /before any hook can run/);
 });
@@ -257,4 +275,64 @@ test("every async state update is guarded and cleanup retires the panel", () => 
     panel,
     /if \(requestGuard\.current\.accepts\(requestRevision\)\) \{[\s\S]*setTrustState\(fallbackTrustState\);[\s\S]*setError\(errorMessage\(nextError\)\)/,
   );
+});
+
+test("mounted browser renders trusted enabled active foreground and background states", async (t) => {
+  const require = createRequire(import.meta.url);
+  let createElement: typeof import("react").createElement;
+  let renderToStaticMarkup: typeof import("react-dom/server").renderToStaticMarkup;
+  try {
+    ({ createElement } = require("react") as typeof import("react"));
+    ({ renderToStaticMarkup } = require("react-dom/server") as typeof import("react-dom/server"));
+  } catch {
+    t.skip("mounted frontend dependencies are unavailable on this host");
+    return;
+  }
+  const render = (
+    props: Parameters<typeof projectHookHandlerPresentation>[0],
+  ) => {
+    const presentation = projectHookHandlerPresentation(props);
+    return renderToStaticMarkup(
+      createElement(
+        "div",
+        { "data-eligible": presentation.eligible },
+        createElement("span", { className: "state" }, presentation.state),
+        createElement(
+          "span",
+          { className: "execution" },
+          presentation.execution,
+        ),
+      ),
+    );
+  };
+
+  const foreground = render({
+    trusted: true,
+    enabled: true,
+    active: true,
+    background: false,
+  });
+  assert.match(foreground, /data-eligible="true"/);
+  assert.match(foreground, /Enabled preference, trusted and eligible/);
+  assert.match(foreground, /foreground, may control supported pre-events/);
+
+  const background = render({
+    trusted: true,
+    enabled: true,
+    active: true,
+    background: true,
+  });
+  assert.match(background, /data-eligible="true"/);
+  assert.match(background, /background, informational only/);
+
+  for (const state of [
+    { trusted: false, enabled: true, active: true, background: false },
+    { trusted: true, enabled: false, active: true, background: false },
+    { trusted: true, enabled: true, active: false, background: true },
+  ]) {
+    const inactive = render(state);
+    assert.match(inactive, /data-eligible="false"/);
+    assert.match(inactive, /not eligible/);
+    assert.doesNotMatch(inactive, /trusted and eligible/);
+  }
 });

@@ -37,6 +37,11 @@ from core.inference.openai_responses_shared import (
 )
 
 
+# In-process only. The shared tool loop consumes this proof and never writes it
+# onto the client SSE stream.
+_INTERNAL_TRANSPORT_TERMINAL_TYPE = "_studio_transport_terminal"
+
+
 class CodexTransportError(RuntimeError):
     def __init__(
         self,
@@ -842,7 +847,7 @@ class OpenAICodexClient:
         tool_choice: Any,
         response_format: dict[str, Any] | None = None,
         cancel_event: threading.Event | None = None,
-    ) -> AsyncGenerator[str, None]:
+    ) -> AsyncGenerator[Any, None]:
         instructions, input_items = _responses_input(messages)
         conversation_id = thread_id or secrets.token_urlsafe(24)
         affinity = hashlib.sha256(
@@ -915,7 +920,7 @@ class OpenAICodexClient:
             "x-client-request-id": request_id,
         }
         completion_id = f"chatcmpl-codex-{request_id}"
-        emitted_terminal, saw_tool_call = False, False
+        emitted_terminal, saw_done_sentinel, saw_tool_call = False, False, False
         reasoning_items: list[dict[str, Any]] = []
         cancel_task: asyncio.Task | None = None
         try:
@@ -953,6 +958,7 @@ class OpenAICodexClient:
                             continue
                         raw = line[5:].strip()
                         if raw == "[DONE]":
+                            saw_done_sentinel = True
                             break
                         try:
                             event = json.loads(raw)
@@ -1083,7 +1089,7 @@ class OpenAICodexClient:
                                 responses_usage_to_chat(response_body.get("usage")),
                             )
                             emitted_terminal = True
-                            break
+                            continue
                         elif kind in ("response.failed", "error"):
                             error = (
                                 event.get("error")
@@ -1101,5 +1107,11 @@ class OpenAICodexClient:
         finally:
             if cancel_task is not None:
                 cancel_task.cancel()
-        if not emitted_terminal and not (cancel_event is not None and cancel_event.is_set()):
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        if not emitted_terminal or not saw_done_sentinel:
             raise CodexTransportError("ChatGPT stream ended before completion.")
+        yield {
+            "type": _INTERNAL_TRANSPORT_TERMINAL_TYPE,
+            "protocol": "sse",
+        }

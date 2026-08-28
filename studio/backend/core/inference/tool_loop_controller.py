@@ -13,7 +13,8 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from typing import Any, Collection, Literal, Mapping, Sequence
 from urllib.parse import urlparse
 
@@ -722,10 +723,33 @@ class ToolLoopController:
             action = action,
             tool_name = tool_name,
             arguments = coerced.arguments,
-            tool_call_id = str(tool_call.get("id") or ""),
+            tool_call_id = str(tool_call.get("id") or f"toolu_{uuid.uuid4().hex}"),
             key = key,
             provenance = provenance,
             status_text = status_for_tool(tool_name, coerced.arguments),
+            noop_result = noop,
+        )
+
+    def reclassify_rewritten_call(
+        self, decision: ToolCallDecision, arguments: Mapping[str, Any]
+    ) -> ToolCallDecision:
+        """Rekey an accepted PreToolUse rewrite against the live controller ledger."""
+        effective_arguments = dict(arguments)
+        key = canonical_tool_call_key(decision.tool_name, effective_arguments)
+        action: ToolAction = "execute"
+        noop = ""
+        if decision.tool_name in self._completed_one_shot_tools:
+            action = "render_html_repeat"
+            noop = _noop_result("render_html_repeat", decision.tool_name)
+        elif key in self._successful_keys:
+            action = "duplicate"
+            noop = _noop_result("duplicate", decision.tool_name)
+        return replace(
+            decision,
+            action = action,
+            arguments = effective_arguments,
+            key = key,
+            status_text = status_for_tool(decision.tool_name, effective_arguments),
             noop_result = noop,
         )
 

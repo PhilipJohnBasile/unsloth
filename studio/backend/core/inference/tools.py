@@ -7337,14 +7337,27 @@ def _session_key(session_id: "str | None") -> str:
 
 
 @contextlib.contextmanager
-def _session_in_flight(session_id: "str | None"):
+def _session_in_flight(
+    session_id: "str | None",
+    *,
+    cancel_event = None,
+    deadline: "float | None" = None,
+):
     key = _session_key(session_id)
     with _sessions_free:
         # A removal for this session runs with the lock released, so a call
         # starting in that window would be handed the directory it is about to
         # rename away. Only this session waits; every other chat is untouched.
         while key in _removing_sessions:
-            _sessions_free.wait()
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("Project workspace admission was cancelled.")
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("Project workspace admission timed out.")
+                _sessions_free.wait(timeout = min(0.05, remaining))
+            else:
+                _sessions_free.wait(timeout = 0.05)
         _active_sessions[key] = _active_sessions.get(key, 0) + 1
     try:
         yield
@@ -7395,10 +7408,26 @@ def finish_project_workspace_change(project_id: str) -> None:
         _sessions_free.notify_all()
 
 
+def project_workspace_change_is_fenced(project_id: str) -> bool:
+    """Return whether the caller's project key is closed to normal leases."""
+    key = _session_key(project_session_id(project_id))
+    with _sessions_free:
+        return key in _removing_sessions
+
+
 @contextlib.contextmanager
-def project_workspace_in_flight(project_id: str):
+def project_workspace_in_flight(
+    project_id: str,
+    *,
+    cancel_event = None,
+    deadline = None,
+):
     """Keep one project's workspace identity stable for a bounded operation."""
-    with _session_in_flight(project_session_id(project_id)):
+    with _session_in_flight(
+        project_session_id(project_id),
+        cancel_event = cancel_event,
+        deadline = deadline,
+    ):
         yield
 
 
@@ -7631,7 +7660,10 @@ def collect_orphaned_project_workspaces() -> None:
     not something anybody asked to remove. Skipped while a tool call is still
     running in there, or while a chat still shows its files.
     """
-    from storage.studio_db import sandbox_is_referenced_elsewhere
+    from storage.studio_db import (
+        project_hook_session_end_pending_for_project,
+        sandbox_is_referenced_elsewhere,
+    )
     for record_id, workspace, root, pending, is_chat in list_orphaned_projects():
         if not pending:
             continue
@@ -7647,6 +7679,10 @@ def collect_orphaned_project_workspaces() -> None:
             )
             if recreated:
                 logger.info("Kept %s: it was created again", record_id)
+                continue
+            if not is_chat and project_hook_session_end_pending_for_project(record_id):
+                # A finalizer may still be executing with the sealed old root as
+                # its cwd. Consumption is the authority release boundary.
                 continue
             if not wait_for_sessions_idle([session], timeout = 0.0):
                 continue
@@ -7845,7 +7881,13 @@ def _project_execution_id(
     resolved by the supervisor. This helper only distinguishes a real project
     session from an ordinary chat whose caller-chosen id shares the prefix.
     """
-    if disable_sandbox or not session_id or not session_id.startswith(_PROJECT_SESSION_PREFIX):
+    if disable_sandbox:
+        return None
+    return _project_session_id_for_workdir(session_id, workdir)
+
+
+def _project_session_id_for_workdir(session_id: "str | None", workdir: str) -> "str | None":
+    if not session_id or not session_id.startswith(_PROJECT_SESSION_PREFIX):
         return None
     project_workdir = _get_project_workdir(session_id)
     if project_workdir is None:
@@ -7908,7 +7950,15 @@ def project_terminal_rule_policy(
                 expected_identity = (workspace.device_id, workspace.file_id),
                 project_trusted = True,
             )
-        return evaluate_terminal_command_rules(discovered, command)
+            evaluated = evaluate_terminal_command_rules(discovered, command)
+            evaluated.update(
+                {
+                    "projectId": project_id,
+                    "workspaceIdentity": [int(workspace.device_id), int(workspace.file_id)],
+                    "workspaceRevision": int(workspace.revision),
+                }
+            )
+            return evaluated
     except Exception as exc:
         logger.warning("Project command policy could not be resolved", exc_info = True)
         return {
@@ -7917,6 +7967,22 @@ def project_terminal_rule_policy(
             "matchedRules": [],
             "error": f"Project command policy is invalid or unavailable: {exc}",
         }
+
+
+def project_terminal_rule_proof(
+    policy: dict | None, command: str, *, approved: bool
+) -> dict | None:
+    if policy is None:
+        return None
+    return {
+        "policyHash": policy.get("policyHash"),
+        "approved": bool(approved),
+        "command": command,
+        "argv": list(_get_shell_cmd(command)),
+        "projectId": policy.get("projectId"),
+        "workspaceIdentity": policy.get("workspaceIdentity"),
+        "workspaceRevision": policy.get("workspaceRevision"),
+    }
 
 
 def _tracks_workspace_artifacts(session_id: "str | None") -> bool:
@@ -10725,7 +10791,7 @@ def _render_html_result(arguments: dict) -> str:
     )
 
 
-def execute_tool(
+def _execute_tool_without_project_hooks(
     name: str,
     arguments: dict,
     cancel_event = None,
@@ -10926,6 +10992,336 @@ def execute_tool(
                 name,
             )
     return f"Unknown tool: {name}"
+
+
+def _project_hook_tool_name(name: str) -> str:
+    if name == "terminal":
+        return "Bash"
+    return name
+
+
+def new_project_hook_turn_id() -> str:
+    from core.agent_workspace.hook_runtime import current_project_hook_turn  # noqa: PLC0415
+
+    turn = current_project_hook_turn()
+    if turn is not None:
+        return turn.turn_id
+    return f"turn_{uuid.uuid4().hex}"
+
+
+def new_project_hook_session_id() -> str:
+    return f"session_{uuid.uuid4().hex}"
+
+
+def _project_hook_tool_use_id(tool_use_id: str | None) -> str:
+    return (
+        tool_use_id if isinstance(tool_use_id, str) and tool_use_id else f"toolu_{uuid.uuid4().hex}"
+    )
+
+
+def prepare_project_tool_hook(
+    name: str,
+    arguments: dict,
+    *,
+    session_id: str | None,
+    hook_session_id: str | None,
+    hook_turn_id: str | None,
+    tool_use_id: str | None,
+    permission_mode: str | None,
+    bypass_permissions: bool,
+    cancel_event = None,
+):
+    """Run PreToolUse once before rule evaluation or approval resolution."""
+    from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+        HookEventResult,
+        canonical_permission_mode,
+        current_project_hook_turn,
+        project_hook_control_failure,
+        project_id_from_session_id,
+        redact_project_hook_feedback,
+        run_project_hook_event,
+    )
+
+    project_id = project_id_from_session_id(session_id)
+    effective_tool_use_id = _project_hook_tool_use_id(tool_use_id)
+    effective_turn_id = hook_turn_id or new_project_hook_turn_id()
+    if project_id is None or not hook_session_id:
+        return arguments, HookEventResult(event = "PreToolUse"), effective_tool_use_id
+    turn = current_project_hook_turn()
+    session_token = (
+        turn.session_token
+        if turn is not None and turn.project_id == project_id and turn.session_id == hook_session_id
+        else None
+    )
+    try:
+        result = run_project_hook_event(
+            project_id,
+            "PreToolUse",
+            {
+                "turn_id": effective_turn_id,
+                "tool_name": _project_hook_tool_name(name),
+                "tool_use_id": effective_tool_use_id,
+                "tool_input": arguments,
+            },
+            session_id = hook_session_id,
+            permission_mode = canonical_permission_mode(
+                permission_mode,
+                bypass_permissions = bypass_permissions,
+            ),
+            cancel_event = cancel_event,
+            session_token = session_token,
+        )
+        if turn is not None:
+            turn.bind_session(result)
+    except Exception as exc:  # noqa: BLE001 - configured tool policy fails closed
+        message = redact_project_hook_feedback(f"Project PreToolUse hook validation failed: {exc}")
+        result = HookEventResult(
+            event = "PreToolUse",
+            blocked = True,
+            reason = message,
+            errors = (message,),
+        )
+    control_failure = project_hook_control_failure(result)
+    if control_failure is not None:
+        message = control_failure
+        result = HookEventResult(
+            event = result.event,
+            runs = result.runs,
+            blocked = True,
+            reason = message,
+            updated_input = result.updated_input,
+            permission_decision = result.permission_decision,
+            additional_context = result.additional_context,
+            system_messages = result.system_messages,
+            status_messages = result.status_messages,
+            errors = result.errors or (message,),
+            session_token = result.session_token,
+        )
+    return (
+        arguments if result.updated_input is None else result.updated_input,
+        result,
+        effective_tool_use_id,
+    )
+
+
+def _project_hook_result_context(result, original: str) -> str:
+    from core.agent_workspace.hook_runtime import hook_model_feedback  # noqa: PLC0415
+
+    context = list(hook_model_feedback(result))
+    if not context:
+        return original
+    addition = "\n\n".join(dict.fromkeys(context))
+    return f"{original}\n\n[Project hook context]\n{addition}"
+
+
+def run_project_permission_hook(
+    name: str,
+    arguments: dict,
+    *,
+    session_id: str | None,
+    thread_id: str | None,
+    hook_session_id: str | None = None,
+    hook_turn_id: str | None = None,
+    tool_use_id: str | None,
+    permission_mode: str | None,
+    bypass_permissions: bool,
+    hook_session_token = None,
+    cancel_event = None,
+):
+    """Let a trusted PermissionRequest hook resolve a pending approval."""
+    from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+        HookEventResult,
+        canonical_permission_mode,
+        project_hook_control_failure,
+        project_id_from_session_id,
+        redact_project_hook_feedback,
+        run_project_hook_event,
+    )
+
+    project_id = project_id_from_session_id(session_id)
+    effective_hook_session_id = hook_session_id or thread_id
+    if project_id is None or not effective_hook_session_id:
+        return HookEventResult(event = "PermissionRequest")
+    effective_mode = canonical_permission_mode(
+        permission_mode,
+        bypass_permissions = bypass_permissions,
+    )
+    try:
+        result = run_project_hook_event(
+            project_id,
+            "PermissionRequest",
+            {
+                "turn_id": hook_turn_id or new_project_hook_turn_id(),
+                "tool_name": _project_hook_tool_name(name),
+                "tool_use_id": _project_hook_tool_use_id(tool_use_id),
+                "tool_input": arguments,
+            },
+            session_id = effective_hook_session_id,
+            permission_mode = effective_mode,
+            cancel_event = cancel_event,
+            session_token = hook_session_token,
+        )
+        control_failure = project_hook_control_failure(result)
+        if control_failure is None:
+            return result
+        message = control_failure
+        return HookEventResult(
+            event = result.event,
+            runs = result.runs,
+            blocked = True,
+            reason = message,
+            updated_input = result.updated_input,
+            permission_decision = result.permission_decision,
+            additional_context = result.additional_context,
+            system_messages = result.system_messages,
+            status_messages = result.status_messages,
+            errors = result.errors or (message,),
+            session_token = result.session_token,
+        )
+    except Exception as exc:  # noqa: BLE001 - an approval hook must fail closed
+        message = redact_project_hook_feedback(f"Project permission hook validation failed: {exc}")
+        return HookEventResult(
+            event = "PermissionRequest",
+            blocked = True,
+            reason = message,
+            errors = (message,),
+        )
+
+
+def execute_tool(
+    name: str,
+    arguments: dict,
+    cancel_event = None,
+    timeout: int | None = _TIMEOUT_UNSET,
+    session_id: str | None = None,
+    thread_id: str | None = None,
+    rag_scope: dict | None = None,
+    disable_sandbox: bool = False,
+    output_callback = None,
+    website_policy: dict | None = None,
+    conversation_branch: list[dict] | None = None,
+    conversation_budget_tokens: int | None = None,
+    conversation_token_counter = None,
+    context_tokens = _UNSET_CONTEXT_TOKENS,
+    search_images: bool = False,
+    result_budget_tokens: int | None = None,
+    project_rule_proof: dict | None = None,
+    tool_use_id: str | None = None,
+    hook_session_id: str | None = None,
+    hook_turn_id: str | None = None,
+    project_pre_hook = None,
+    permission_mode: str | None = None,
+) -> str:
+    """Execute one tool with trusted project PreToolUse and PostToolUse hooks."""
+    from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+        AgentWorkspaceError,
+        canonical_permission_mode,
+        project_hook_session_work,
+        project_id_from_session_id,
+        run_project_hook_event,
+    )
+
+    project_id = project_id_from_session_id(session_id)
+    effective_hook_session_id = hook_session_id or thread_id
+    effective_turn_id = hook_turn_id or new_project_hook_turn_id()
+    effective_arguments = arguments
+    pre_context = project_pre_hook
+    effective_tool_use_id = _project_hook_tool_use_id(tool_use_id)
+    hook_tool_name = _project_hook_tool_name(name)
+    effective_permission_mode = canonical_permission_mode(
+        permission_mode,
+        bypass_permissions = disable_sandbox,
+    )
+    if pre_context is None:
+        effective_arguments, pre_context, effective_tool_use_id = prepare_project_tool_hook(
+            name,
+            arguments,
+            session_id = session_id,
+            hook_session_id = effective_hook_session_id,
+            hook_turn_id = effective_turn_id,
+            tool_use_id = effective_tool_use_id,
+            permission_mode = effective_permission_mode,
+            bypass_permissions = disable_sandbox,
+            cancel_event = cancel_event,
+        )
+    elif pre_context.updated_input is not None:
+        effective_arguments = pre_context.updated_input
+    if project_id is not None and effective_hook_session_id:
+        if pre_context.blocked:
+            return f"Error: tool call blocked by project hook: {pre_context.reason or 'blocked'}"
+
+    effective_rule_proof = project_rule_proof
+    if effective_arguments is not arguments and name == "terminal":
+        rewritten_command = effective_arguments.get("command")
+        if isinstance(rewritten_command, str):
+            rewritten_policy = project_terminal_rule_policy(
+                session_id,
+                rewritten_command,
+                outside_sandbox = disable_sandbox,
+            )
+            if rewritten_policy is not None:
+                effective_rule_proof = project_terminal_rule_proof(
+                    rewritten_policy,
+                    rewritten_command,
+                    approved = rewritten_policy.get("decision") == "allow",
+                )
+            else:
+                effective_rule_proof = None
+
+    session_token = pre_context.session_token if pre_context is not None else None
+    work = (
+        project_hook_session_work(session_token, cancel_event)
+        if project_id is not None and effective_hook_session_id and session_token is not None
+        else contextlib.nullcontext(cancel_event)
+    )
+    try:
+        with work:
+            result = _execute_tool_without_project_hooks(
+                name,
+                effective_arguments,
+                cancel_event = cancel_event,
+                timeout = timeout,
+                session_id = session_id,
+                thread_id = thread_id,
+                rag_scope = rag_scope,
+                disable_sandbox = disable_sandbox,
+                output_callback = output_callback,
+                website_policy = website_policy,
+                conversation_branch = conversation_branch,
+                conversation_budget_tokens = conversation_budget_tokens,
+                conversation_token_counter = conversation_token_counter,
+                context_tokens = context_tokens,
+                search_images = search_images,
+                result_budget_tokens = result_budget_tokens,
+                project_rule_proof = effective_rule_proof,
+            )
+            if project_id is None or not effective_hook_session_id:
+                return result
+            try:
+                post = run_project_hook_event(
+                    project_id,
+                    "PostToolUse",
+                    {
+                        "turn_id": effective_turn_id,
+                        "tool_name": hook_tool_name,
+                        "tool_use_id": effective_tool_use_id,
+                        "tool_input": effective_arguments,
+                        "tool_response": result,
+                    },
+                    session_id = effective_hook_session_id,
+                    permission_mode = effective_permission_mode,
+                    cancel_event = cancel_event,
+                    session_token = session_token,
+                )
+            except Exception as exc:  # noqa: BLE001 - completed side effects cannot be undone
+                logger.warning("Project PostToolUse hook failed: %s", exc)
+                return _project_hook_result_context(pre_context, result) if pre_context else result
+            if post.blocked:
+                result = post.reason or "Project hook stopped normal processing of the tool result."
+            result = _project_hook_result_context(post, result)
+            return _project_hook_result_context(pre_context, result) if pre_context else result
+    except AgentWorkspaceError as exc:
+        return f"Error: tool call blocked by project hook session: {exc}"
 
 
 def _opt_int(v) -> int | None:
@@ -16638,6 +17034,9 @@ def _bash_exec(
             workdir,
             disable_sandbox = disable_sandbox,
         )
+        host_project_id = (
+            _project_session_id_for_workdir(session_id, workdir) if disable_sandbox else None
+        )
         # Same scoping as _python_exec: nothing is retained in a sandbox that is shared.
         spill_scope = _spill_scope(session_id, thread_id)
         spill_dir = workdir if session_id else None
@@ -16646,6 +17045,43 @@ def _bash_exec(
         # to produce "(no output)" and no other trace anywhere in the product.
         track_workspace_artifacts = _tracks_workspace_artifacts(session_id)
         _before = _snapshot_workdir_files(workdir) if track_workspace_artifacts else {}
+        argv = _get_shell_cmd(command)
+        safe_env = _build_bypass_env(workdir) if disable_sandbox else _build_safe_env(workdir)
+        # Bind the reviewed decision to the exact rewritten command before
+        # either the confined project supervisor or a host process can spawn.
+        # The supervisor branch used to return above the only proof check.
+        project_policy = project_terminal_rule_policy(
+            session_id,
+            command,
+            outside_sandbox = disable_sandbox,
+        )
+        if project_policy is not None:
+            decision = project_policy.get("decision")
+            reason = project_policy.get("error")
+            if decision == "forbidden":
+                if not reason:
+                    matched = project_policy.get("matchedRules") or []
+                    reasons = [str(rule.get("justification") or "").strip() for rule in matched]
+                    reason = next((value for value in reversed(reasons) if value), None)
+            else:
+                proof = project_rule_proof if isinstance(project_rule_proof, dict) else {}
+                exact_proof = (
+                    proof.get("policyHash") == project_policy.get("policyHash")
+                    and proof.get("command") == command
+                    and proof.get("argv") == list(argv)
+                    and proof.get("projectId") == project_policy.get("projectId")
+                    and proof.get("workspaceIdentity") == project_policy.get("workspaceIdentity")
+                    and proof.get("workspaceRevision") == project_policy.get("workspaceRevision")
+                )
+                if not exact_proof:
+                    decision = "forbidden"
+                    reason = "Project command policy changed or was not reviewed before execution."
+                elif decision == "prompt" and proof.get("approved") is not True:
+                    decision = "forbidden"
+                    reason = "This project command requires approval for the current policy."
+            if decision == "forbidden":
+                suffix = f" {reason}" if reason else ""
+                return _truncate(f"Blocked by project command rules.{suffix}")
         if project_id is not None:
             from core.agent_workspace.supervisor import (
                 MAX_OUTPUT_LIMIT_BYTES,
@@ -16653,7 +17089,7 @@ def _bash_exec(
             )
             supervised = run_project_process(
                 project_id,
-                _get_shell_cmd(command),
+                argv,
                 timeout_seconds = timeout,
                 output_limit_bytes = MAX_OUTPUT_LIMIT_BYTES,
                 cancel_event = cancel_event,
@@ -16670,7 +17106,6 @@ def _bash_exec(
                 track_workspace_artifacts = track_workspace_artifacts,
                 call_token = call_token,
             )
-        safe_env = _build_bypass_env(workdir) if disable_sandbox else _build_safe_env(workdir)
         popen_kwargs = dict(
             stdout = subprocess.PIPE,
             stderr = subprocess.STDOUT,
@@ -16683,7 +17118,6 @@ def _bash_exec(
             env = safe_env,
         )
         preexec = _bypass_preexec if disable_sandbox else _sandbox_preexec
-        argv = _get_shell_cmd(command)
         if sys.platform != "win32":
             popen_kwargs["cwd"] = workdir
             popen_kwargs["preexec_fn"] = preexec
@@ -16691,39 +17125,27 @@ def _bash_exec(
             popen_kwargs["cwd"] = workdir
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        # Bind the approval decision to the exact policy snapshot used by the
-        # loop. Re-read as late as possible, after the execution boundary and
-        # argv are ready but before any child process exists.
-        project_policy = project_terminal_rule_policy(
-            session_id,
-            command,
-            outside_sandbox = disable_sandbox,
-        )
-        if project_policy is not None:
-            decision = project_policy.get("decision")
-            reason = project_policy.get("error")
-            if decision == "forbidden":
-                if not reason:
-                    matched = project_policy.get("matchedRules") or []
-                    reasons = [str(rule.get("justification") or "").strip() for rule in matched]
-                    reason = next((value for value in reversed(reasons) if value), None)
-            else:
-                proof_hash = (
-                    project_rule_proof.get("policyHash")
-                    if isinstance(project_rule_proof, dict)
-                    else None
+        if host_project_id is not None:
+            from core.agent_workspace.supervisor import (  # noqa: PLC0415
+                _bind_project_command_capability,
+                _spawn_authorized_project_host_command,
+            )
+            capability = _bind_project_command_capability(
+                host_project_id,
+                command,
+                argv,
+                project_rule_proof,
+            )
+            try:
+                proc = _spawn_authorized_project_host_command(
+                    capability,
+                    popen_kwargs,
+                    cancel_event,
                 )
-                if not proof_hash or proof_hash != project_policy.get("policyHash"):
-                    decision = "forbidden"
-                    reason = "Project command policy changed or was not reviewed before execution."
-                elif decision == "prompt" and project_rule_proof.get("approved") is not True:
-                    decision = "forbidden"
-                    reason = "This project command requires approval for the current policy."
-            if decision == "forbidden":
-                suffix = f" {reason}" if reason else ""
-                return _truncate(f"Blocked by project command rules.{suffix}")
-
-        proc = subprocess.Popen(argv, **popen_kwargs)
+            except InterruptedError:
+                return "Execution cancelled."
+        else:
+            proc = subprocess.Popen(argv, **popen_kwargs)
 
         # Capture the group before any watcher can poll/reap the leader (see
         # _python_exec); None on Windows.

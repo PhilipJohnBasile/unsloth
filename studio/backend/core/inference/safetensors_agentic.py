@@ -19,10 +19,12 @@ import inspect
 import json
 import re
 import threading
-from typing import Callable, Generator, Optional
+from dataclasses import replace
+from typing import Any, Callable, Generator, Optional
 
 from loggers import get_logger
 
+from core.agent_workspace.hook_runtime import project_stop_hook
 from core.inference.tool_call_parser import (
     _GEMMA_BARE_TC_PREFIX_RE,
     _GEMMA_BARE_TC_RE,
@@ -470,6 +472,7 @@ def _call_single_turn(single_turn, conversation: list, active_tools: list[dict])
         return single_turn(conversation)
 
 
+@project_stop_hook
 def run_safetensors_tool_loop(
     *,
     single_turn: Callable[[list], Generator[str, None, None]],
@@ -493,6 +496,7 @@ def run_safetensors_tool_loop(
     renderable_tools = None,
     context_length: Optional[int] = None,
     max_tokens: Optional[int] = None,
+    continuation_state: Optional[dict[str, Any]] = None,
 ) -> Generator[dict, None, None]:
     """Drive an agentic tool loop on top of a cumulative-text generator.
 
@@ -517,6 +521,8 @@ def run_safetensors_tool_loop(
     * ``{"type": "tool_end", "tool_name", "tool_call_id", "result"}``
     """
     conversation = list(messages)
+    if continuation_state is not None:
+        continuation_state["messages"] = conversation
     # The branch this request is on, before the loop appends anything. A GGUF-compacted
     # thread keeps its archive across a switch to safetensors, so search_conversation is
     # advertised here too and needs the same filtering: the stored rows are the whole
@@ -536,6 +542,18 @@ def run_safetensors_tool_loop(
         permission_mode = "auto"
     elif permission_mode not in ("ask", "auto", "off"):
         permission_mode = "ask"
+
+    from core.inference.tools import (
+        new_project_hook_session_id,
+        new_project_hook_turn_id,
+    )
+
+    hook_session_id = thread_id or (
+        new_project_hook_session_id()
+        if isinstance(session_id, str) and session_id.startswith("project-")
+        else None
+    )
+    hook_turn_id = new_project_hook_turn_id()
 
     # Forced first-pass RAG (mirrors the GGUF loop) so doc Qs don't lose to
     # web_search. Skip only when a retrieval call would actually prompt (ask
@@ -1218,6 +1236,49 @@ def run_safetensors_tool_loop(
                 )
                 continue
 
+            from core.inference.tools import prepare_project_tool_hook
+
+            permission_arguments, pre_hook, tool_use_id = prepare_project_tool_hook(
+                decision.tool_name,
+                decision.arguments,
+                session_id = session_id,
+                hook_session_id = hook_session_id,
+                hook_turn_id = hook_turn_id,
+                tool_use_id = decision.tool_call_id,
+                permission_mode = permission_mode,
+                bypass_permissions = bypass_permissions,
+                cancel_event = cancel_event,
+            )
+            decision = tool_controller.reclassify_rewritten_call(
+                decision,
+                permission_arguments,
+            )
+            decision = replace(decision, tool_call_id = tool_use_id)
+            if not decision.should_execute:
+                if content_text and not assistant_appended:
+                    append_assistant_turn(
+                        conversation,
+                        assistant_msg,
+                        continue_final_message = continue_final_message,
+                    )
+                    assistant_appended = True
+                if provisional_match and not provisional_resolved:
+                    provisional_resolved = True
+                    yield {
+                        "type": "tool_end",
+                        "tool_name": decision.tool_name,
+                        "tool_call_id": decision.tool_call_id,
+                        "result": "",
+                        "provenance": decision.provenance,
+                    }
+                completion = tool_controller.record_noop(decision)
+                deferred_noop_msgs.append(completion.model_message())
+                logger.info(
+                    "Suppressed rewritten local safetensors tool call as internal no-op: "
+                    f"action={decision.action} tool={decision.tool_name}"
+                )
+                continue
+
             if not assistant_appended:
                 assistant_msg["tool_calls"] = [decision.as_assistant_tool_call()]
                 # Merges into a resumed partial, so a continued turn that calls a tool
@@ -1239,17 +1300,46 @@ def run_safetensors_tool_loop(
             )
             if needs_confirm and permission_mode == "auto":
                 from core.inference.tools import is_high_risk_tool_call
-                needs_confirm = is_high_risk_tool_call(decision.tool_name, decision.arguments)
+                needs_confirm = is_high_risk_tool_call(decision.tool_name, permission_arguments)
             if decision.tool_name == "terminal":
-                from core.inference.tools import project_terminal_rule_policy
+                from core.inference.tools import (
+                    project_terminal_rule_policy,
+                    project_terminal_rule_proof,
+                    run_project_permission_hook,
+                )
                 project_rule = project_terminal_rule_policy(
                     session_id,
-                    str(decision.arguments.get("command") or ""),
+                    str(permission_arguments.get("command") or ""),
                     outside_sandbox = bypass_permissions,
                 )
                 if project_rule is not None and project_rule.get("decision") == "prompt":
                     needs_confirm = True
                 elif project_rule is not None and project_rule.get("decision") == "forbidden":
+                    needs_confirm = False
+            else:
+                from core.inference.tools import run_project_permission_hook
+
+            hook_verdict = "deny" if pre_hook.blocked else pre_hook.permission_decision
+            hook_denial_message = pre_hook.reason
+            if hook_verdict in {"allow", "deny"}:
+                needs_confirm = False
+            if needs_confirm:
+                permission = run_project_permission_hook(
+                    decision.tool_name,
+                    permission_arguments,
+                    session_id = session_id,
+                    thread_id = thread_id,
+                    hook_session_id = hook_session_id,
+                    hook_turn_id = hook_turn_id,
+                    tool_use_id = tool_use_id,
+                    permission_mode = permission_mode,
+                    bypass_permissions = bypass_permissions,
+                    hook_session_token = pre_hook.session_token,
+                    cancel_event = cancel_event,
+                )
+                hook_verdict = "deny" if permission.blocked else permission.permission_decision
+                hook_denial_message = permission.reason
+                if hook_verdict in {"allow", "deny"}:
                     needs_confirm = False
             approval_id = new_approval_id() if needs_confirm else ""
             decision_slot = begin_tool_decision(session_id, approval_id) if needs_confirm else None
@@ -1269,7 +1359,7 @@ def run_safetensors_tool_loop(
                 }
                 yield start_event
 
-                _decision = (
+                _decision = hook_verdict or (
                     wait_tool_decision(
                         decision_slot,
                         approval_id,
@@ -1285,18 +1375,19 @@ def run_safetensors_tool_loop(
                     decision_slot = None
                     if provisional_match:
                         provisional_resolved = True
+                    denial_result = hook_denial_message or TOOL_REJECTED_MESSAGE
                     yield {
                         "type": "tool_end",
                         "tool_name": decision.tool_name,
                         "tool_call_id": decision.tool_call_id,
-                        "result": TOOL_REJECTED_MESSAGE,
+                        "result": denial_result,
                         "provenance": decision.provenance,
                     }
                     tool_denied = True
                     denied_message = {
                         "role": "tool",
                         "name": decision.tool_name,
-                        "content": TOOL_REJECTED_MESSAGE,
+                        "content": denial_result,
                     }
                     if decision.tool_call_id:
                         denied_message["tool_call_id"] = decision.tool_call_id
@@ -1307,12 +1398,13 @@ def run_safetensors_tool_loop(
                 if decision_slot is not None:
                     abort_tool_decision(decision_slot, approval_id)
 
-            project_rule_proof = (
-                {
-                    "policyHash": project_rule.get("policyHash"),
-                    "approved": _decision == "allow",
-                }
-                if decision.tool_name == "terminal" and project_rule is not None
+            rule_proof = (
+                project_terminal_rule_proof(
+                    project_rule,
+                    str(permission_arguments.get("command") or ""),
+                    approved = _decision == "allow",
+                )
+                if decision.tool_name == "terminal"
                 else None
             )
 
@@ -1340,7 +1432,17 @@ def run_safetensors_tool_loop(
                     if _accepts_kwarg(execute_tool, "conversation_branch"):
                         kwargs["conversation_branch"] = request_branch
                     if _accepts_kwarg(execute_tool, "project_rule_proof"):
-                        kwargs["project_rule_proof"] = project_rule_proof
+                        kwargs["project_rule_proof"] = rule_proof
+                    if _accepts_kwarg(execute_tool, "tool_use_id"):
+                        kwargs["tool_use_id"] = tool_use_id
+                    if _accepts_kwarg(execute_tool, "hook_session_id"):
+                        kwargs["hook_session_id"] = hook_session_id
+                    if _accepts_kwarg(execute_tool, "hook_turn_id"):
+                        kwargs["hook_turn_id"] = hook_turn_id
+                    if _accepts_kwarg(execute_tool, "project_pre_hook"):
+                        kwargs["project_pre_hook"] = pre_hook
+                    if _accepts_kwarg(execute_tool, "permission_mode"):
+                        kwargs["permission_mode"] = permission_mode
                     # And the room the model has left, as the GGUF loop does: without a
                     # budget the tool's clamp is skipped and a model-chosen top_k of 8
                     # appends roughly 4K tokens to an already full prompt.
@@ -1439,7 +1541,7 @@ def run_safetensors_tool_loop(
                     if _accepts_output_callback(execute_tool):
                         kwargs["output_callback"] = _output_callback
                     kwargs.update(_search_images_kwargs(execute_tool, _decision.tool_name))
-                    return execute_tool(_decision.tool_name, _decision.arguments, **kwargs)
+                    return execute_tool(_decision.tool_name, permission_arguments, **kwargs)
 
                 try:
                     result = yield from stream_tool_execution(

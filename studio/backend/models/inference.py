@@ -2933,6 +2933,14 @@ class ResponsesRequest(BaseModel):
         None,
         description = "[x-unsloth] Per-request cancellation token.",
     )
+    bypass_permissions: Optional[bool] = Field(
+        False,
+        description = "[x-unsloth] Bypass the local tool sandbox for this request.",
+    )
+    permission_mode: Optional[str] = Field(
+        None,
+        description = "[x-unsloth] Permission mode used by project lifecycle and tool hooks.",
+    )
 
     model_config = {"extra": "allow"}
 

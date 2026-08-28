@@ -2272,13 +2272,11 @@ class _SameTaskStreamingResponse(StreamingResponse):
                 body_started = True
             await send(message)
 
-        try:
-            await self.stream_response(_tracking_send)
-        except OSError:  # client disconnected mid-send
+        async def _close_abnormal_stream() -> None:
             if body_started:
-                # Generator is suspended in its try/finally: throw CancelledError
-                # (not aclose's GeneratorExit) so its handler finishes the
-                # api_monitor entry. Fall back to aclose() without athrow.
+                # The iterator is suspended inside its lifecycle boundary. Inject
+                # cancellation so transport monitoring and project-turn cleanup see
+                # an interrupted stream, then fall back to aclose when unsupported.
                 athrow = getattr(self.body_iterator, "athrow", None)
                 if athrow is not None:
                     try:
@@ -2289,22 +2287,65 @@ class _SameTaskStreamingResponse(StreamingResponse):
                     aclose = getattr(self.body_iterator, "aclose", None)
                     if aclose is not None:
                         await aclose()
-            else:
-                # Generator never started; aclose()/athrow() are no-ops on it, so
-                # release eager resources via the hook. getattr guards a response
-                # built through __new__ without __init__ (tests, pickling).
-                aclose = getattr(self.body_iterator, "aclose", None)
-                if aclose is not None:
-                    await aclose()
-                cleanup = getattr(self, "_unstarted_cleanup", None)
-                if cleanup is not None:
-                    try:
-                        await cleanup()
-                    except Exception:
-                        pass
-            raise ClientDisconnect()
+                return
+
+            # The iterator may never have entered its try/finally. Closing it is
+            # still useful for custom iterators, while eager resources and project
+            # turns are released through the explicit unstarted hook.
+            aclose = getattr(self.body_iterator, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            cleanup = getattr(self, "_unstarted_cleanup", None)
+            if cleanup is not None:
+                await cleanup()
+
+        try:
+            await self.stream_response(_tracking_send)
+        except BaseException as exc:
+            try:
+                await _close_abnormal_stream()
+            except BaseException:
+                # Preserve the send or cancellation failure. Cleanup is idempotent,
+                # and a later lifecycle fence can retry any durable SessionEnd.
+                pass
+            if isinstance(exc, OSError):
+                raise ClientDisconnect() from exc
+            raise
         if self.background is not None:
             await self.background()
+
+
+class _ProjectHookNonStreamingResponse(Response):
+    """Run project turn cleanup even when ASGI body delivery raises."""
+
+    def __init__(self, response: Response, cleanup) -> None:
+        self._response = response
+        self._cleanup = cleanup
+        self._prior_background = response.background
+        response.background = None
+        self._finished = False
+        # Preserve the response's observable metadata for middleware and tests.
+        self.status_code = response.status_code
+        self.raw_headers = response.raw_headers
+        self.body = getattr(response, "body", b"")
+        self.media_type = response.media_type
+        self.background = None
+
+    async def _finish(self) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        try:
+            if self._prior_background is not None:
+                await self._prior_background()
+        finally:
+            await self._cleanup()
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await self._response(scope, receive, send)
+        finally:
+            await self._finish()
 
 
 async def _release_unstarted_anthropic_stream(iterator, prior_cleanup) -> None:
@@ -2772,6 +2813,7 @@ from core.agent_workspace.guidance import (
     resolve_project_guidance,
     strip_server_project_guidance,
 )
+from core.agent_workspace.common import AgentWorkspaceError
 from core.agent_workspace.lease import ProjectWorkspaceRequestLease
 from auth import storage as auth_storage
 from auth.authentication import API_KEY_PREFIX, get_current_subject
@@ -2916,6 +2958,7 @@ from core.inference.external_tool_transport import OAICompatTransport
 from core.inference.studio_tool_loop import (
     ToolLoopPolicy,
     ToolLoopRun,
+    stream_with_project_stop_passthrough,
     stream_with_studio_tools,
 )
 from core.inference.chat_templates import resolve_effective_chat_template_override
@@ -3893,12 +3936,18 @@ async def _await_disconnect_then_close(request, resp, cancel_event) -> None:
         return
 
 
-async def _await_disconnect_then_cancel(request, cancel_event) -> None:
+async def _await_disconnect_then_cancel(
+    request,
+    cancel_event,
+    stop_signal = None,
+) -> None:
     """Set ``cancel_event`` when a same-task local stream disconnects."""
     try:
-        while not await request.is_disconnected():
+        while stop_signal is None or not stop_signal.is_set():
+            if await request.is_disconnected():
+                cancel_event.set()
+                return
             await asyncio.sleep(0.1)
-        cancel_event.set()
     except asyncio.CancelledError:
         return
 
@@ -3957,22 +4006,24 @@ async def _await_cancel_or_disconnect_then_close_client(
 
 
 async def _stop_local_disconnect_cancel_watcher(
-    watcher, timeout_s: float = _TEARDOWN_TASK_STOP_TIMEOUT_S
+    watcher,
+    stop_event = None,
+    timeout_s: float = _TEARDOWN_TASK_STOP_TIMEOUT_S,
 ) -> None:
-    # Bounded: this runs in the stream's finally, so awaiting the watcher outright would let a
-    # wedged poll loop hold the response open forever. asyncio.wait neither cancels nor re-raises,
-    # and an abandoned watcher owns no resources.
-    watcher.cancel()
-    done, _pending = await asyncio.wait({watcher}, timeout = timeout_s)
+    # Let the ordinary watcher condition end the task before injecting cancellation.
+    # Request.is_disconnected() can swallow cancel() inside its AnyIO cancel scope,
+    # so both joins are bounded and a still-running task is drained by callback.
+    done = {watcher} if watcher.done() else set()
+    if not done and stop_event is not None:
+        stop_event.set()
+        done, _pending = await asyncio.wait({watcher}, timeout = timeout_s)
     if not done:
-        # _wait_preheader_cancel has no exception handler, so a raise after we stop
-        # waiting would surface as "Task exception was never retrieved".
+        watcher.cancel()
+        done, _pending = await asyncio.wait({watcher}, timeout = timeout_s)
+    if not done:
         watcher.add_done_callback(_discard_task_outcome)
         return
-    try:
-        watcher.result()
-    except (asyncio.CancelledError, Exception):
-        pass
+    _discard_task_outcome(watcher)
 
 
 async def _drain_pending_worker(worker, cancel_event) -> None:
@@ -17280,7 +17331,7 @@ async def _proxy_to_external_provider(
                 chat_messages = _append_to_codex_instructions(
                     chat_messages, _codex_full_access_nudge
                 )
-        cancel_event = threading.Event()
+        cancel_event = _chat_cancel_event(request)
         cancel_keys = tuple(key for key in (payload.cancel_id, payload.session_id) if key)
 
         async def _codex_stream():
@@ -17320,28 +17371,25 @@ async def _proxy_to_external_provider(
                 session_id = payload.session_id,
                 messages = chat_messages,
                 model = model,
+                max_tokens = _effective_max_tokens(payload),
                 reasoning_effort = payload.reasoning_effort,
                 response_format = _extract_response_format(payload),
                 tool_choice = payload.tool_choice,
                 continue_final_message = _continue_final_message(payload),
             )
-            policy = (
-                CodexToolPolicy(
-                    tools = studio_tool_payloads,
-                    max_calls = (
-                        payload.max_tool_calls_per_message
-                        if payload.max_tool_calls_per_message is not None
-                        else 25
-                    ),
-                    timeout = payload.tool_call_timeout or 300,
-                    permission_mode = payload.permission_mode or "auto",
-                    confirm_calls = _permission_mode_confirm(payload),
-                    bypass_permissions = bool(payload.bypass_permissions),
-                    rag_scope = payload.rag_scope,
-                    nudge_tool_calls = payload.nudge_tool_calls,
-                )
-                if studio_tool_payloads
-                else None
+            policy = CodexToolPolicy(
+                tools = studio_tool_payloads,
+                max_calls = (
+                    payload.max_tool_calls_per_message
+                    if payload.max_tool_calls_per_message is not None
+                    else 25
+                ),
+                timeout = payload.tool_call_timeout or 300,
+                permission_mode = payload.permission_mode or "auto",
+                confirm_calls = _permission_mode_confirm(payload),
+                bypass_permissions = bool(payload.bypass_permissions),
+                rag_scope = payload.rag_scope,
+                nudge_tool_calls = payload.nudge_tool_calls,
             )
             should_cancel = False
             with _CANCEL_LOCK:
@@ -17354,8 +17402,10 @@ async def _proxy_to_external_provider(
             if should_cancel:
                 cancel_event.set()
 
+            disconnect_stop_signal = threading.Event()
+
             async def _watch_disconnect() -> None:
-                while not cancel_event.is_set():
+                while not cancel_event.is_set() and not disconnect_stop_signal.is_set():
                     if await request.is_disconnected():
                         cancel_event.set()
                         return
@@ -17371,26 +17421,11 @@ async def _proxy_to_external_provider(
             try:
                 # Closing the upstream response from the client's watcher makes
                 # cancellation immediate even while no SSE line is arriving.
-                generator = (
-                    stream_codex_with_studio_tools(
-                        client,
-                        run = run,
-                        policy = policy,
-                        cancel_event = cancel_event,
-                    )
-                    if policy
-                    else client.stream(
-                        provider_id = run.provider_id,
-                        thread_id = run.thread_id,
-                        messages = run.messages,
-                        model = run.model,
-                        max_tokens = _effective_max_tokens(payload),
-                        reasoning_effort = run.reasoning_effort,
-                        response_format = run.response_format,
-                        tools = tool_payloads,
-                        tool_choice = payload.tool_choice,
-                        cancel_event = cancel_event,
-                    )
+                generator = stream_codex_with_studio_tools(
+                    client,
+                    run = run,
+                    policy = policy,
+                    cancel_event = cancel_event,
                 )
                 async for line in generator:
                     if cancel_event.is_set() or await request.is_disconnected():
@@ -17464,8 +17499,13 @@ async def _proxy_to_external_provider(
                 yield "data: [DONE]\n\n"
             finally:
                 await client.close()
-                disconnect_task.cancel()
-                await asyncio.gather(disconnect_task, return_exceptions = True)
+                try:
+                    await _stop_local_disconnect_cancel_watcher(
+                        disconnect_task,
+                        disconnect_stop_signal,
+                    )
+                except (asyncio.CancelledError, Exception):
+                    pass
 
                 with _CANCEL_LOCK:
                     for key in cancel_keys:
@@ -17573,6 +17613,12 @@ async def _proxy_to_external_provider(
             mcp_allowed = bool(payload.mcp_enabled),
         )
     run_studio_tool_loop = bool(external_studio_tools)
+    project_stop_passthrough = bool(
+        isinstance(payload.session_id, str)
+        and payload.session_id.startswith("project-")
+        and not run_studio_tool_loop
+    )
+    run_project_transport = run_studio_tool_loop or project_stop_passthrough
     if run_studio_tool_loop and payload.bypass_permissions:
         # Full access disables the sandbox at execution time, so the schemas must
         # say so too rather than describing a sandbox the model will not get.
@@ -17585,13 +17631,14 @@ async def _proxy_to_external_provider(
         if _external_nudge:
             chat_messages = _append_to_system_message(chat_messages, _external_nudge)
 
-    cancel_event = threading.Event()
+    cancel_event = _chat_cancel_event(request)
     cancel_keys = tuple(key for key in (payload.cancel_id, payload.session_id) if key)
+    disconnect_stop_signal = threading.Event()
 
     async def _watch_disconnect() -> None:
         # A tool loop can sit for minutes inside execute_tool with no SSE line
         # arriving, so poll rather than waiting for the next yield to notice.
-        while not cancel_event.is_set():
+        while not cancel_event.is_set() and not disconnect_stop_signal.is_set():
             if await request.is_disconnected():
                 cancel_event.set()
                 return
@@ -17666,6 +17713,42 @@ async def _proxy_to_external_provider(
                 ),
                 cancel_event = cancel_event,
             )
+        elif project_stop_passthrough:
+            caller_tools = [
+                tool.model_dump(exclude_none = True) if hasattr(tool, "model_dump") else dict(tool)
+                for tool in (payload.tools or ())
+                if hasattr(tool, "model_dump") or isinstance(tool, dict)
+            ]
+            gen = stream_with_project_stop_passthrough(
+                OAICompatTransport(
+                    client,
+                    model = model,
+                    continue_final_message = _continue_final_message(payload),
+                    enabled_tools = payload.enabled_tools,
+                    stream = True,
+                    **_provider_kwargs,
+                ),
+                run = ToolLoopRun(
+                    messages = chat_messages,
+                    session_id = payload.session_id,
+                    thread_id = payload.thread_id,
+                    model = model,
+                    tool_choice = payload.tool_choice,
+                    continue_final_message = _continue_final_message(payload),
+                ),
+                policy = ToolLoopPolicy(
+                    tools = caller_tools,
+                    max_calls = 0,
+                    timeout = payload.tool_call_timeout or 300,
+                    permission_mode = payload.permission_mode or "auto",
+                    confirm_calls = False,
+                    bypass_permissions = bool(payload.bypass_permissions),
+                    rag_scope = payload.rag_scope,
+                    auto_heal = False,
+                    nudge_tool_calls = False,
+                ),
+                cancel_event = cancel_event,
+            )
         else:
             gen = client.stream_chat_completion(
                 messages = chat_messages,
@@ -17677,7 +17760,9 @@ async def _proxy_to_external_provider(
                 stream = payload.stream,
                 **_provider_kwargs,
             )
-        disconnect_task = asyncio.create_task(_watch_disconnect()) if run_studio_tool_loop else None
+        disconnect_task = (
+            asyncio.create_task(_watch_disconnect()) if run_project_transport else None
+        )
         try:
             sent_done = False
             stream_failed = False
@@ -17698,7 +17783,11 @@ async def _proxy_to_external_provider(
                 # stream regardless of what the caller wanted, so honour OpenAI's contract
                 # on the way out: a client that did not opt in never sees the standalone
                 # choices: [] chunk. Same rule _cmpl_stream_event_out applies locally.
-                if not _wants_stream_usage(payload) and _is_openai_usage_only_sse(line):
+                if (
+                    payload.stream
+                    and not _wants_stream_usage(payload)
+                    and _is_openai_usage_only_sse(line)
+                ):
                     continue
                 yield f"{line}\n\n"
                 # Parsed from the line itself, not from monitor_event: with the
@@ -17727,14 +17816,16 @@ async def _proxy_to_external_provider(
         finally:
             cancel_event.set()
             if disconnect_task is not None:
-                # Joined, not just cancelled. A bare cancel() leaves the task's
-                # result unretrieved, so asyncio logs "Task exception was never
-                # retrieved" when it is collected, and the poll can still be
-                # mid-await on request.is_disconnected() while the response is
-                # torn down. Same pairing as the Codex branch and the local
-                # watchers.
-                disconnect_task.cancel()
-                await asyncio.gather(disconnect_task, return_exceptions = True)
+                # Request.is_disconnected() can swallow cancellation inside its
+                # AnyIO cancel scope. Keep teardown bounded while still draining
+                # the ordinary cancelled-task result.
+                try:
+                    await _stop_local_disconnect_cancel_watcher(
+                        disconnect_task,
+                        disconnect_stop_signal,
+                    )
+                except (asyncio.CancelledError, Exception):
+                    pass
             try:
                 await gen.aclose()
             except RuntimeError:
@@ -17745,7 +17836,7 @@ async def _proxy_to_external_provider(
         # Only the tool loop is registered: it can run for minutes and a /load
         # needs to know it would interrupt a chat. The plain proxy stays
         # untracked, as it was before.
-        if not run_studio_tool_loop:
+        if not run_project_transport:
             return _stream()
 
         async def _wrapped():
@@ -17754,6 +17845,98 @@ async def _proxy_to_external_provider(
                     yield chunk
 
         return _wrapped()
+
+    async def _nonstream_response():
+        response_data: dict[str, Any] = {
+            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": ""},
+                    "finish_reason": None,
+                }
+            ],
+        }
+        message = response_data["choices"][0]["message"]
+        tool_calls: dict[int, dict[str, Any]] = {}
+        async for chunk in _tracked_stream():
+            text = chunk.decode("utf-8", errors = "replace") if isinstance(chunk, bytes) else chunk
+            for raw_line in str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+                line = raw_line.strip()
+                if not line or line == "data: [DONE]":
+                    continue
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+                try:
+                    data = json.loads(line)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                if isinstance(data.get("error"), dict):
+                    raise HTTPException(
+                        status_code = 502,
+                        detail = data["error"],
+                    )
+                choices = data.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    if isinstance(data.get("usage"), dict):
+                        response_data["usage"] = data["usage"]
+                    elif data.get("object") == "chat.completion":
+                        response_data = data
+                    continue
+                choice = choices[0] if isinstance(choices[0], dict) else {}
+                if isinstance(data.get("id"), str):
+                    response_data["id"] = data["id"]
+                if isinstance(data.get("created"), int):
+                    response_data["created"] = data["created"]
+                if isinstance(data.get("model"), str):
+                    response_data["model"] = data["model"]
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    full_message = choice.get("message")
+                    if isinstance(full_message, dict):
+                        response_data = data
+                    continue
+                if isinstance(delta.get("role"), str):
+                    message["role"] = delta["role"]
+                if isinstance(delta.get("content"), str):
+                    message["content"] += delta["content"]
+                if isinstance(delta.get("reasoning_content"), str):
+                    message["reasoning_content"] = (
+                        str(message.get("reasoning_content") or "") + delta["reasoning_content"]
+                    )
+                for tool_delta in delta.get("tool_calls") or ():
+                    if not isinstance(tool_delta, dict):
+                        continue
+                    index = int(tool_delta.get("index") or 0)
+                    target = tool_calls.setdefault(
+                        index,
+                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                    if isinstance(tool_delta.get("id"), str):
+                        target["id"] += tool_delta["id"]
+                    function = tool_delta.get("function")
+                    if isinstance(function, dict):
+                        if isinstance(function.get("name"), str):
+                            target["function"]["name"] += function["name"]
+                        if isinstance(function.get("arguments"), str):
+                            target["function"]["arguments"] += function["arguments"]
+                if choice.get("finish_reason") is not None:
+                    response_data["choices"][0]["finish_reason"] = choice["finish_reason"]
+                if isinstance(data.get("usage"), dict):
+                    response_data["usage"] = data["usage"]
+        if tool_calls:
+            message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+            if not message["content"]:
+                message["content"] = None
+        return JSONResponse(content = response_data)
+
+    if not payload.stream:
+        return await _nonstream_response()
 
     return StreamingResponse(
         _tracked_stream(),
@@ -18038,8 +18221,226 @@ class _DisconnectPolicyRequest:
 
 def _chat_cancel_event(request: Request) -> threading.Event:
     """Reuse a durable run's event across auto-load and generation registration."""
-    event = getattr(getattr(request, "state", None), "generation_cancel_event", None)
-    return event if event is not None else threading.Event()
+    state = getattr(request, "state", None)
+    event = getattr(state, "generation_cancel_event", None)
+    if isinstance(event, threading.Event):
+        return event
+    event = threading.Event()
+    if state is not None:
+        state.generation_cancel_event = event
+    return event
+
+
+def _project_hook_turn_for_request(payload, request):
+    from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+        canonical_permission_mode,
+        new_project_hook_turn,
+        project_id_from_session_id,
+    )
+    from core.inference.tools import new_project_hook_session_id  # noqa: PLC0415
+
+    project_id = project_id_from_session_id(getattr(payload, "session_id", None))
+    if project_id is None:
+        return None
+    session_id = getattr(payload, "thread_id", None)
+    synthetic_session = not bool(session_id)
+    if not session_id:
+        session_id = new_project_hook_session_id()
+        payload.thread_id = session_id
+    turn = new_project_hook_turn(
+        project_id,
+        session_id,
+        model = str(
+            getattr(payload, "external_model", None) or getattr(payload, "model", None) or ""
+        ),
+        permission_mode = canonical_permission_mode(
+            getattr(payload, "permission_mode", None),
+            bypass_permissions = bool(getattr(payload, "bypass_permissions", False)),
+        ),
+        cancel_event = _chat_cancel_event(request),
+        transport = (
+            "responses"
+            if isinstance(payload, ResponsesRequest)
+            else "anthropic"
+            if isinstance(payload, AnthropicMessagesRequest)
+            else "chat"
+        ),
+        synthetic_session = synthetic_session,
+    )
+    request.state._project_hook_turn = turn
+    return turn
+
+
+def _bind_current_project_hook_runtime(runtime_owner: str) -> None:
+    from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+        bind_project_hook_session_owner,
+        current_project_hook_turn,
+    )
+    turn = current_project_hook_turn()
+    if turn is not None:
+        turn.runtime_owner = runtime_owner
+        if turn.session_token is not None:
+            bind_project_hook_session_owner(turn.session_token, runtime_owner)
+
+
+def _bind_current_project_hook_gguf_runtime(llama_backend) -> None:
+    if llama_backend.is_loaded:
+        _bind_current_project_hook_runtime(f"gguf:{id(llama_backend)}")
+
+
+def _bind_current_project_hook_standard_runtime(backend) -> None:
+    if getattr(backend, "active_model_name", None):
+        _bind_current_project_hook_runtime(f"standard:{id(backend)}")
+
+
+def _project_hook_response_text(result) -> str:
+    if not isinstance(result, JSONResponse):
+        return ""
+    try:
+        body = json.loads(result.body.decode("utf-8"))
+    except (AttributeError, UnicodeError, ValueError):
+        return ""
+    choices = body.get("choices") if isinstance(body, dict) else None
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message") if isinstance(choices[0], dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            return content
+    output = body.get("output") if isinstance(body, dict) else None
+    if isinstance(output, list):
+        values = []
+        for item in output:
+            for part in item.get("content", ()) if isinstance(item, dict) else ():
+                text = part.get("text") if isinstance(part, dict) else None
+                if isinstance(text, str):
+                    values.append(text)
+        if values:
+            return "".join(values)
+    content = body.get("content") if isinstance(body, dict) else None
+    if isinstance(content, list):
+        return "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def _attach_project_hook_turn(response: StreamingResponse, turn) -> StreamingResponse:
+    """Keep the server-owned turn active while a deferred stream is consumed.
+
+    The transport or model loop must own Stop because only it can suppress its
+    terminal marker and dispatch a continuation. This wrapper deliberately
+    does not run a fallback Stop that would discard continuation prompts.
+    """
+    from core.agent_workspace.hook_runtime import activate_project_hook_turn  # noqa: PLC0415
+
+    if type(response) is StreamingResponse:
+        # Starlette sends headers before entering body_iterator. A send failure
+        # in that window skips both the iterator finally and background task, so
+        # use the response implementation with an explicit pre-start cleanup.
+        stock_response = response
+        response = _SameTaskStreamingResponse(
+            stock_response.body_iterator,
+            status_code = stock_response.status_code,
+            media_type = stock_response.media_type,
+            background = stock_response.background,
+        )
+        response.raw_headers = list(stock_response.raw_headers)
+
+    iterator = response.body_iterator
+    synthetic_ended = False
+    synthetic_end_lock = asyncio.Lock()
+
+    async def end_synthetic_once() -> None:
+        nonlocal synthetic_ended
+        turn.close()
+        if not turn.synthetic_session:
+            return
+        async with synthetic_end_lock:
+            if synthetic_ended:
+                return
+            synthetic_ended = True
+        from core.agent_workspace.hook_runtime import end_project_hook_session  # noqa: PLC0415
+
+        await asyncio.to_thread(
+            end_project_hook_session,
+            turn.project_id,
+            session_id = turn.session_id,
+            model = turn.model,
+            permission_mode = turn.permission_mode,
+            reason = "other",
+            session_token = turn.session_token,
+        )
+
+    async def turn_iterator():
+        try:
+            with activate_project_hook_turn(turn):
+                async for chunk in iterator:
+                    yield chunk
+        except asyncio.CancelledError:
+            turn.cancel_event.set()
+            try:
+                await _close_openai_admitted_stream_iterator(iterator, cancelled = True)
+            except BaseException:
+                pass
+            raise
+        except GeneratorExit:
+            turn.cancel_event.set()
+            raise
+        finally:
+            try:
+                aclose = getattr(iterator, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            finally:
+                await end_synthetic_once()
+
+    response.body_iterator = turn_iterator()
+    prior_background = response.background
+
+    async def turn_background() -> None:
+        try:
+            if prior_background is not None:
+                await prior_background()
+        finally:
+            await end_synthetic_once()
+
+    response.background = BackgroundTask(turn_background)
+    if isinstance(response, _SameTaskStreamingResponse):
+        prior_cleanup = getattr(response, "_unstarted_cleanup", None)
+
+        async def turn_unstarted_cleanup() -> None:
+            try:
+                if prior_cleanup is not None:
+                    await prior_cleanup()
+            finally:
+                await end_synthetic_once()
+
+        response._unstarted_cleanup = turn_unstarted_cleanup
+    return response
+
+
+def _attach_project_hook_nonstream_turn(response: Response, turn) -> Response:
+    """Keep an anonymous or persisted turn registered through body delivery."""
+
+    async def finish_turn() -> None:
+        turn.close()
+        if turn.synthetic_session:
+            from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+                end_project_hook_session,
+            )
+            await asyncio.to_thread(
+                end_project_hook_session,
+                turn.project_id,
+                session_id = turn.session_id,
+                model = turn.model,
+                permission_mode = turn.permission_mode,
+                reason = "other",
+                session_token = turn.session_token,
+            )
+
+    return _ProjectHookNonStreamingResponse(response, finish_turn)
 
 
 def _attach_project_workspace_lease(
@@ -18051,8 +18452,23 @@ def _attach_project_workspace_lease(
         try:
             async for chunk in iterator:
                 yield chunk
+        except asyncio.CancelledError:
+            # Propagate interruption through every owned generator layer. An
+            # aclose() alone injects GeneratorExit into the inner turn wrapper,
+            # which can skip its cancellation path and leave an upstream stream
+            # or cancellation tracker suspended until garbage collection.
+            try:
+                await _close_openai_admitted_stream_iterator(iterator, cancelled = True)
+            except BaseException:
+                pass
+            raise
         finally:
-            await lease.release()
+            try:
+                aclose = getattr(iterator, "aclose", None)
+                if aclose is not None:
+                    await aclose()
+            finally:
+                await lease.release()
 
     response.body_iterator = leased_iterator()
 
@@ -18083,13 +18499,85 @@ def _attach_project_workspace_lease(
 def _hold_project_workspace_for_request(handler):
     @functools.wraps(handler)
     async def wrapped(payload, *args, **kwargs):
+        from core.agent_workspace.hook_runtime import activate_project_hook_turn  # noqa: PLC0415
+
+        request = kwargs.get("request")
+        if request is None and args:
+            request = next((value for value in args if isinstance(value, Request)), None)
+        turn = (
+            _project_hook_turn_for_request(payload, request)
+            if request is not None
+            and handler.__name__
+            in {"openai_chat_completions", "openai_responses", "anthropic_messages"}
+            else None
+        )
+        if (
+            turn is not None
+            and isinstance(payload, ChatCompletionRequest)
+            and _wants_multiple_choices(payload)
+        ):
+            _raise_unsupported_n("project hook chat completions")
         lease = await ProjectWorkspaceRequestLease.acquire(getattr(payload, "session_id", None))
         try:
-            result = await handler(payload, *args, **kwargs)
-        except BaseException:
+            with activate_project_hook_turn(turn):
+                result = await handler(payload, *args, **kwargs)
+        except asyncio.CancelledError:
+            if turn is not None:
+                turn.cancel_event.set()
+                turn.close()
+                if turn.synthetic_session:
+                    from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+                        end_project_hook_session,
+                    )
+                    await asyncio.to_thread(
+                        end_project_hook_session,
+                        turn.project_id,
+                        session_id = turn.session_id,
+                        model = turn.model,
+                        permission_mode = turn.permission_mode,
+                        reason = "other",
+                        session_token = turn.session_token,
+                    )
             if lease is not None:
                 await lease.release()
             raise
+        except BaseException:
+            if turn is not None:
+                turn.close()
+            if turn is not None and turn.synthetic_session:
+                from core.agent_workspace.hook_runtime import end_project_hook_session  # noqa: PLC0415
+                await asyncio.to_thread(
+                    end_project_hook_session,
+                    turn.project_id,
+                    session_id = turn.session_id,
+                    model = turn.model,
+                    permission_mode = turn.permission_mode,
+                    reason = "other",
+                    session_token = turn.session_token,
+                )
+            if lease is not None:
+                await lease.release()
+            raise
+        if turn is not None:
+            if isinstance(result, StreamingResponse):
+                result = _attach_project_hook_turn(result, turn)
+            elif isinstance(result, Response):
+                result = _attach_project_hook_nonstream_turn(result, turn)
+            else:
+                turn.close()
+                if turn.synthetic_session:
+                    from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+                        end_project_hook_session,
+                    )
+                    await asyncio.to_thread(
+                        end_project_hook_session,
+                        turn.project_id,
+                        session_id = turn.session_id,
+                        model = turn.model,
+                        permission_mode = turn.permission_mode,
+                        reason = "other",
+                        session_token = turn.session_token,
+                    )
         if lease is None:
             return result
         if isinstance(result, StreamingResponse):
@@ -18152,6 +18640,9 @@ async def produce_openai_chat_completions(
         request,
         cancel_on_disconnect = cancel_on_disconnect,
     )
+    project_hooks_resolved = bool(
+        getattr(getattr(request, "state", None), "_project_hooks_resolved", False)
+    )
 
     # OpenAI's newer "developer" role is equivalent to "system". Normalize it
     # before provider routing so external providers (which may not accept the
@@ -18193,6 +18684,21 @@ async def produce_openai_chat_completions(
             raise HTTPException(
                 status_code = 400,
                 detail = "Video input is only supported on a local GGUF model with video support.",
+            )
+        _bind_current_project_hook_runtime(
+            "external:"
+            f"{payload.provider_id or payload.provider_type or 'provider'}:"
+            f"{payload.external_model or payload.model}"
+        )
+        if not project_hooks_resolved:
+            payload.messages = await _with_project_prompt_hook_messages_async(
+                payload.messages,
+                project_session_id = payload.session_id,
+                thread_id = payload.thread_id,
+                model = payload.external_model or payload.model,
+                permission_mode = getattr(payload, "permission_mode", None),
+                bypass_permissions = bool(payload.bypass_permissions),
+                request = request,
             )
         if not project_guidance_resolved:
             payload.messages = await _with_project_guidance_messages_async(
@@ -18389,6 +18895,21 @@ async def produce_openai_chat_completions(
 
     llama_backend = get_llama_cpp_backend()
     using_gguf = llama_backend.is_loaded
+    if using_gguf:
+        _bind_current_project_hook_gguf_runtime(llama_backend)
+    else:
+        _bind_current_project_hook_standard_runtime(get_inference_backend())
+
+    if not project_hooks_resolved:
+        payload.messages = await _with_project_prompt_hook_messages_async(
+            payload.messages,
+            project_session_id = payload.session_id,
+            thread_id = payload.thread_id,
+            model = payload.model,
+            permission_mode = getattr(payload, "permission_mode", None),
+            bypass_permissions = bool(payload.bypass_permissions),
+            request = request,
+        )
 
     # OpenAI-SDK clients send ``chat_template_kwargs`` via ``extra_body``, which
     # the SDK spreads into the request body at the top level. Unsloth's
@@ -19983,6 +20504,7 @@ async def produce_openai_chat_completions(
                 context_overflow = _rolling_context_policy(payload),
                 context_policy = _request_context_policy(payload),
                 compaction_headroom_ratio = _request_compaction_headroom_ratio(payload),
+                session_id = payload.session_id,
                 thread_id = payload.thread_id,
                 # These requests suppress the tool loop AND are excluded from the checkpoint
                 # repair above, so search_conversation is offered neither now nor on the
@@ -21288,6 +21810,8 @@ async def produce_openai_chat_completions(
     # Shared generation kwargs
     gen_kwargs = dict(
         messages = chat_messages,
+        session_id = payload.session_id,
+        thread_id = payload.thread_id,
         system_prompt = system_prompt,
         image = image,
         temperature = payload.temperature,
@@ -23660,6 +24184,11 @@ async def _responses_non_streaming(
         if request_state is not None
         else False
     )
+    previous_hooks_resolved = (
+        bool(getattr(request_state, "_project_hooks_resolved", False))
+        if request_state is not None
+        else False
+    )
     monitor_id = None
     if not previous_skip_monitor:
         monitor_id = api_monitor.start(
@@ -23673,6 +24202,7 @@ async def _responses_non_streaming(
         )
     if request_state is not None:
         request_state.skip_api_monitor = True
+        request_state._project_hooks_resolved = True
 
     # Catches the engine timings the suppressed inner monitor would otherwise drop.
     inner_perf: dict = {}
@@ -23727,14 +24257,28 @@ async def _responses_non_streaming(
         output_items: list[dict] = []
         if reasoning_text:
             output_items.append(_responses_reasoning_output_item(reasoning_text))
-        if text:
-            msg_id = f"msg_{uuid.uuid4().hex[:12]}"
+        from core.agent_workspace.hook_runtime import current_project_hook_turn  # noqa: PLC0415
+
+        hook_turn = current_project_hook_turn()
+        response_text_items = [text] if text else []
+        if hook_turn is not None and len(hook_turn.assistant_candidates) > 1:
+            response_text_items = []
+            for candidate in hook_turn.assistant_candidates:
+                _, candidate_text = _extract_responses_reasoning(
+                    candidate,
+                    parse_think_markers = _responses_should_parse_think_markers(
+                        chat_req, llama_backend
+                    ),
+                )
+                if candidate_text:
+                    response_text_items.append(candidate_text)
+        for response_text in response_text_items:
             output_items.append(
                 ResponsesOutputMessage(
-                    id = msg_id,
+                    id = f"msg_{uuid.uuid4().hex[:12]}",
                     status = "completed",
                     role = "assistant",
-                    content = [ResponsesOutputTextContent(text = text)],
+                    content = [ResponsesOutputTextContent(text = response_text)],
                 ).model_dump()
             )
         output_items.extend(_chat_tool_calls_to_responses_output(tool_calls))
@@ -23779,6 +24323,7 @@ async def _responses_non_streaming(
     finally:
         if request_state is not None:
             request_state.skip_api_monitor = previous_skip_monitor
+            request_state._project_hooks_resolved = previous_hooks_resolved
 
 
 async def _responses_stream(
@@ -23851,11 +24396,12 @@ async def _responses_stream(
     )
     body["stream_options"] = {"include_usage": True}
     target_url = f"{llama_backend.base_url}/v1/chat/completions"
-    # The stream's own disconnect event, shared with the cancel/active-generation registries:
+    # The stream's own disconnect event, shared with project hooks and the
+    # cancel/active-generation registries:
     # this path decodes on llama-server, so a non-forced /unload must see it and refuse instead
     # of tearing the server down mid-response. Entered inside the body generator below, so a
     # response whose body never starts leaves nothing behind.
-    cancel_event = threading.Event()
+    cancel_event = _chat_cancel_event(request)
     _tracker = _TrackedCancel.for_payload(cancel_event, payload, resp_id)
     try:
         reservation, admission_config = _openai_llama_admission_reserve(
@@ -24324,6 +24870,8 @@ async def _responses_stream(
         disconnect_watcher = None
         # Tracked per-run event: a client disconnect and a forced reload both land here.
         disconnect_event = cancel_event
+        saw_upstream_done = False
+        saw_upstream_finish = False
         try:
             req = client.build_request(
                 "POST", target_url, json = body, headers = {"Connection": "close"}
@@ -24410,11 +24958,13 @@ async def _responses_stream(
                     continue
                 data_str = raw_line[6:]
                 if data_str.strip() == "[DONE]":
+                    saw_upstream_done = True
                     break
                 try:
                     chunk_data = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
+                _project_hook_validate_openai_candidate(chunk_data)
                 if payload.parallel_tool_calls is False:
                     _drop_parallel_tool_call_deltas(chunk_data)
 
@@ -24436,6 +24986,7 @@ async def _responses_stream(
                     continue
                 if choices[0].get("finish_reason"):
                     stream_finish_reason = choices[0]["finish_reason"]
+                    saw_upstream_finish = True
 
                 delta = choices[0].get("delta", {}) or {}
                 reasoning_delta, visible_delta = extractor.feed(
@@ -24559,6 +25110,13 @@ async def _responses_stream(
             mark_response_failed(getattr(request, "scope", None))
             api_monitor.finish(monitor_id, "cancelled")
             return
+        if not saw_upstream_finish or not saw_upstream_done:
+            error = RuntimeError(
+                "Responses upstream ended without a complete finish and DONE sequence."
+            )
+            api_monitor.fail(monitor_id, _friendly_error(error))
+            yield _sse("response.failed", _failed_response_payload(error, 502))
+            return
 
         final_reasoning, final_visible = extractor.finish()
         if final_reasoning:
@@ -24605,6 +25163,259 @@ async def _responses_stream(
                     "delta": final_visible,
                 },
             )
+
+        # A project Stop hook is part of this direct Responses loop. The route
+        # cannot replay itself: continuation keeps this admission lease, turn,
+        # cancellation event, provider body, and output-index ledger.
+        from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+            MAX_STOP_CONTINUATIONS,
+            current_project_hook_turn,
+            project_hook_continuation_prompts,
+        )
+
+        hook_turn = current_project_hook_turn()
+        continuation_count = 0
+        candidate_text = full_text
+        continuation_messages = [
+            dict(message) for message in body.get("messages", ()) if isinstance(message, dict)
+        ]
+
+        async def _stream_responses_hook_continuation(
+            request_body: dict[str, Any], state: dict[str, Any]
+        ):
+            nonlocal full_reasoning, full_text, input_tokens, output_tokens
+            continuation_client = httpx.AsyncClient(
+                timeout = _llama_streaming_generation_timeout(),
+                trust_env = False,
+            )
+            continuation_response = None
+            continuation_lines = None
+            continuation_watcher = None
+            continuation_extractor = _ResponsesReasoningExtractor(
+                parse_think_markers = _responses_should_parse_think_markers(chat_req, llama_backend)
+            )
+            attempt_input_tokens = 0
+            attempt_output_tokens = 0
+            saw_continuation_done = False
+            saw_continuation_finish = False
+            try:
+                continuation_request = continuation_client.build_request(
+                    "POST",
+                    target_url,
+                    json = request_body,
+                    headers = {"Connection": "close"},
+                )
+                continuation_response = await _send_stream_with_preheader_cancel(
+                    continuation_client,
+                    continuation_request,
+                    disconnect_event,
+                    request = request,
+                )
+                if continuation_response is None:
+                    # A disconnect won the race before continuation headers.
+                    # Treat that as cancellation, not a zero-token successful
+                    # attempt that the outer loop may review with Stop again.
+                    disconnect_event.set()
+                    raise asyncio.CancelledError
+                if continuation_response.status_code != 200:
+                    error_bytes = await continuation_response.aread()
+                    raise RuntimeError(
+                        _friendly_upstream_error(
+                            error_bytes.decode("utf-8", errors = "replace")[:500]
+                        )
+                    )
+                continuation_lines = continuation_response.aiter_lines()
+                continuation_watcher = asyncio.create_task(
+                    _await_disconnect_then_close(
+                        request,
+                        continuation_response,
+                        disconnect_event,
+                    )
+                )
+                deadline = time.monotonic() + _DEFAULT_FIRST_TOKEN_TIMEOUT_S
+                async for raw_line in _aiter_llama_stream_items(
+                    continuation_lines,
+                    cancel_event = disconnect_event,
+                    request = request,
+                    first_token_deadline = deadline,
+                    response = continuation_response,
+                ):
+                    if not raw_line or not raw_line.startswith("data: "):
+                        continue
+                    data_str = raw_line[6:]
+                    if data_str.strip() == "[DONE]":
+                        saw_continuation_done = True
+                        break
+                    try:
+                        chunk_data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    _project_hook_validate_openai_candidate(chunk_data)
+                    choices = chunk_data.get("choices", [])
+                    if not choices:
+                        usage = chunk_data.get("usage")
+                        if isinstance(usage, dict):
+                            attempt_input_tokens = usage.get("prompt_tokens", attempt_input_tokens)
+                            attempt_output_tokens = usage.get(
+                                "completion_tokens", attempt_output_tokens
+                            )
+                        continue
+                    finish_reason = choices[0].get("finish_reason")
+                    if finish_reason:
+                        state["finish_reason"] = finish_reason
+                        saw_continuation_finish = True
+                    delta = choices[0].get("delta", {}) or {}
+                    reasoning_delta, visible_delta = continuation_extractor.feed(
+                        delta.get("content") or "",
+                        delta.get("reasoning_content"),
+                    )
+                    if reasoning_delta:
+                        for event in _ensure_reasoning_open():
+                            yield event
+                        full_reasoning += reasoning_delta
+                        yield _sse(
+                            "response.reasoning_text.delta",
+                            {
+                                "type": "response.reasoning_text.delta",
+                                "item_id": reasoning_state["item_id"],
+                                "output_index": reasoning_state["output_index"],
+                                "content_index": 0,
+                                "delta": reasoning_delta,
+                            },
+                        )
+                    if visible_delta:
+                        for event in _ensure_message_open():
+                            yield event
+                        state["text"] += visible_delta
+                        full_text += visible_delta
+                        message_state["text"] += visible_delta
+                        api_monitor.append_reply(monitor_id, visible_delta)
+                        yield _sse(
+                            "response.output_text.delta",
+                            {
+                                "type": "response.output_text.delta",
+                                "item_id": message_state["item_id"],
+                                "output_index": message_state["output_index"],
+                                "content_index": 0,
+                                "delta": visible_delta,
+                            },
+                        )
+                    for tool_call in delta.get("tool_calls") or []:
+                        state["has_tool_calls"] = True
+                        for event in _tool_call_delta_events(tool_call):
+                            yield event
+                if not saw_continuation_finish or not saw_continuation_done:
+                    raise RuntimeError(
+                        "Responses continuation ended without a complete finish and DONE sequence."
+                    )
+                final_reasoning, final_text = continuation_extractor.finish()
+                if final_reasoning:
+                    for event in _ensure_reasoning_open():
+                        yield event
+                    full_reasoning += final_reasoning
+                    yield _sse(
+                        "response.reasoning_text.delta",
+                        {
+                            "type": "response.reasoning_text.delta",
+                            "item_id": reasoning_state["item_id"],
+                            "output_index": reasoning_state["output_index"],
+                            "content_index": 0,
+                            "delta": final_reasoning,
+                        },
+                    )
+                if final_text:
+                    for event in _ensure_message_open():
+                        yield event
+                    state["text"] += final_text
+                    full_text += final_text
+                    message_state["text"] += final_text
+                    api_monitor.append_reply(monitor_id, final_text)
+                    yield _sse(
+                        "response.output_text.delta",
+                        {
+                            "type": "response.output_text.delta",
+                            "item_id": message_state["item_id"],
+                            "output_index": message_state["output_index"],
+                            "content_index": 0,
+                            "delta": final_text,
+                        },
+                    )
+                input_tokens += attempt_input_tokens
+                output_tokens += attempt_output_tokens
+            finally:
+                await _aclose_stream_resources(
+                    watchers = (continuation_watcher,),
+                    iterator = continuation_lines,
+                    resp = continuation_response,
+                    client = continuation_client,
+                )
+
+        if (
+            hook_turn is not None
+            and not disconnect_event.is_set()
+            and stream_finish_reason != "tool_calls"
+            and not tool_call_state
+        ):
+            while True:
+                stop_result = await asyncio.to_thread(
+                    hook_turn.stop,
+                    last_assistant_message = candidate_text,
+                )
+                prompts = project_hook_continuation_prompts(stop_result)
+                if (
+                    stop_result.stop_requested
+                    or not prompts
+                    or continuation_count >= MAX_STOP_CONTINUATIONS
+                ):
+                    break
+                if disconnect_event.is_set() or await request.is_disconnected():
+                    disconnect_event.set()
+                    return
+                for event in _close_message_item():
+                    yield event
+                if candidate_text:
+                    continuation_messages.append({"role": "assistant", "content": candidate_text})
+                continuation_messages.append(
+                    {
+                        "role": "user",
+                        "content": "\n".join(prompt.as_message()["content"] for prompt in prompts),
+                    }
+                )
+                continuation_count += 1
+                continuation_state = {
+                    "text": "",
+                    "finish_reason": None,
+                    "has_tool_calls": False,
+                }
+                continuation_body = {
+                    **body,
+                    "messages": [dict(message) for message in continuation_messages],
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                }
+                try:
+                    async for event in _stream_responses_hook_continuation(
+                        continuation_body,
+                        continuation_state,
+                    ):
+                        yield event
+                except asyncio.CancelledError:
+                    disconnect_event.set()
+                    raise
+                except Exception as exc:
+                    if disconnect_event.is_set():
+                        return
+                    api_monitor.fail(monitor_id, _friendly_error(exc))
+                    yield _sse(
+                        "response.failed",
+                        _failed_response_payload(exc, 502),
+                    )
+                    return
+                candidate_text = continuation_state["text"]
+                stream_finish_reason = continuation_state["finish_reason"]
+                if continuation_state["has_tool_calls"]:
+                    stream_finish_reason = "tool_calls"
+                    break
 
         close_items: list[tuple[int, str, dict[str, Any]]] = []
         if reasoning_state["opened"]:
@@ -24967,6 +25778,22 @@ async def openai_responses(
         claim_resident = False,
     )
 
+    _responses_llama_backend = get_llama_cpp_backend()
+    if _responses_llama_backend.is_loaded:
+        _bind_current_project_hook_gguf_runtime(_responses_llama_backend)
+    else:
+        _bind_current_project_hook_standard_runtime(get_inference_backend())
+
+    messages = await _with_project_prompt_hook_messages_async(
+        messages,
+        project_session_id = payload.session_id,
+        thread_id = payload.thread_id,
+        model = payload.model,
+        permission_mode = getattr(payload, "permission_mode", None),
+        bypass_permissions = bool(getattr(payload, "bypass_permissions", False)),
+        request = request,
+    )
+
     if payload.stream:
         monitor_id = None
         if not getattr(request.state, "skip_api_monitor", False):
@@ -25210,6 +26037,195 @@ def _project_guidance_http_exception(
     return HTTPException(status_code = 409, detail = detail)
 
 
+def _project_hook_http_exception(
+    reason: Optional[str], *, anthropic: bool = False
+) -> HTTPException:
+    from core.agent_workspace.hook_runtime import redact_project_hook_feedback  # noqa: PLC0415
+
+    reason = redact_project_hook_feedback(reason) if reason else reason
+    message = reason or "A project hook stopped this request."
+    return HTTPException(
+        status_code = 409,
+        detail = (
+            anthropic_error_body(message, status = 409)
+            if anthropic
+            else openai_error_body(
+                message,
+                status = 409,
+                code = "project_hook_blocked",
+                param = "session_id",
+            )
+        ),
+    )
+
+
+def _project_prompt_hook_context(
+    messages: list[Any],
+    *,
+    project_session_id: Optional[str],
+    thread_id: Optional[str],
+    model: str,
+    permission_mode: Optional[str] = None,
+    bypass_permissions: bool,
+    anthropic: bool = False,
+    cancel_event: Optional[threading.Event] = None,
+) -> tuple[str, ...]:
+    from core.agent_workspace.hook_runtime import (
+        current_project_hook_turn,
+        canonical_permission_mode,
+        ensure_project_hook_session,
+        hook_model_feedback,
+        project_hook_control_failure,
+        project_id_from_session_id,
+        run_project_hook_event,
+    )
+
+    project_id = project_id_from_session_id(project_session_id)
+    hook_session_id = thread_id
+    if project_id is None or not hook_session_id:
+        return ()
+    turn = current_project_hook_turn()
+    effective_permission_mode = (
+        turn.permission_mode
+        if turn is not None and turn.project_id == project_id and turn.session_id == hook_session_id
+        else canonical_permission_mode(
+            permission_mode,
+            bypass_permissions = bypass_permissions,
+        )
+    )
+    synthetic_session = bool(
+        turn is not None
+        and turn.project_id == project_id
+        and turn.session_id == hook_session_id
+        and turn.synthetic_session
+    )
+    try:
+        started = ensure_project_hook_session(
+            project_id,
+            session_id = hook_session_id,
+            model = model,
+            permission_mode = effective_permission_mode,
+            cancel_event = cancel_event,
+            source = "auto",
+            synthetic_session = synthetic_session,
+        )
+    except AgentWorkspaceError as exc:
+        raise _project_guidance_http_exception(
+            ProjectGuidanceUnavailable(str(exc)),
+            anthropic = anthropic,
+        ) from exc
+    start_failure = project_hook_control_failure(started)
+    if started.blocked or start_failure is not None:
+        raise _project_hook_http_exception(
+            started.reason or start_failure,
+            anthropic = anthropic,
+        )
+    if turn is not None:
+        turn.bind_session(started)
+    submitted = run_project_hook_event(
+        project_id,
+        "UserPromptSubmit",
+        {
+            "prompt": latest_user_query(messages),
+            "turn_id": turn.turn_id if turn is not None else f"turn_{uuid.uuid4().hex}",
+        },
+        session_id = hook_session_id,
+        model = model,
+        permission_mode = effective_permission_mode,
+        cancel_event = cancel_event,
+        session_token = started.session_token,
+    )
+    if turn is not None:
+        turn.bind_session(submitted)
+    submit_failure = project_hook_control_failure(submitted)
+    if submitted.blocked or submit_failure is not None:
+        raise _project_hook_http_exception(
+            submitted.reason or submit_failure,
+            anthropic = anthropic,
+        )
+    return tuple(dict.fromkeys((*hook_model_feedback(started), *hook_model_feedback(submitted))))
+
+
+def _with_project_prompt_hook_messages(
+    messages: list[Any],
+    *,
+    project_session_id: Optional[str],
+    thread_id: Optional[str],
+    model: str,
+    permission_mode: Optional[str] = None,
+    bypass_permissions: bool,
+    cancel_event: Optional[threading.Event] = None,
+) -> list[Any]:
+    """Run SessionStart and UserPromptSubmit before model dispatch."""
+    context = _project_prompt_hook_context(
+        messages,
+        project_session_id = project_session_id,
+        thread_id = thread_id,
+        model = model,
+        permission_mode = permission_mode,
+        bypass_permissions = bypass_permissions,
+        cancel_event = cancel_event,
+    )
+    if not context:
+        return messages
+
+    copied = [
+        dict(message) if isinstance(message, dict) else message.model_copy(deep = True)
+        for message in messages
+    ]
+    hook_message = "\n\n".join(context)
+    authoritative = (
+        {"role": "system", "content": hook_message}
+        if copied and isinstance(copied[0], dict)
+        else ChatMessage(role = "system", content = hook_message)
+    )
+    prefix_end = 0
+    while prefix_end < len(copied):
+        message = copied[prefix_end]
+        role = message.get("role") if isinstance(message, dict) else message.role
+        if role not in ("system", "developer"):
+            break
+        prefix_end += 1
+    return [*copied[:prefix_end], authoritative, *copied[prefix_end:]]
+
+
+async def _with_project_prompt_hook_messages_async(
+    messages: list[Any],
+    *,
+    project_session_id: Optional[str],
+    thread_id: Optional[str],
+    model: str,
+    permission_mode: Optional[str] = None,
+    bypass_permissions: bool,
+    request: Optional[Request] = None,
+) -> list[Any]:
+    if not project_session_id or not thread_id:
+        return messages
+    cancel_event = _chat_cancel_event(request) if request is not None else threading.Event()
+    watcher_stop_signal = threading.Event()
+    watcher = (
+        asyncio.create_task(
+            _await_disconnect_then_cancel(request, cancel_event, watcher_stop_signal)
+        )
+        if request is not None
+        else None
+    )
+    try:
+        return await asyncio.to_thread(
+            _with_project_prompt_hook_messages,
+            messages,
+            project_session_id = project_session_id,
+            thread_id = thread_id,
+            model = model,
+            permission_mode = permission_mode,
+            bypass_permissions = bypass_permissions,
+            cancel_event = cancel_event,
+        )
+    finally:
+        if watcher is not None:
+            await _stop_local_disconnect_cancel_watcher(watcher, watcher_stop_signal)
+
+
 def _with_project_guidance_messages(messages: list[Any], session_id: Optional[str]) -> list[Any]:
     """Place current server-owned project guidance after caller instructions."""
     try:
@@ -25339,6 +26355,76 @@ async def _with_anthropic_project_guidance_async(
         session_id,
         messages = messages,
     )
+
+
+def _with_anthropic_project_prompt_hooks(
+    system: Any,
+    *,
+    messages: list[Any],
+    project_session_id: Optional[str],
+    thread_id: Optional[str],
+    model: str,
+    permission_mode: Optional[str] = None,
+    bypass_permissions: bool,
+    cancel_event: Optional[threading.Event] = None,
+) -> Any:
+    context = _project_prompt_hook_context(
+        messages,
+        project_session_id = project_session_id,
+        thread_id = thread_id,
+        model = model,
+        permission_mode = permission_mode,
+        bypass_permissions = bypass_permissions,
+        anthropic = True,
+        cancel_event = cancel_event,
+    )
+    if not context:
+        return system
+    addition = "\n\n".join(context)
+    if system is None:
+        return addition
+    if isinstance(system, str):
+        return f"{system.rstrip()}\n\n{addition}"
+    if isinstance(system, list):
+        return [*system, {"type": "text", "text": addition}]
+    return system
+
+
+async def _with_anthropic_project_prompt_hooks_async(
+    system: Any,
+    *,
+    messages: list[Any],
+    project_session_id: Optional[str],
+    thread_id: Optional[str],
+    model: str,
+    permission_mode: Optional[str] = None,
+    bypass_permissions: bool,
+    request: Optional[Request] = None,
+) -> Any:
+    cancel_event = _chat_cancel_event(request) if request is not None else threading.Event()
+    watcher_stop_signal = threading.Event()
+    watcher = (
+        asyncio.create_task(
+            _await_disconnect_then_cancel(request, cancel_event, watcher_stop_signal)
+        )
+        if request is not None
+        else None
+    )
+    try:
+        return await asyncio.to_thread(
+            _with_anthropic_project_prompt_hooks,
+            system,
+            messages = messages,
+            project_session_id = project_session_id,
+            thread_id = thread_id,
+            model = model,
+            permission_mode = permission_mode,
+            bypass_permissions = bypass_permissions,
+            cancel_event = cancel_event,
+        )
+    finally:
+        if watcher is not None:
+            await _stop_local_disconnect_cancel_watcher(watcher, watcher_stop_signal)
 
 
 @router.post("/chat/count_tokens")
@@ -25787,7 +26873,6 @@ async def anthropic_messages(
         payload.session_id,
         messages = payload.messages,
     )
-
     # require_vision rejects a swap to a text-only target before it runs, so an
     # image request can't evict the resident vision model only to hit the vision
     # guard (_normalize_anthropic_openai_images) below after the load.
@@ -25801,6 +26886,18 @@ async def anthropic_messages(
         # model.
         claim_resident = False,
     )
+    if llama_backend.is_loaded:
+        _bind_current_project_hook_gguf_runtime(llama_backend)
+    payload.system = await _with_anthropic_project_prompt_hooks_async(
+        payload.system,
+        messages = payload.messages,
+        project_session_id = payload.session_id,
+        thread_id = payload.thread_id,
+        model = payload.model,
+        permission_mode = getattr(payload, "permission_mode", None),
+        bypass_permissions = bool(payload.bypass_permissions),
+        request = request,
+    )
     if not llama_backend.is_loaded:
         _status, _detail = await _no_model_loaded_error(
             "No GGUF model loaded. Load a GGUF model first.",
@@ -25809,7 +26906,6 @@ async def anthropic_messages(
             status = 503,
         )
         raise HTTPException(status_code = _status, detail = _detail)
-
     # Advertised repo id after an auto-switch load, else a clean public id, never
     # the local .gguf path (and a legacy raw path in payload.model is sanitized).
     model_name = _llama_public_model_id(llama_backend, payload.model)
@@ -25879,7 +26975,7 @@ async def anthropic_messages(
     if openai_tool_choice is None:
         openai_tool_choice = "auto"
 
-    cancel_event = threading.Event()
+    cancel_event = _chat_cancel_event(request)
 
     # ── Tool routing ──────────────────────────────────────────
     # Three paths:
@@ -26400,6 +27496,8 @@ async def anthropic_messages(
                 monitor_id,
                 llama_backend.context_length,
             ),
+            session_id = payload.session_id,
+            thread_id = payload.thread_id,
             **_anthropic_reasoning_args(payload),
         )
 
@@ -26682,7 +27780,10 @@ async def _anthropic_plain_stream(
                     if cumulative is _sentinel:
                         break
                     if isinstance(cumulative, dict):
-                        if cumulative.get("type") == "metadata":
+                        if cumulative.get("type") == "hook_continuation_boundary":
+                            for line in emitter.feed(cumulative):
+                                yield line
+                        elif cumulative.get("type") == "metadata":
                             _fr = cumulative.get("finish_reason")
                             if _fr is not None:
                                 captured_finish_reason = _fr
@@ -26869,6 +27970,7 @@ def _anthropic_tool_response_from_events(
     usage = {}
     prev_text = ""
     captured_finish_reason = None
+    force_new_text_block = False
     # Gate the display strip on the declared tools: an inactive NAME[ARGS]{...} in a final
     # answer is prose and must survive in the delivered text.
     _display_names = _display_tool_name_gate(openai_tools)
@@ -26884,6 +27986,12 @@ def _anthropic_tool_response_from_events(
 
     for event in events:
         etype = event.get("type", "")
+        if etype == "hook_continuation_boundary":
+            prev_text = ""
+            ends_on_tool_use = False
+            force_new_text_block = True
+            _span_guard.tool_end()
+            continue
         if etype == "content":
             # Strip leaked tool XML (protected helper keeps think rehearsal and trailing prose).
             clean = _span_guard.strip(
@@ -26896,10 +28004,15 @@ def _anthropic_tool_response_from_events(
             prev_text = clean
             if new:
                 ends_on_tool_use = False
-                if content_blocks and isinstance(content_blocks[-1], AnthropicResponseTextBlock):
+                if (
+                    not force_new_text_block
+                    and content_blocks
+                    and isinstance(content_blocks[-1], AnthropicResponseTextBlock)
+                ):
                     content_blocks[-1].text += new
                 else:
                     content_blocks.append(AnthropicResponseTextBlock(text = new))
+                    force_new_text_block = False
                     # The wrap belongs to the block that OPENS this turn's span,
                     # not to a later block of the same turn (a client tool_use
                     # can interrupt one turn's text).
@@ -27046,7 +28159,21 @@ def _anthropic_plain_response_from_events(
     _wrapped = think_provenance is None or think_provenance.get("wrapped", 0) > 0
     _wrap_entries = (think_provenance or {}).get("wraps") or []
     content_blocks: list = []
-    if full_text and parse_think and _wrapped:
+    from core.agent_workspace.hook_runtime import current_project_hook_turn  # noqa: PLC0415
+
+    hook_turn = current_project_hook_turn()
+    if hook_turn is not None and len(hook_turn.assistant_candidates) > 1:
+        for index, candidate in enumerate(hook_turn.assistant_candidates):
+            if candidate and parse_think and _wrapped:
+                content_blocks.extend(
+                    _think_markup_to_blocks(
+                        candidate,
+                        _wrap_entries[index] if index < len(_wrap_entries) else None,
+                    )
+                )
+            elif candidate:
+                content_blocks.append(AnthropicResponseTextBlock(text = candidate))
+    elif full_text and parse_think and _wrapped:
         content_blocks = _think_markup_to_blocks(
             full_text, _wrap_entries[0] if _wrap_entries else None
         )
@@ -27356,6 +28483,118 @@ async def _passthrough_retry_url(llama_backend, exc):
     return f"{llama_backend.base_url}/v1/chat/completions"
 
 
+def _anthropic_passthrough_candidate(data: dict) -> tuple[str, dict, bool]:
+    _project_hook_validate_openai_candidate(data, require_terminal = True)
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    text = content if isinstance(content, str) else ""
+    assistant = {"role": "assistant", "content": content}
+    reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        assistant["reasoning_content"] = reasoning
+    tool_calls = message.get("tool_calls") or []
+    if tool_calls:
+        assistant["tool_calls"] = tool_calls
+    pending_tool = bool(tool_calls) or choice.get("finish_reason") == "tool_calls"
+    return text, assistant, pending_tool
+
+
+def _project_hook_validate_openai_candidate(data: Any, *, require_terminal: bool = False) -> None:
+    """Reject ambiguous upstream choices before project Stop can review them."""
+    from core.agent_workspace.hook_runtime import current_project_hook_turn  # noqa: PLC0415
+
+    if current_project_hook_turn() is None:
+        return
+    if not isinstance(data, dict):
+        raise RuntimeError("Project hook provider response is not a JSON object.")
+    choices = data.get("choices")
+    if isinstance(choices, list) and len(choices) > 1:
+        raise RuntimeError("Project hook transports support exactly one provider choice.")
+    if not require_terminal:
+        return
+    if not isinstance(choices, list) or len(choices) != 1:
+        raise RuntimeError(
+            "Project hook provider response did not contain exactly one terminal choice."
+        )
+    choice = choices[0]
+    if (
+        not isinstance(choice, dict)
+        or not isinstance(choice.get("finish_reason"), str)
+        or not choice["finish_reason"]
+        or not isinstance(choice.get("message"), dict)
+    ):
+        raise RuntimeError("Project hook provider response is not terminal.")
+
+
+def _sum_openai_usage(attempts: list[dict]) -> dict:
+    total: dict[str, Any] = {}
+    for data in attempts:
+        usage = data.get("usage") if isinstance(data, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        for key, value in usage.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                total[key] = total.get(key, 0) + value
+            elif key not in total:
+                total[key] = value
+    return total
+
+
+async def _anthropic_passthrough_stop_continuations(
+    *, first_data: dict, body: dict, post, request, cancel_event
+) -> list[dict]:
+    """Run bounded Stop continuations for the direct client-tool transport."""
+    from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+        MAX_STOP_CONTINUATIONS,
+        current_project_hook_turn,
+        project_hook_continuation_prompts,
+    )
+
+    turn = current_project_hook_turn()
+    attempts = [first_data]
+    if turn is None:
+        return attempts
+    messages = [dict(message) for message in body.get("messages", ()) if isinstance(message, dict)]
+    continuation_count = 0
+    current = first_data
+    while True:
+        candidate, assistant, pending_tool = _anthropic_passthrough_candidate(current)
+        if pending_tool or cancel_event.is_set():
+            break
+        stop_result = await asyncio.to_thread(
+            turn.stop,
+            last_assistant_message = candidate,
+        )
+        prompts = project_hook_continuation_prompts(stop_result)
+        if (
+            stop_result.stop_requested
+            or not prompts
+            or continuation_count >= MAX_STOP_CONTINUATIONS
+        ):
+            break
+        if cancel_event.is_set() or (request is not None and await request.is_disconnected()):
+            cancel_event.set()
+            raise asyncio.CancelledError()
+        messages.append(assistant)
+        messages.append(
+            {
+                "role": "user",
+                "content": "\n".join(prompt.as_message()["content"] for prompt in prompts),
+            }
+        )
+        continuation_body = {
+            **body,
+            "messages": [dict(message) for message in messages],
+            "stream": False,
+        }
+        continuation_body.pop("stream_options", None)
+        current = await post(continuation_body)
+        attempts.append(current)
+        continuation_count += 1
+    return attempts
+
+
 async def _anthropic_passthrough_stream(
     request,
     cancel_event,
@@ -27463,6 +28702,11 @@ async def _anthropic_passthrough_stream(
                 _healing_tools,
                 disable_parallel_tool_use = disable_parallel_tool_use,
             )
+        candidate_text_parts: list[str] = []
+        candidate_reasoning_parts: list[str] = []
+        candidate_has_tool_calls = False
+        candidate_finish_reason = None
+        candidate_usage: dict = {}
         # These yields sit outside the teardown try below, so a disconnect while
         # the opening lines are being sent would strand the tracker. __exit__ is
         # idempotent, so the normal path still exits once, down there.
@@ -27505,6 +28749,9 @@ async def _anthropic_passthrough_stream(
         lines_iter = None
         cancel_watcher = None
         disconnect_watcher = None
+        candidate_complete = False
+        saw_upstream_done = False
+        saw_upstream_finish = False
         try:
             url = target_url
             try:
@@ -27572,12 +28819,14 @@ async def _anthropic_passthrough_stream(
                     continue
                 data_str = raw_line[6:]
                 if data_str.strip() == "[DONE]":
+                    saw_upstream_done = True
                     break
                 try:
                     chunk = json.loads(data_str)
                 except json.JSONDecodeError:
                     continue
                 if isinstance(chunk, dict):
+                    _project_hook_validate_openai_candidate(chunk)
                     error_message = _monitor_openai_error_message(chunk)
                     if error_message:
                         # Upstream HTTP-200 SSE error payload (data: {"error": ...}):
@@ -27597,8 +28846,33 @@ async def _anthropic_passthrough_stream(
                         return
                 if disable_parallel_tool_use:
                     _drop_parallel_tool_call_deltas(chunk)
+                usage = chunk.get("usage") if isinstance(chunk, dict) else None
+                if isinstance(usage, dict):
+                    candidate_usage = usage
+                choices = chunk.get("choices") if isinstance(chunk, dict) else None
+                if isinstance(choices, list) and choices:
+                    choice = choices[0] if isinstance(choices[0], dict) else {}
+                    delta = choice.get("delta") if isinstance(choice, dict) else None
+                    if isinstance(delta, dict):
+                        content = delta.get("content")
+                        reasoning = delta.get("reasoning_content")
+                        if isinstance(content, str):
+                            candidate_text_parts.append(content)
+                        if isinstance(reasoning, str):
+                            candidate_reasoning_parts.append(reasoning)
+                        candidate_has_tool_calls = candidate_has_tool_calls or bool(
+                            delta.get("tool_calls")
+                        )
+                    if choice.get("finish_reason") is not None:
+                        candidate_finish_reason = choice.get("finish_reason")
+                        saw_upstream_finish = True
                 for line in emitter.feed_chunk(chunk):
                     yield line
+            if not saw_upstream_finish or not saw_upstream_done:
+                raise RuntimeError(
+                    "Anthropic passthrough ended without a complete finish and DONE sequence."
+                )
+            candidate_complete = True
         except Exception as e:
             if not cancel_event.is_set():
                 logger.error("anthropic_messages passthrough stream error: %s", e)
@@ -27630,8 +28904,101 @@ async def _anthropic_passthrough_stream(
                     client = client,
                 )
             finally:
-                _release_admission(tracker = _tracker)
+                if not candidate_complete:
+                    _release_admission(tracker = _tracker)
 
+        finalized_events, healed_tool_use = emitter.continuation_boundary(reset_stop = False)
+        for line in finalized_events:
+            yield line
+        first_message: dict[str, Any] = {"content": "".join(candidate_text_parts)}
+        if candidate_reasoning_parts:
+            first_message["reasoning_content"] = "".join(candidate_reasoning_parts)
+        if candidate_has_tool_calls or healed_tool_use:
+            first_message["tool_calls"] = [{"id": "pending", "function": {}}]
+        first_data = {
+            "choices": [
+                {
+                    "message": first_message,
+                    "finish_reason": (
+                        "tool_calls"
+                        if candidate_has_tool_calls or healed_tool_use
+                        else candidate_finish_reason
+                    ),
+                }
+            ],
+            "usage": candidate_usage,
+        }
+
+        async def _post_continuation(payload_body: dict) -> dict:
+            continuation_client = _cancelable_nonstreaming_client()
+            watcher = asyncio.create_task(
+                _await_cancel_or_disconnect_then_close_client(
+                    cancel_event = cancel_event,
+                    request = request,
+                    client = continuation_client,
+                )
+            )
+            try:
+                response = await continuation_client.post(
+                    f"{llama_backend.base_url}/v1/chat/completions",
+                    json = payload_body,
+                    timeout = _llama_non_streaming_generation_timeout(),
+                )
+                if response.status_code != 200:
+                    raise RuntimeError(_friendly_upstream_error(response.text[:500]))
+                return response.json()
+            finally:
+                await _stop_local_disconnect_cancel_watcher(watcher)
+                try:
+                    await continuation_client.aclose()
+                except Exception:
+                    pass
+
+        try:
+            attempts = await _anthropic_passthrough_stop_continuations(
+                first_data = first_data,
+                body = body,
+                post = _post_continuation,
+                request = request,
+                cancel_event = cancel_event,
+            )
+        finally:
+            _release_admission(tracker = _tracker)
+        if len(attempts) > 1:
+            for line in emitter.continuation_boundary()[0]:
+                yield line
+        for index, attempt in enumerate(attempts[1:]):
+            choice = (attempt.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            synthetic_delta = {
+                key: message[key]
+                for key in ("reasoning_content", "content", "tool_calls")
+                if message.get(key)
+            }
+            tool_calls = synthetic_delta.get("tool_calls")
+            if isinstance(tool_calls, list):
+                synthetic_delta["tool_calls"] = [
+                    {**tool_call, "index": tool_index}
+                    for tool_index, tool_call in enumerate(tool_calls)
+                    if isinstance(tool_call, dict)
+                ]
+            for line in emitter.feed_chunk(
+                {
+                    "choices": [
+                        {
+                            "delta": synthetic_delta,
+                            "finish_reason": choice.get("finish_reason"),
+                        }
+                    ]
+                }
+            ):
+                yield line
+            if index + 1 < len(attempts) - 1:
+                for line in emitter.continuation_boundary()[0]:
+                    yield line
+        aggregate_usage = _sum_openai_usage(attempts)
+        if aggregate_usage:
+            emitter.feed_chunk({"choices": [], "usage": aggregate_usage})
         for line in emitter.finish():
             yield line
 
@@ -27797,6 +29164,40 @@ async def _anthropic_passthrough_non_streaming(
             except (httpx.RequestError, ValueError) as exc:
                 logger.warning("tool-call nudge retry failed; keeping original: %s", exc)
 
+        async def _post_continuation(payload_body: dict) -> dict:
+            response = await _post(payload_body)
+            if response.status_code != 200:
+                raise HTTPException(
+                    status_code = response.status_code,
+                    detail = _friendly_upstream_error(response.text[:500]),
+                )
+            return response.json()
+
+        hook_attempts = await _anthropic_passthrough_stop_continuations(
+            first_data = data,
+            body = body,
+            post = _post_continuation,
+            request = request,
+            cancel_event = cancel_event,
+        )
+        prior_content_blocks = []
+        for prior in hook_attempts[:-1]:
+            prior_choice = (prior.get("choices") or [{}])[0]
+            prior_message = prior_choice.get("message") or {}
+            prior_reasoning = prior_message.get("reasoning_content") or ""
+            prior_text = prior_message.get("content") or ""
+            if isinstance(prior_reasoning, str) and prior_reasoning.strip():
+                if parse_think:
+                    prior_content_blocks.append(
+                        AnthropicResponseThinkingBlock(thinking = prior_reasoning)
+                    )
+                else:
+                    prior_content_blocks.append(
+                        AnthropicResponseTextBlock(text = f"<think>{prior_reasoning}</think>")
+                    )
+            if isinstance(prior_text, str) and prior_text:
+                prior_content_blocks.append(AnthropicResponseTextBlock(text = prior_text))
+        data = hook_attempts[-1]
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         finish_reason = choice.get("finish_reason")
@@ -27808,7 +29209,7 @@ async def _anthropic_passthrough_non_streaming(
             else None
         )
 
-        content_blocks = []
+        content_blocks = prior_content_blocks
         tool_calls = []
         # Reasoning first: llama-server splits <think> into reasoning_content on any
         # turn whose format it can parse, and Anthropic orders thinking ahead of the
@@ -27886,7 +29287,7 @@ async def _anthropic_passthrough_non_streaming(
             finish_reason, had_tool_calls = bool(tool_calls)
         )
 
-        usage = data.get("usage") or {}
+        usage = _sum_openai_usage(hook_attempts)
         return _anthropic_message_json_response(
             message_id, model_name, content_blocks, stop_reason, usage
         )
@@ -28806,16 +30207,24 @@ async def _openai_passthrough_stream_admitted(
             # cancel/disconnect checks can run.
             cancel_watcher = None
             disconnect_watcher = None
+            from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+                current_project_hook_turn,
+            )
+
+            project_hook_turn = current_project_hook_turn()
 
             nonlocal resp, send_task, first_token_deadline, _truncate_budget
             nonlocal client, target_url, upstream_headers, _respawn_retried
             monitor_done = False
-            saw_finish_reason = False
             saw_done = False
             saw_stream_error = False
             saw_stream_item = False
             saw_tool_call_delta = False
             terminal_seen = False
+            candidate_parts: list[str] = []
+            last_finish_reason: Optional[str] = None
+            first_usage: dict[str, Any] = {}
+            upstream_usage_line: Optional[str] = None
             last_chunk_id = completion_id
             last_chunk_model = model_name
             last_chunk_created = int(time.time())
@@ -28824,21 +30233,171 @@ async def _openai_passthrough_stream_admitted(
             )
             healed_call_index = 0
 
-            def _synthetic_finish_line() -> str:
-                healed = healer is not None and healer.healed
-                finish_reason = "tool_calls" if (saw_tool_call_delta or healed) else "stop"
-                chunk = ChatCompletionChunk(
-                    id = last_chunk_id,
-                    created = last_chunk_created,
-                    model = last_chunk_model,
-                    choices = [
-                        ChunkChoice(
-                            delta = ChoiceDelta(),
-                            finish_reason = finish_reason,
-                        )
+            def _record_candidate_line(line: str) -> None:
+                nonlocal saw_tool_call_delta, last_finish_reason, first_usage
+                if not line.startswith("data:"):
+                    return
+                try:
+                    document = json.loads(line[5:].strip())
+                except (TypeError, ValueError):
+                    return
+                if not isinstance(document, dict):
+                    return
+                usage = document.get("usage")
+                if isinstance(usage, dict):
+                    first_usage = usage
+                choices = document.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    return
+                choice = choices[0] if isinstance(choices[0], dict) else {}
+                if isinstance(choice.get("finish_reason"), str):
+                    last_finish_reason = choice["finish_reason"]
+                delta = choice.get("delta")
+                if not isinstance(delta, dict):
+                    return
+                if isinstance(delta.get("content"), str):
+                    candidate_parts.append(delta["content"])
+                if delta.get("tool_calls"):
+                    saw_tool_call_delta = True
+
+            async def _finish_with_project_stop():
+                if project_hook_turn is not None and (not saw_done or last_finish_reason is None):
+                    raise RuntimeError(
+                        "Provider stream ended without a complete finish and DONE sequence."
+                    )
+                first_message: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": "".join(candidate_parts),
+                }
+                if saw_tool_call_delta:
+                    first_message["tool_calls"] = [{"id": "pending", "type": "function"}]
+                first_data = {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": first_message,
+                            "finish_reason": last_finish_reason
+                            or ("tool_calls" if saw_tool_call_delta else "stop"),
+                        }
                     ],
+                    "usage": first_usage,
+                }
+
+                async def _post_continuation(continuation_body: dict) -> dict:
+                    if cancel_event.is_set() or await request.is_disconnected():
+                        cancel_event.set()
+                        raise asyncio.CancelledError()
+                    continuation_client = _cancelable_nonstreaming_client()
+                    continuation_watcher = asyncio.create_task(
+                        _await_cancel_or_disconnect_then_close_client(
+                            cancel_event = cancel_event,
+                            request = request,
+                            client = continuation_client,
+                        )
+                    )
+                    try:
+                        try:
+                            continuation_response = await continuation_client.post(
+                                target_url,
+                                json = continuation_body,
+                                headers = upstream_headers,
+                                timeout = _llama_non_streaming_generation_timeout(),
+                            )
+                        except httpx.RequestError:
+                            if cancel_event.is_set():
+                                raise asyncio.CancelledError()
+                            raise
+                        if cancel_event.is_set():
+                            raise asyncio.CancelledError()
+                        if continuation_response.status_code != 200:
+                            raise _openai_passthrough_error(
+                                continuation_response.status_code,
+                                continuation_response.text,
+                            )
+                        return continuation_response.json()
+                    finally:
+                        try:
+                            await _stop_local_disconnect_cancel_watcher(continuation_watcher)
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        try:
+                            await continuation_client.aclose()
+                        except Exception:
+                            pass
+
+                attempts = await _anthropic_passthrough_stop_continuations(
+                    first_data = first_data,
+                    body = body,
+                    post = _post_continuation,
+                    request = request,
+                    cancel_event = cancel_event,
                 )
-                return f"data: {chunk.model_dump_json(exclude_none = True)}"
+                for attempt in attempts[1:]:
+                    choice = (attempt.get("choices") or [{}])[0]
+                    message = choice.get("message") or {}
+                    delta = {
+                        key: message[key]
+                        for key in ("reasoning_content", "content", "tool_calls")
+                        if message.get(key) is not None
+                    }
+                    if isinstance(delta.get("tool_calls"), list):
+                        delta["tool_calls"] = [
+                            {**tool_call, "index": index}
+                            for index, tool_call in enumerate(delta["tool_calls"])
+                            if isinstance(tool_call, dict)
+                        ]
+                    chunk = {
+                        "id": last_chunk_id,
+                        "object": "chat.completion.chunk",
+                        "created": last_chunk_created,
+                        "model": last_chunk_model,
+                        "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+                    }
+                    line = "data: " + json.dumps(chunk, ensure_ascii = False)
+                    _monitor_openai_sse_line(monitor_id, line, llama_backend.context_length)
+                    yield line + "\n\n"
+                final_choice = (attempts[-1].get("choices") or [{}])[0]
+                finish_reason = final_choice.get("finish_reason") or "stop"
+                finish_chunk = {
+                    "id": last_chunk_id,
+                    "object": "chat.completion.chunk",
+                    "created": last_chunk_created,
+                    "model": last_chunk_model,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+                }
+                finish_line = "data: " + json.dumps(finish_chunk, ensure_ascii = False)
+                usage = _sum_openai_usage(attempts)
+                usage_line = None
+                if usage:
+                    usage_line = "data: " + json.dumps(
+                        {
+                            "id": last_chunk_id,
+                            "object": "chat.completion.chunk",
+                            "created": last_chunk_created,
+                            "model": last_chunk_model,
+                            "choices": [],
+                            "usage": usage,
+                        },
+                        ensure_ascii = False,
+                    )
+                    _monitor_openai_sse_line(
+                        monitor_id,
+                        usage_line,
+                        llama_backend.context_length,
+                    )
+                _monitor_openai_sse_line(monitor_id, finish_line, llama_backend.context_length)
+                yield finish_line + "\n\n"
+                if client_wants_usage:
+                    if project_hook_turn is None and upstream_usage_line is not None:
+                        yield upstream_usage_line + "\n\n"
+                    elif usage_line is not None:
+                        yield usage_line + "\n\n"
+                _monitor_openai_sse_line(
+                    monitor_id,
+                    _SSE_DONE_LINE,
+                    llama_backend.context_length,
+                )
+                yield _SSE_DONE_LINE + "\n\n"
 
             def _healer_sse_lines(events) -> list:
                 # Serialize healer events as chunks matching the upstream stream's
@@ -29156,29 +30715,26 @@ async def _openai_passthrough_stream_admitted(
                         # first so the synthetic finish sees healer.healed.
                         if healer is not None and not saw_stream_error:
                             for held_line in _healer_sse_lines(healer.finalize()):
+                                _record_candidate_line(held_line)
                                 _monitor_openai_sse_line(
                                     monitor_id, held_line, llama_backend.context_length
                                 )
                                 yield held_line + "\n\n"
                         if (
-                            not saw_finish_reason
+                            project_hook_turn is not None
+                            and last_finish_reason is None
                             and not saw_stream_error
-                            and not cancel_event.is_set()
                         ):
-                            finish_line = _synthetic_finish_line()
-                            _monitor_openai_sse_line(
-                                monitor_id,
-                                finish_line,
-                                llama_backend.context_length,
+                            raise RuntimeError(
+                                "Provider stream ended without a complete finish and DONE sequence."
                             )
-                            yield finish_line + "\n\n"
-                            saw_finish_reason = True
-                        _monitor_openai_sse_line(
-                            monitor_id,
-                            raw_line,
-                            llama_backend.context_length,
-                        )
-                        yield raw_line + "\n\n"
+                        if saw_stream_error:
+                            # Preserve the provider's terminal frame after its
+                            # error frame without changing the monitor's error.
+                            yield raw_line + "\n\n"
+                        elif not cancel_event.is_set():
+                            async for terminal_line in _finish_with_project_stop():
+                                yield terminal_line
                         monitor_done = True
                         break
                     raw_line = _normalize_openai_passthrough_sse_line(
@@ -29191,6 +30747,7 @@ async def _openai_passthrough_stream_admitted(
                     except json.JSONDecodeError:
                         chunk_data = None
                     if isinstance(chunk_data, dict):
+                        _project_hook_validate_openai_candidate(chunk_data)
                         if isinstance(chunk_data.get("id"), str):
                             last_chunk_id = chunk_data["id"]
                         if isinstance(chunk_data.get("model"), str):
@@ -29202,7 +30759,7 @@ async def _openai_passthrough_stream_admitted(
                             choice = choices[0]
                             if isinstance(choice, dict):
                                 if choice.get("finish_reason"):
-                                    saw_finish_reason = True
+                                    last_finish_reason = choice.get("finish_reason")
                                 delta = choice.get("delta")
                                 if isinstance(delta, dict) and delta.get("tool_calls"):
                                     saw_tool_call_delta = True
@@ -29225,69 +30782,55 @@ async def _openai_passthrough_stream_admitted(
                         out_lines = _heal_transform(chunk_data, raw_line)
                     else:
                         out_lines = [raw_line]
-                    # If a trailing usage-only chunk (include_usage) arrives before
-                    # any finish chunk, emit the synthetic finish first so the order
-                    # stays finish -> usage -> [DONE], matching the other streams.
-                    if (
-                        isinstance(chunk_data, dict)
-                        and chunk_data.get("usage")
-                        and not (
-                            isinstance(chunk_data.get("choices"), list) and chunk_data["choices"]
-                        )
-                        and not saw_finish_reason
-                        and not saw_stream_error
-                        and not cancel_event.is_set()
-                    ):
-                        if healer is not None:
-                            # Residue must precede the finish it may upgrade.
-                            held = _healer_sse_lines(healer.finalize())
-                            for held_line in held:
-                                _monitor_openai_sse_line(
-                                    monitor_id, held_line, llama_backend.context_length
-                                )
-                                yield held_line + "\n\n"
-                        finish_line = _synthetic_finish_line()
-                        _monitor_openai_sse_line(
-                            monitor_id, finish_line, llama_backend.context_length
-                        )
-                        yield finish_line + "\n\n"
-                        saw_finish_reason = True
                     for out_line in out_lines:
-                        monitor_event = _monitor_openai_sse_line(
-                            monitor_id,
-                            out_line,
-                            llama_backend.context_length,
-                        )
-                        if monitor_event == "error":
-                            saw_stream_error = True
-                            mark_response_failed(getattr(request, "scope", None))
+                        _record_candidate_line(out_line)
                         terminal_state = (
                             _openai_passthrough_terminal_state_from_data(chunk_data)
                             if out_line is raw_line
                             else _openai_passthrough_sse_line_terminal_state(out_line)
                         )
+                        # Hold every upstream terminal marker until Stop settles.
+                        # Monitoring the held finish would finalize the request
+                        # before a continuation could be sampled.
+                        monitor_event = None
+                        if terminal_state not in {"finish", "usage"}:
+                            monitor_event = _monitor_openai_sse_line(
+                                monitor_id,
+                                out_line,
+                                llama_backend.context_length,
+                            )
+                        if monitor_event == "error":
+                            saw_stream_error = True
+                            mark_response_failed(getattr(request, "scope", None))
                         # The upstream usage-only chunk is always requested for
                         # accounting, but remains caller-visible only by opt-in.
-                        if terminal_state != "usage" or client_wants_usage:
+                        if terminal_state not in {"finish", "usage"}:
                             yield out_line + "\n\n"
                         if monitor_event == "done":
                             monitor_done = True
                             break
                         if terminal_state == "usage":
-                            done_line = _SSE_DONE_LINE
+                            terminal_seen = True
+                            upstream_usage_line = out_line
                             _monitor_openai_sse_line(
                                 monitor_id,
-                                done_line,
+                                out_line,
                                 llama_backend.context_length,
                             )
-                            yield done_line + "\n\n"
-                            saw_done = True
-                            monitor_done = True
-                            break
+                            continue
                         if terminal_state == "finish":
                             terminal_seen = True
                     if monitor_done:
                         break
+                if (
+                    project_hook_turn is not None
+                    and not saw_done
+                    and not saw_stream_error
+                    and not cancel_event.is_set()
+                ):
+                    raise RuntimeError(
+                        "Provider stream ended without a complete finish and DONE sequence."
+                    )
                 if not saw_done and not saw_stream_error and not cancel_event.is_set():
                     # Synthesize a finish chunk only if one was not already
                     # emitted (e.g. before a trailing usage-only chunk), but
@@ -29295,25 +30838,13 @@ async def _openai_passthrough_stream_admitted(
                     # so the stream ends on the [DONE] sentinel either way.
                     if healer is not None:
                         for held_line in _healer_sse_lines(healer.finalize()):
+                            _record_candidate_line(held_line)
                             _monitor_openai_sse_line(
                                 monitor_id, held_line, llama_backend.context_length
                             )
                             yield held_line + "\n\n"
-                    if not saw_finish_reason:
-                        finish_line = _synthetic_finish_line()
-                        _monitor_openai_sse_line(
-                            monitor_id,
-                            finish_line,
-                            llama_backend.context_length,
-                        )
-                        yield finish_line + "\n\n"
-                    done_line = _SSE_DONE_LINE
-                    _monitor_openai_sse_line(
-                        monitor_id,
-                        done_line,
-                        llama_backend.context_length,
-                    )
-                    yield done_line + "\n\n"
+                    async for terminal_line in _finish_with_project_stop():
+                        yield terminal_line
                     monitor_done = True
                 if not monitor_done:
                     api_monitor.finish(
@@ -29324,15 +30855,14 @@ async def _openai_passthrough_stream_admitted(
                 api_monitor.finish(monitor_id, "cancelled")
                 raise
             except httpx.ReadTimeout as e:
-                if terminal_seen and not saw_stream_error and not cancel_event.is_set():
-                    done_line = _SSE_DONE_LINE
-                    _monitor_openai_sse_line(
-                        monitor_id,
-                        done_line,
-                        llama_backend.context_length,
-                    )
-                    yield done_line + "\n\n"
-                    api_monitor.finish(monitor_id)
+                if (
+                    project_hook_turn is None
+                    and terminal_seen
+                    and not saw_stream_error
+                    and not cancel_event.is_set()
+                ):
+                    async for terminal_line in _finish_with_project_stop():
+                        yield terminal_line
                     return
                 if cancel_event.is_set():
                     api_monitor.finish(monitor_id, "cancelled")
@@ -29688,6 +31218,16 @@ async def _openai_passthrough_non_streaming_upstream(
     try:
         data = resp.json()
     except Exception as exc:
+        from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+            current_project_hook_turn,
+        )
+
+        if current_project_hook_turn() is not None:
+            api_monitor.fail(monitor_id, "Project provider response was not valid JSON.")
+            raise _openai_passthrough_error(
+                502,
+                "Project provider response was not valid terminal JSON.",
+            ) from exc
         # Non-JSON / unparseable upstream body: relay verbatim as before.
         logger.warning(
             "openai passthrough non-streaming: response not JSON, relaying raw: %s",
@@ -29778,6 +31318,49 @@ async def _openai_passthrough_non_streaming_upstream(
                 continue
             msg["content"] = f"```json\n{stripped}\n```"
             changed = True
+
+    async def _post_hook_continuation(continuation_body: dict) -> dict:
+        continuation_response = await _post(continuation_body)
+        if continuation_response.status_code != 200:
+            raise _openai_passthrough_error(
+                continuation_response.status_code,
+                continuation_response.text,
+            )
+        return continuation_response.json()
+
+    _project_hook_validate_openai_candidate(data, require_terminal = True)
+    hook_attempts = await _anthropic_passthrough_stop_continuations(
+        first_data = data,
+        body = body,
+        post = _post_hook_continuation,
+        request = request,
+        cancel_event = cancel_event if cancel_event is not None else threading.Event(),
+    )
+    if len(hook_attempts) > 1:
+        final_data = dict(hook_attempts[-1])
+        final_choices = final_data.get("choices")
+        final_choice = (
+            final_choices[0] if isinstance(final_choices, list) and final_choices else None
+        )
+        final_message = final_choice.get("message") if isinstance(final_choice, dict) else None
+        if isinstance(final_message, dict):
+            content_parts = []
+            reasoning_parts = []
+            for attempt in hook_attempts:
+                attempt_choice = (attempt.get("choices") or [{}])[0]
+                attempt_message = attempt_choice.get("message") or {}
+                if isinstance(attempt_message.get("content"), str):
+                    content_parts.append(attempt_message["content"])
+                if isinstance(attempt_message.get("reasoning_content"), str):
+                    reasoning_parts.append(attempt_message["reasoning_content"])
+            final_message["content"] = "".join(content_parts)
+            if reasoning_parts:
+                final_message["reasoning_content"] = "".join(reasoning_parts)
+        usage = _sum_openai_usage(hook_attempts)
+        if usage:
+            final_data["usage"] = usage
+        data = final_data
+        changed = True
 
     _monitor_openai_chunk(monitor_id, data, llama_backend.context_length)
     api_monitor.finish(monitor_id)

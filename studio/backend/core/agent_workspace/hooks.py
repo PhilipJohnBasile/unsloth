@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import stat
+import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -416,8 +417,19 @@ def _empty_project_hooks(root_identity: Optional[tuple[int, int]] = None) -> dic
     }
 
 
+def _check_discovery_budget(cancel_event, deadline: Optional[float]) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise InterruptedError("Project hook discovery was cancelled.")
+    if deadline is not None and time.monotonic() >= deadline:
+        raise TimeoutError("Project hook discovery timed out.")
+
+
 def discover_project_hooks(
-    root: Path | str, *, expected_identity: Optional[tuple[int, int]] = None
+    root: Path | str,
+    *,
+    expected_identity: Optional[tuple[int, int]] = None,
+    cancel_event = None,
+    deadline: Optional[float] = None,
 ) -> dict[str, Any]:
     """Read one identity-bound, non-symlink project ``hooks.json`` file."""
     if (
@@ -437,9 +449,11 @@ def discover_project_hooks(
     expected = _normalize_identity(expected_identity)
     root_fd = codex_fd = hook_fd = None
     try:
+        _check_discovery_budget(cancel_event, deadline)
         if requested_root.is_symlink():
             raise AgentWorkspaceError("Symbolic-link project roots are not supported.")
         resolved = requested_root.resolve(strict = True)
+        _check_discovery_budget(cancel_event, deadline)
         root_fd = os.open(resolved, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         root_path_metadata = resolved.stat(follow_symlinks = False)
         root_opened_metadata = os.fstat(root_fd)
@@ -455,6 +469,7 @@ def discover_project_hooks(
         ):
             raise AgentWorkspaceError("Project root identity changed.")
         try:
+            _check_discovery_budget(cancel_event, deadline)
             codex_fd = os.open(
                 ".codex",
                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -465,6 +480,7 @@ def discover_project_hooks(
         if not stat.S_ISDIR(os.fstat(codex_fd).st_mode):
             raise AgentWorkspaceError("Project .codex is not a directory.")
         try:
+            _check_discovery_budget(cancel_event, deadline)
             hook_fd = os.open(
                 "hooks.json",
                 os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
@@ -477,6 +493,7 @@ def discover_project_hooks(
             raise AgentWorkspaceError("Project hooks.json must be a regular file.")
         raw = bytearray()
         while len(raw) <= MAX_HOOK_CONFIG_BYTES:
+            _check_discovery_budget(cancel_event, deadline)
             chunk = os.read(hook_fd, min(8192, MAX_HOOK_CONFIG_BYTES + 1 - len(raw)))
             if not chunk:
                 break
@@ -492,7 +509,7 @@ def discover_project_hooks(
         discovered = validate_project_hooks(bytes(raw), source_path = _HOOK_PATH)
         discovered["rootIdentity"] = actual_identity
         return discovered
-    except AgentWorkspaceError:
+    except (AgentWorkspaceError, TimeoutError, InterruptedError):
         raise
     except (OSError, RuntimeError, ValueError) as exc:
         raise AgentWorkspaceError(
@@ -505,6 +522,16 @@ def discover_project_hooks(
                     os.close(descriptor)
                 except OSError:
                     pass
+
+
+def secure_project_hook_discovery_supported() -> bool:
+    return bool(
+        os.name != "nt"
+        and os.open in os.supports_dir_fd
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "O_NONBLOCK")
+    )
 
 
 def project_hooks_are_trusted(

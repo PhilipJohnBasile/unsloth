@@ -576,9 +576,9 @@ def test_oauth_start_captures_generation_guarded_persistence(monkeypatch):
     monkeypatch.setattr(
         codex_auth,
         "set_oauth_flow_marker_status",
-        lambda scope, marker, _status: markers.pop(scope, None)
-        if markers.get(scope) == marker
-        else None,
+        lambda scope, marker, _status: (
+            markers.pop(scope, None) if markers.get(scope) == marker else None
+        ),
     )
     monkeypatch.setattr(
         codex_auth,
@@ -588,9 +588,9 @@ def test_oauth_start_captures_generation_guarded_persistence(monkeypatch):
     monkeypatch.setattr(
         codex_auth,
         "delete_oauth_flow_marker",
-        lambda scope, marker = None: markers.pop(scope, None)
-        if marker is None or markers.get(scope) == marker
-        else None,
+        lambda scope, marker = None: (
+            markers.pop(scope, None) if marker is None or markers.get(scope) == marker else None
+        ),
     )
     monkeypatch.setattr(
         codex_auth,
@@ -1027,16 +1027,26 @@ def test_model_route_falls_back_to_curated_when_upstream_is_unusable(monkeypatch
 
 def test_client_never_emits_done_marker_itself():
     # The route owns the one Chat-Completions [DONE] marker.
-    assert not any("[DONE]" in line for line in asyncio.run(_successful_stream_lines()))
+    lines = asyncio.run(_successful_stream_lines())
+    assert not any("[DONE]" in line for line in lines)
+    assert [line for line in lines if isinstance(line, dict)] == [
+        {"type": "_studio_transport_terminal", "protocol": "sse"}
+    ]
 
 
-async def _successful_stream_lines():
+def test_client_requires_provider_done_after_completed_event():
+    with pytest.raises(CodexTransportError, match = "before completion"):
+        asyncio.run(_successful_stream_lines(include_done = False))
+
+
+async def _successful_stream_lines(*, include_done: bool = True):
     class Response:
         status_code = 200
 
         async def aiter_lines(self):
             yield 'data: {"type":"response.completed","response":{}}'
-            yield "data: [DONE]"
+            if include_done:
+                yield "data: [DONE]"
 
     class Stream:
         async def __aenter__(self):
@@ -1071,6 +1081,70 @@ async def _successful_stream_lines():
         ]
     finally:
         await client.close()
+
+
+def test_real_codex_client_terminal_proof_is_consumed_by_tool_loop():
+    from core.inference import openai_codex_tool_loop as tool_loop
+
+    class Response:
+        status_code = 200
+
+        async def aiter_lines(self):
+            yield 'data: {"type":"response.output_text.delta","delta":"hello"}'
+            yield 'data: {"type":"response.completed","response":{}}'
+            yield "data: [DONE]"
+
+    class Stream:
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Client:
+        def stream(self, *_args, **_kwargs):
+            return Stream()
+
+        async def aclose(self):
+            return None
+
+    async def run():
+        client = OpenAICodexClient("secret", "account")
+        await client._client.aclose()
+        client._client = Client()
+        try:
+            return [
+                line
+                async for line in tool_loop.stream_codex_with_studio_tools(
+                    client,
+                    run = tool_loop.CodexRunContext(
+                        provider_id = "provider",
+                        thread_id = None,
+                        session_id = None,
+                        messages = [{"role": "user", "content": "hello"}],
+                        model = "gpt-5.4",
+                        reasoning_effort = None,
+                    ),
+                    policy = tool_loop.CodexToolPolicy(
+                        tools = [],
+                        max_calls = 0,
+                        timeout = 30,
+                        permission_mode = "off",
+                        confirm_calls = False,
+                        bypass_permissions = False,
+                        rag_scope = None,
+                    ),
+                    cancel_event = threading.Event(),
+                )
+            ]
+        finally:
+            await client.close()
+
+    lines = asyncio.run(run())
+    assert all(isinstance(line, str) for line in lines)
+    assert not any("[DONE]" in line for line in lines)
+    assert any("hello" in line for line in lines)
+    assert sum('"finish_reason":"stop"' in line for line in lines) == 1
 
 
 def test_browser_no_bind_fallback_keeps_registered_manual_redirect(monkeypatch):
@@ -1274,6 +1348,7 @@ def test_codex_tool_loop_autoinjects_rag_before_first_model_call(monkeypatch):
         async def stream(self, **kwargs):
             self.messages.append(kwargs["messages"])
             yield 'data: {"choices":[{"delta":{"content":"from docs"},"finish_reason":"stop"}]}'
+            yield "data: [DONE]"
 
     injected_messages = [
         {
@@ -1352,9 +1427,11 @@ def test_codex_studio_tool_loop_executes_and_continues(monkeypatch):
             if len(self.messages) == 1:
                 yield 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"python","arguments":"{\\"code\\":\\"print(6 * 7)\\"}"}}]},"finish_reason":null}]}'
                 yield 'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}'
+                yield "data: [DONE]"
             else:
                 yield 'data: {"choices":[{"delta":{"content":"The result is 42."},"finish_reason":null}]}'
                 yield 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
+                yield "data: [DONE]"
 
     executed = []
     monkeypatch.setattr(
@@ -1431,9 +1508,11 @@ def test_codex_tool_budget_resolves_parallel_overflow_without_executing_it(monke
             if len(self.requests) == 1:
                 yield 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"python","arguments":"{}"}},{"index":1,"id":"call_2","type":"function","function":{"name":"terminal","arguments":"{}"}}]},"finish_reason":null}]}'
                 yield 'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}'
+                yield "data: [DONE]"
             else:
                 yield 'data: {"choices":[{"delta":{"content":"done"},"finish_reason":null}]}'
                 yield 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
+                yield "data: [DONE]"
 
     executed = []
     monkeypatch.setattr(

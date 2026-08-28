@@ -1232,11 +1232,31 @@ class TestResponsesStreamAdapter:
         *,
         supports_reasoning = True,
         reasoning_always_on = False,
+        terminal_finish_reason = "stop",
     ):
         import routes.inference as inf_mod
 
+        stream_chunks = list(chunks)
+        has_terminal_finish = any(
+            isinstance(choice, dict) and bool(choice.get("finish_reason"))
+            for chunk in stream_chunks
+            if isinstance(chunk, dict)
+            for choice in (chunk.get("choices") or [])
+        )
+        if terminal_finish_reason is not None and not has_terminal_finish:
+            stream_chunks.append(
+                {
+                    "choices": [
+                        {
+                            "delta": {},
+                            "finish_reason": terminal_finish_reason,
+                        }
+                    ]
+                }
+            )
+
         def handler(request: httpx.Request) -> httpx.Response:
-            content = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+            content = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in stream_chunks)
             content += "data: [DONE]\n\n"
             return httpx.Response(
                 200,
@@ -1460,7 +1480,7 @@ class TestResponsesStreamAdapter:
     def test_preheader_cancel_finalizes_monitor(self, monkeypatch):
         import routes.inference as inf_mod
 
-        self._install_stream_mock(monkeypatch, [])
+        self._install_stream_mock(monkeypatch, [], terminal_finish_reason = None)
         monitor = ApiMonitor(max_entries = 3)
         monkeypatch.setattr(inf_mod, "api_monitor", monitor)
         monitor_id = monitor.start(
@@ -1503,7 +1523,7 @@ class TestResponsesStreamAdapter:
                 yield 'data: {"choices":[{"delta":{"content":"hello"}}]}'
                 await asyncio.sleep(3600)
 
-            self._install_stream_mock(monkeypatch, [])
+            self._install_stream_mock(monkeypatch, [], terminal_finish_reason = None)
             monitor = ApiMonitor(max_entries = 3)
             monkeypatch.setattr(inf_mod, "api_monitor", monitor)
             monkeypatch.setattr(inf_mod, "_send_stream_with_preheader_cancel", fake_send)
@@ -1872,6 +1892,7 @@ class TestResponsesStreamAdapter:
                     ]
                 },
                 {"choices": [], "usage": {"prompt_tokens": 2, "completion_tokens": 3}},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
             ]
             content = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
             content += "data: [DONE]\n\n"

@@ -33,6 +33,7 @@ class CodexRunContext:
     messages: list[dict[str, Any]]
     model: str
     reasoning_effort: str | None
+    max_tokens: int | None = None
     response_format: dict[str, Any] | None = None
     tool_choice: Any = None
     continue_final_message: bool = False
@@ -77,7 +78,7 @@ class CodexTransport:
             thread_id = self._run.thread_id,
             messages = messages,
             model = self._run.model,
-            max_tokens = None,
+            max_tokens = self._run.max_tokens,
             reasoning_effort = self._run.reasoning_effort,
             response_format = self._run.response_format,
             tools = tools,

@@ -3,11 +3,15 @@
 
 import asyncio
 import inspect
+import json
 import os
 import re
 import sqlite3
 import sys
 import threading
+import time
+from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -187,7 +191,7 @@ def test_save_thread_message_does_not_mask_an_unrelated_integrity_error(monkeypa
 
 
 def test_save_thread_distinguishes_a_tombstone_from_an_unknown_id(monkeypatch):
-    def reject_deleted_thread(_thread):
+    def reject_deleted_thread(_thread, **_kwargs):
         raise chat_history.ChatThreadDeletedError("thread-1")
 
     monkeypatch.setattr(chat_history, "upsert_chat_thread", reject_deleted_thread)
@@ -229,11 +233,16 @@ def test_clear_history_fences_pending_thread_ids(monkeypatch):
         thread_ids = (),
         operation_id = None,
         include_chat_generation_runs = False,
+        hook_session_ledger = None,
     ):
         captured.extend(thread_ids)
         captured_operation_ids.append(operation_id)
         result = (list(thread_ids), [])
-        return (*result, [], False) if include_chat_generation_runs else (*result, False)
+        if include_chat_generation_runs:
+            response = (*result, [], False)
+        else:
+            response = (*result, False)
+        return (*response, []) if hook_session_ledger is not None else response
 
     async def remove_sandboxes(_thread_ids, _delete_files):
         return 0, []
@@ -279,8 +288,14 @@ def test_clear_history_reaps_search_thumbnails_with_a_body(monkeypatch):
     monkeypatch.setattr(
         chat_history,
         "clear_chat_history_with_replay_status",
-        lambda thread_ids = (), operation_id = None, include_chat_generation_runs = False: (
-            ([], [], [], False) if include_chat_generation_runs else ([], [], False)
+        lambda thread_ids = (), operation_id = None, include_chat_generation_runs = False, hook_session_ledger = None: (
+            ([], [], [], False, [])
+            if include_chat_generation_runs and hook_session_ledger is not None
+            else ([], [], [], False)
+            if include_chat_generation_runs
+            else ([], [], False, [])
+            if hook_session_ledger is not None
+            else ([], [], False)
         ),
     )
     monkeypatch.setattr(chat_history, "_remove_sandboxes", remove_sandboxes)
@@ -315,7 +330,7 @@ def test_project_delete_cancels_research_before_workspace_cleanup(monkeypatch):
     monkeypatch.setattr(
         chat_history,
         "delete_chat_project",
-        lambda _project_id, delete_files = False: project,
+        lambda _project_id, delete_files = False, **_kwargs: project,
     )
     monkeypatch.setattr(
         chat_history,
@@ -340,6 +355,160 @@ def test_project_delete_cancels_research_before_workspace_cleanup(monkeypatch):
         )
 
     assert cancelled == ["run-1"]
+
+
+def test_project_delete_always_ends_captured_hook_sessions(monkeypatch):
+    captured = [{"project_id": "project-1", "session_id": "thread-1"}]
+    project = {
+        "id": "project-1",
+        "name": "Project",
+        "createdAt": 1,
+        "updatedAt": 1,
+        "memberIds": ["thread-1"],
+        "activeResearchRunIds": ["run-1"],
+        "hookSessions": captured,
+    }
+    ended = []
+    monkeypatch.setattr(
+        chat_history,
+        "delete_chat_project",
+        lambda _project_id, delete_files = False, **_kwargs: project,
+    )
+    monkeypatch.setattr(
+        chat_history,
+        "_cancel_research_runs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("cancel failed")),
+    )
+    monkeypatch.setattr(
+        chat_history,
+        "_end_project_hook_sessions",
+        lambda records, **kwargs: ended.append((records, kwargs["reason"])),
+    )
+
+    with pytest.raises(RuntimeError, match = "cancel failed"):
+        asyncio.run(
+            chat_history.delete_project(
+                "project-1",
+                SimpleNamespace(),
+                current_subject = "test-user",
+            )
+        )
+
+    assert ended == [(captured, "delete")]
+
+
+@pytest.mark.parametrize("outbox_state", ["failed", "recovery-owned"])
+def test_project_delete_retains_managed_root_until_session_end_consumption(
+    tmp_path, monkeypatch, outbox_state
+):
+    from core.inference import tools
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path / "studio-home"))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "studio-home" / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    snapshot = json.dumps(
+        {
+            "token": {
+                "project_id": "project-1",
+                "session_id": "thread-1",
+                "generation": "generation-1",
+            }
+        }
+    )
+    connection = studio_db.get_connection()
+    try:
+        studio_db.enqueue_project_hook_session_end_outbox(
+            connection,
+            [("generation-1:SessionEnd", snapshot, "project")],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    if outbox_state == "failed":
+        assert studio_db.mark_project_hook_session_end_outbox_failed(
+            "generation-1:SessionEnd",
+            "finalizer failed",
+        )
+    else:
+        assert studio_db.claim_project_hook_session_end_outbox(
+            "generation-1:SessionEnd",
+            "recovery-worker",
+        )
+
+    managed_root = tmp_path / "Projects" / "project-project-1"
+    managed_root.mkdir(parents = True)
+    project = {
+        "id": "project-1",
+        "name": "Project",
+        "createdAt": 1,
+        "updatedAt": 1,
+        "workspaceKind": "managed",
+        "managedRootPath": str(managed_root),
+        "rootPath": str(managed_root),
+        "memberIds": ["thread-1"],
+        "activeResearchRunIds": [],
+        "activeChatGenerationRunIds": [],
+        "hookSessions": [],
+    }
+    deleted = []
+    orphaned = []
+    deferred = []
+    monkeypatch.setattr(
+        chat_history,
+        "delete_chat_project",
+        lambda _project_id, delete_files = False, **_kwargs: project,
+    )
+    monkeypatch.setattr(chat_history, "get_chat_project", lambda _project_id: None)
+    monkeypatch.setattr(chat_history, "_delete_project_rag_sources", lambda _id: None)
+    monkeypatch.setattr(chat_history, "_cancel_research_runs", lambda *_args: None)
+    monkeypatch.setattr(chat_history, "_cancel_chat_generation_runs", lambda *_args: None)
+    monkeypatch.setattr(chat_history, "_cancel_active_generations", lambda *_args: None)
+    monkeypatch.setattr(
+        chat_history, "_remove_conversation_archives", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(chat_history, "_end_project_hook_sessions", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(tools, "wait_for_sessions_idle", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(tools, "live_project_owns", lambda *_args: False)
+    monkeypatch.setattr(
+        tools,
+        "record_orphaned_project",
+        lambda *args: orphaned.append(args),
+    )
+    monkeypatch.setattr(
+        tools,
+        "finish_workspace_delete_when_idle",
+        lambda project_id: deferred.append(project_id),
+    )
+    monkeypatch.setattr(
+        studio_db,
+        "delete_project_workspace",
+        lambda value: deleted.append(value),
+    )
+    monkeypatch.setattr(
+        studio_db,
+        "sandbox_is_referenced_elsewhere",
+        lambda *_args: False,
+    )
+
+    async def remove_sandboxes(_thread_ids, _delete_files):
+        return 0, []
+
+    monkeypatch.setattr(chat_history, "_remove_sandboxes", remove_sandboxes)
+    request = SimpleNamespace(app = SimpleNamespace(state = SimpleNamespace()))
+
+    asyncio.run(
+        chat_history.delete_project(
+            "project-1",
+            request,
+            delete_files = True,
+            current_subject = "test-user",
+        )
+    )
+
+    assert deleted == []
+    assert orphaned == [("project-1", str(managed_root / "sandbox"), True, str(managed_root))]
+    assert deferred == ["project-1"]
 
 
 # ---------------------------------------------------------------------------
@@ -517,9 +686,9 @@ def test_chat_inference_settings_covers_frontend_persisted_fields():
     persisted = set(re.findall(r"^\s*(\w+)\??:", block.group(1), re.M)) - {"checkpoint"}
 
     backend = set(chat_history.ChatInferenceSettings.model_fields)
-    assert (
-        persisted == backend
-    ), f"schema drift: frontend-only {persisted - backend}, backend-only {backend - persisted}"
+    assert persisted == backend, (
+        f"schema drift: frontend-only {persisted - backend}, backend-only {backend - persisted}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +926,1229 @@ def _clear_thread_row(thread_id: str) -> dict:
     }
 
 
+def _install_active_hook_turn(project_id: str, thread_id: str):
+    from core.agent_workspace import hook_runtime
+
+    token = hook_runtime.HookSessionToken(project_id, thread_id, "live-generation")
+    turn_cancel = threading.Event()
+    with hook_runtime._BACKGROUND_LOCK:
+        hook_runtime._ACTIVE_SESSIONS[(project_id, thread_id)] = token
+        hook_runtime._SESSION_TURNS[token] = {1: turn_cancel}
+    return token, turn_cancel
+
+
+def _remove_active_hook_turn(token) -> None:
+    from core.agent_workspace import hook_runtime
+    with hook_runtime._BACKGROUND_LOCK:
+        hook_runtime._SESSION_TURNS.pop(token, None)
+        hook_runtime._ENDING_SESSIONS.discard(token)
+        if hook_runtime._ACTIVE_SESSIONS.get((token.project_id, token.session_id)) == token:
+            hook_runtime._ACTIVE_SESSIONS.pop((token.project_id, token.session_id), None)
+
+
+def _destructive_test_ledger(token, turn_cancel, calls):
+    @contextmanager
+    def ledger(_connection, _thread_ids, *, reason):
+        calls.append(reason)
+        with hook_runtime._BACKGROUND_LOCK:
+            hook_runtime._ENDING_SESSIONS.add(token)
+        turn_cancel.set()
+        yield []
+
+    from core.agent_workspace import hook_runtime
+    return ledger
+
+
+def _capturing_test_ledger(token, workspace):
+    from core.agent_workspace import hook_runtime
+
+    @contextmanager
+    def ledger(
+        _connection,
+        thread_ids,
+        *,
+        reason = "clear",
+    ):
+        records = [
+            {
+                "project_id": token.project_id,
+                "session_id": thread_id,
+                "model": "model",
+            }
+            for thread_id in sorted(thread_ids)
+        ]
+        with hook_runtime.capture_project_hook_session_ledgers(
+            records,
+            session_ids = tuple(sorted(thread_ids)),
+            reason = reason,
+            workspace_snapshots = {token.project_id: workspace},
+        ) as captured:
+            yield captured
+
+    return ledger
+
+
+class _FailingDatabaseConnection:
+    def __init__(
+        self,
+        connection,
+        *,
+        fail_commit = False,
+        fail_sql = None,
+    ):
+        self._connection = connection
+        self._fail_commit = fail_commit
+        self._fail_sql = fail_sql
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+    def execute(self, sql, *args, **kwargs):
+        if self._fail_sql and self._fail_sql in sql:
+            raise sqlite3.OperationalError("injected SQL failure")
+        return self._connection.execute(sql, *args, **kwargs)
+
+    def commit(self):
+        if self._fail_commit:
+            raise sqlite3.OperationalError("injected commit failure")
+        return self._connection.commit()
+
+
+def _insert_folder_project(studio_db, tmp_path) -> SimpleNamespace:
+    managed = tmp_path / "managed"
+    folder = tmp_path / "folder"
+    managed.mkdir()
+    folder.mkdir()
+    metadata = folder.stat()
+    connection = studio_db.get_connection()
+    try:
+        connection.execute(
+            """
+            INSERT INTO chat_projects (
+                id, name, instructions, root_path, workspace_kind,
+                folder_path, folder_device_id, folder_file_id,
+                workspace_revision, archived, created_at, updated_at
+            ) VALUES (?, ?, '', ?, 'folder', ?, ?, ?, 0, 0, 1, 1)
+            """,
+            (
+                "project",
+                "Project",
+                str(managed),
+                str(folder),
+                str(metadata.st_dev),
+                str(metadata.st_ino),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    studio_db.upsert_chat_thread({**_clear_thread_row("thread"), "projectId": "project"})
+    return SimpleNamespace(
+        project_id = "project",
+        root = folder,
+        kind = "folder",
+        device_id = metadata.st_dev,
+        file_id = metadata.st_ino,
+        revision = 0,
+    )
+
+
+def test_rejected_thread_patch_does_not_capture_or_cancel_active_generation(tmp_path, monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    studio_db.upsert_chat_thread(_clear_thread_row("thread"))
+    token, turn_cancel = _install_active_hook_turn("project", "thread")
+    calls = []
+    try:
+        with pytest.raises(studio_db.ChatThreadPreconditionFailed):
+            studio_db.update_chat_thread(
+                "thread",
+                {"archived": True},
+                expected_title = "stale-title",
+                hook_session_ledger = _destructive_test_ledger(token, turn_cancel, calls),
+            )
+        assert calls == []
+        assert not turn_cancel.is_set()
+        assert token not in hook_runtime._ENDING_SESSIONS
+        assert hook_runtime._ACTIVE_SESSIONS[("project", "thread")] == token
+    finally:
+        _remove_active_hook_turn(token)
+
+
+def test_missing_thread_patch_does_not_capture_or_cancel_active_generation(tmp_path, monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    studio_db.get_connection().close()
+    token, turn_cancel = _install_active_hook_turn("project", "missing-thread")
+    calls = []
+    try:
+        assert (
+            studio_db.update_chat_thread(
+                "missing-thread",
+                {"archived": True},
+                hook_session_ledger = _destructive_test_ledger(token, turn_cancel, calls),
+            )
+            is None
+        )
+        assert calls == []
+        assert not turn_cancel.is_set()
+        assert token not in hook_runtime._ENDING_SESSIONS
+        assert hook_runtime._ACTIVE_SESSIONS[("project", "missing-thread")] == token
+    finally:
+        _remove_active_hook_turn(token)
+
+
+def test_missing_settings_write_does_not_capture_or_cancel_active_generation(tmp_path, monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    studio_db.upsert_chat_thread(_clear_thread_row("thread"))
+    monkeypatch.setattr(
+        studio_db, "_write_chat_thread_settings_in_conn", lambda *_args, **_kwargs: None
+    )
+    token, turn_cancel = _install_active_hook_turn("project", "thread")
+    calls = []
+    try:
+        assert (
+            studio_db.update_chat_thread(
+                "thread",
+                {"archived": True},
+                settings_write = {"replace": {"toolsEnabled": True}},
+                hook_session_ledger = _destructive_test_ledger(token, turn_cancel, calls),
+            )
+            is None
+        )
+        assert calls == []
+        assert not turn_cancel.is_set()
+        assert token not in hook_runtime._ENDING_SESSIONS
+        assert hook_runtime._ACTIVE_SESSIONS[("project", "thread")] == token
+    finally:
+        _remove_active_hook_turn(token)
+
+
+def test_thread_archive_commit_failure_rolls_back_without_cancelling_live_turn(
+    tmp_path, monkeypatch
+):
+    from core.agent_workspace import hook_runtime
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    workspace = _insert_folder_project(studio_db, tmp_path)
+    token, turn_cancel = _install_active_hook_turn("project", "thread")
+    monkeypatch.setattr(hook_runtime, "_trusted_invocations", lambda *_args, **_kwargs: ((), ()))
+    real_get_connection = studio_db.get_connection
+    monkeypatch.setattr(
+        studio_db,
+        "get_connection",
+        lambda *args, **kwargs: _FailingDatabaseConnection(
+            real_get_connection(*args, **kwargs), fail_commit = True
+        ),
+    )
+    try:
+        with pytest.raises(sqlite3.OperationalError, match = "commit failure"):
+            studio_db.update_chat_thread(
+                "thread",
+                {"archived": True},
+                hook_session_ledger = _capturing_test_ledger(token, workspace),
+            )
+        assert not turn_cancel.is_set()
+        assert token not in hook_runtime._ENDING_SESSIONS
+        assert hook_runtime._ACTIVE_SESSIONS[("project", "thread")] == token
+        connection = real_get_connection()
+        try:
+            row = connection.execute(
+                "SELECT archived FROM chat_threads WHERE id = 'thread'"
+            ).fetchone()
+        finally:
+            connection.close()
+        assert row["archived"] == 0
+    finally:
+        _remove_active_hook_turn(token)
+
+
+def test_folder_project_delete_sql_failure_rolls_back_without_cancelling_live_turn(
+    tmp_path, monkeypatch
+):
+    from core.agent_workspace import hook_runtime
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    workspace = _insert_folder_project(studio_db, tmp_path)
+    token, turn_cancel = _install_active_hook_turn("project", "thread")
+    monkeypatch.setattr(hook_runtime, "_trusted_invocations", lambda *_args, **_kwargs: ((), ()))
+    real_get_connection = studio_db.get_connection
+    monkeypatch.setattr(
+        studio_db,
+        "get_connection",
+        lambda *args, **kwargs: _FailingDatabaseConnection(
+            real_get_connection(*args, **kwargs),
+            fail_sql = "DELETE FROM chat_projects",
+        ),
+    )
+    try:
+        with pytest.raises(sqlite3.OperationalError, match = "SQL failure"):
+            studio_db.delete_chat_project(
+                "project",
+                hook_session_ledger = _capturing_test_ledger(token, workspace),
+            )
+        assert not turn_cancel.is_set()
+        assert token not in hook_runtime._ENDING_SESSIONS
+        assert hook_runtime._ACTIVE_SESSIONS[("project", "thread")] == token
+        connection = real_get_connection()
+        try:
+            project = connection.execute(
+                "SELECT id FROM chat_projects WHERE id = 'project'"
+            ).fetchone()
+            thread = connection.execute(
+                "SELECT id FROM chat_threads WHERE id = 'thread'"
+            ).fetchone()
+        finally:
+            connection.close()
+        assert project is not None
+        assert thread is not None
+    finally:
+        _remove_active_hook_turn(token)
+
+
+def test_cross_project_destructive_transaction_and_generation_admission_do_not_invert(
+    tmp_path, monkeypatch
+):
+    from core.agent_workspace import hook_runtime
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    for project_id in ("project-a", "project-b"):
+        studio_db.upsert_chat_project(
+            {
+                "id": project_id,
+                "name": project_id,
+                "createdAt": 1,
+                "updatedAt": 1,
+            }
+        )
+    studio_db.upsert_chat_thread({**_clear_thread_row("thread-a"), "projectId": "project-a"})
+    studio_db.upsert_chat_thread({**_clear_thread_row("thread-b"), "projectId": "project-b"})
+    token_a = hook_runtime._admit_project_hook_session(
+        "project-a",
+        "thread-a",
+        None,
+        create = True,
+        deadline = time.monotonic() + 2,
+    )
+    assert token_a is not None
+    monkeypatch.setattr(hook_runtime, "_trusted_invocations", lambda *_args, **_kwargs: ((), ()))
+
+    real_ledger = chat_history._project_hook_session_ledger
+    ledger_entered = threading.Event()
+    release_transaction = threading.Event()
+    transaction_committed = []
+
+    @contextmanager
+    def coordinated_ledger(connection, thread_ids, **kwargs):
+        assert connection.in_transaction
+        with real_ledger(connection, thread_ids, **kwargs) as records:
+            ledger_entered.set()
+            assert release_transaction.wait(2)
+            yield records
+            transaction_committed.append(not connection.in_transaction)
+
+    monkeypatch.setattr(chat_history, "_project_hook_session_ledger", coordinated_ledger)
+    real_end = hook_runtime.end_project_hook_session
+    finalized = []
+
+    def observe_finalizer(*args, **kwargs):
+        assert transaction_committed == [True]
+        is_owned = getattr(hook_runtime._ADMISSION_FENCE, "_is_owned", None)
+        assert is_owned is not None and not is_owned()
+        connection = studio_db.get_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.rollback()
+        finally:
+            connection.close()
+        finalized.append(kwargs["session_token"])
+        return real_end(*args, **kwargs)
+
+    monkeypatch.setattr(hook_runtime, "end_project_hook_session", observe_finalizer)
+    move_result = []
+    admitted_b = []
+    failures = []
+    admission_started = threading.Event()
+    admission_done = threading.Event()
+
+    def move_project_a_thread():
+        try:
+            move_result.append(
+                chat_history.save_thread(
+                    chat_history.ChatThread(
+                        **{
+                            **_clear_thread_row("thread-a"),
+                            "projectId": "project-b",
+                        }
+                    ),
+                    current_subject = "test-user",
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - surface worker failures in the test
+            failures.append(exc)
+
+    def admit_project_b_generation():
+        admission_started.set()
+        try:
+            admitted_b.append(
+                hook_runtime._admit_project_hook_session(
+                    "project-b",
+                    "thread-b",
+                    None,
+                    create = True,
+                    deadline = time.monotonic() + 2,
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - surface worker failures in the test
+            failures.append(exc)
+        finally:
+            admission_done.set()
+
+    destructive = threading.Thread(target = move_project_a_thread)
+    admission = threading.Thread(target = admit_project_b_generation)
+    try:
+        destructive.start()
+        assert ledger_entered.wait(1)
+        admission.start()
+        assert admission_started.wait(1)
+        assert not admission_done.wait(0.1)
+        release_transaction.set()
+        destructive.join(3)
+        admission.join(3)
+        assert not destructive.is_alive()
+        assert not admission.is_alive()
+        assert failures == []
+        assert move_result[0].projectId == "project-b"
+        assert finalized == [token_a]
+        assert transaction_committed == [True]
+        assert admitted_b[0] is not None
+        assert admitted_b[0].project_id == "project-b"
+        assert admitted_b[0].session_id == "thread-b"
+        assert hook_runtime.snapshot_project_hook_session("project-a", "thread-a") is None
+        assert hook_runtime.snapshot_project_hook_session("project-b", "thread-b") == admitted_b[0]
+        assert hook_runtime.snapshot_project_hook_session("project-b", "thread-a") is None
+        assert studio_db.get_chat_thread("thread-a")["projectId"] == "project-b"
+        connection = studio_db.get_connection()
+        try:
+            outbox = connection.execute(
+                "SELECT consumed_at FROM project_hook_session_end_outbox WHERE id = ?",
+                (f"{token_a.generation}:SessionEnd",),
+            ).fetchone()
+        finally:
+            connection.close()
+        assert outbox is not None and outbox["consumed_at"] is not None
+    finally:
+        release_transaction.set()
+        destructive.join(3)
+        if admission.ident is not None:
+            admission.join(3)
+        _remove_active_hook_turn(token_a)
+        for token in admitted_b:
+            if token is not None:
+                _remove_active_hook_turn(token)
+
+
+def test_clear_hook_ledger_includes_pending_ids_and_replay_emits_no_new_end(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    studio_db.upsert_chat_thread(_clear_thread_row("stored-thread"))
+    captured = []
+
+    @contextmanager
+    def ledger(_connection, thread_ids):
+        captured.append(set(thread_ids))
+        yield [{"project_id": "project", "session_id": "synthetic"}]
+
+    first = studio_db.clear_chat_history_with_replay_status(
+        ["pending-thread"],
+        operation_id = "clear-hook-ledger",
+        hook_session_ledger = ledger,
+    )
+    replay = studio_db.clear_chat_history_with_replay_status(
+        ["reused-thread"],
+        operation_id = "clear-hook-ledger",
+        hook_session_ledger = ledger,
+    )
+
+    assert captured == [{"stored-thread", "pending-thread"}]
+    assert first[2] is False
+    assert first[3] == [{"project_id": "project", "session_id": "synthetic"}]
+    assert replay[0] == ["stored-thread"]
+    assert replay[2] is True
+    assert replay[3] == []
+
+
+def test_session_end_outbox_claim_is_exclusive_against_immediate_delivery(tmp_path, monkeypatch):
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    connection = studio_db.get_connection()
+    try:
+        snapshot = json.dumps(
+            {
+                "token": {
+                    "project_id": "project",
+                    "session_id": "thread",
+                    "generation": "generation",
+                }
+            }
+        )
+        studio_db.enqueue_project_hook_session_end_outbox(
+            connection,
+            [("generation:SessionEnd", snapshot)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    barrier = threading.Barrier(3)
+    claims = []
+
+    def claim(owner):
+        barrier.wait()
+        claims.append(
+            (
+                owner,
+                studio_db.claim_project_hook_session_end_outbox(
+                    "generation:SessionEnd",
+                    owner,
+                ),
+            )
+        )
+
+    workers = [
+        threading.Thread(target = claim, args = ("recovery",)),
+        threading.Thread(target = claim, args = ("immediate",)),
+    ]
+    for worker in workers:
+        worker.start()
+    barrier.wait()
+    for worker in workers:
+        worker.join(2)
+
+    assert len(claims) == 2
+    [winner] = [owner for owner, claimed in claims if claimed]
+    assert sorted(claimed for _owner, claimed in claims) == [False, True]
+    assert studio_db.pending_project_hook_session_end_outbox() == []
+    assert studio_db.mark_project_hook_session_end_outbox_consumed(
+        "generation:SessionEnd",
+        claim_owner = winner,
+    )
+
+
+def test_immediate_session_end_defers_to_existing_outbox_claim(monkeypatch):
+    from core.agent_workspace import hook_runtime
+
+    executed = []
+    monkeypatch.setattr(
+        chat_history,
+        "claim_project_hook_session_end_outbox",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        hook_runtime,
+        "end_project_hook_session",
+        lambda *_args, **_kwargs: executed.append(True),
+    )
+
+    chat_history._end_project_hook_sessions(
+        [
+            {
+                "project_id": "project",
+                "session_id": "thread",
+                "model": "model",
+                "session_end_outbox_id": "generation:SessionEnd",
+            }
+        ]
+    )
+
+    assert executed == []
+
+
+def test_session_end_claim_heartbeat_prevents_live_owner_reclaim(tmp_path, monkeypatch):
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    snapshot = json.dumps(
+        {
+            "token": {
+                "project_id": "project",
+                "session_id": "thread",
+                "generation": "generation",
+            }
+        }
+    )
+    connection = studio_db.get_connection()
+    try:
+        studio_db.enqueue_project_hook_session_end_outbox(
+            connection,
+            [("generation:SessionEnd", snapshot)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert studio_db.claim_project_hook_session_end_outbox(
+        "generation:SessionEnd", "owner-a", lease_ms = 1_000
+    )
+    with studio_db.project_hook_session_end_claim_heartbeat(
+        "generation:SessionEnd", "owner-a", lease_ms = 1_000
+    ):
+        time.sleep(1.2)
+        assert not studio_db.claim_project_hook_session_end_outbox(
+            "generation:SessionEnd", "owner-b", lease_ms = 1_000
+        )
+
+    time.sleep(1.1)
+    assert studio_db.claim_project_hook_session_end_outbox(
+        "generation:SessionEnd", "owner-b", lease_ms = 1_000
+    )
+
+
+def test_session_end_claim_heartbeat_reports_forced_ownership_loss(monkeypatch):
+    from storage import studio_db
+    monkeypatch.setattr(
+        studio_db,
+        "renew_project_hook_session_end_outbox_claim",
+        lambda *_args, **_kwargs: False,
+    )
+
+    with studio_db.project_hook_session_end_claim_heartbeat(
+        "generation:SessionEnd", "owner", lease_ms = 50
+    ) as ownership_lost:
+        assert ownership_lost.wait(0.5)
+
+
+def test_recovery_claims_only_current_delivery_while_first_finalizer_is_slow(tmp_path, monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    connection = studio_db.get_connection()
+    try:
+        records = []
+        for generation in ("generation-a", "generation-b"):
+            records.append(
+                (
+                    f"{generation}:SessionEnd",
+                    json.dumps(
+                        {
+                            "token": {
+                                "project_id": "project",
+                                "session_id": f"thread-{generation}",
+                                "generation": generation,
+                            }
+                        }
+                    ),
+                )
+            )
+        studio_db.enqueue_project_hook_session_end_outbox(connection, records)
+        connection.commit()
+    finally:
+        connection.close()
+
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def deserialize(raw):
+        token_data = json.loads(raw)["token"]
+        return SimpleNamespace(token = hook_runtime.HookSessionToken(**token_data))
+
+    def end(_project_id, *, session_token, **_kwargs):
+        if session_token.generation == "generation-a":
+            first_started.set()
+            assert release_first.wait(2)
+        return hook_runtime.HookEventResult(event = "SessionEnd")
+
+    monkeypatch.setattr(hook_runtime, "_deserialize_project_hook_session_end_snapshot", deserialize)
+    monkeypatch.setattr(hook_runtime, "end_project_hook_session", end)
+    recovered = []
+    worker = threading.Thread(
+        target = lambda: recovered.extend(
+            hook_runtime.recover_pending_project_hook_session_ends(limit = 2)
+        )
+    )
+    worker.start()
+    assert first_started.wait(2)
+
+    # The recovery worker owns only generation-a. A competing worker may claim
+    # generation-b immediately instead of reclaiming an expired batch lease.
+    assert studio_db.claim_project_hook_session_end_outbox(
+        "generation-b:SessionEnd", "competing-recovery"
+    )
+    release_first.set()
+    worker.join(3)
+
+    assert not worker.is_alive()
+    assert len(recovered) == 1
+
+
+def test_recovery_heartbeats_claim_during_snapshot_preparation(tmp_path, monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    snapshot = json.dumps(
+        {
+            "token": {
+                "project_id": "project",
+                "session_id": "thread",
+                "generation": "generation",
+            }
+        }
+    )
+    connection = studio_db.get_connection()
+    try:
+        studio_db.enqueue_project_hook_session_end_outbox(
+            connection, [("generation:SessionEnd", snapshot)]
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    original_heartbeat = studio_db.project_hook_session_end_claim_heartbeat
+    monkeypatch.setattr(
+        studio_db,
+        "project_hook_session_end_claim_heartbeat",
+        lambda record_id, owner: original_heartbeat(record_id, owner, lease_ms = 1_000),
+    )
+    preparation_started = threading.Event()
+    release_preparation = threading.Event()
+    token = hook_runtime.HookSessionToken("project", "thread", "generation")
+
+    def deserialize(_raw):
+        preparation_started.set()
+        assert release_preparation.wait(3)
+        return SimpleNamespace(token = token)
+
+    monkeypatch.setattr(hook_runtime, "_deserialize_project_hook_session_end_snapshot", deserialize)
+    monkeypatch.setattr(
+        hook_runtime,
+        "end_project_hook_session",
+        lambda *_args, **_kwargs: hook_runtime.HookEventResult(event = "SessionEnd"),
+    )
+    worker = threading.Thread(
+        target = hook_runtime.recover_pending_project_hook_session_ends,
+        kwargs = {"limit": 1},
+    )
+    worker.start()
+    assert preparation_started.wait(2)
+    time.sleep(1.2)
+    assert not studio_db.claim_project_hook_session_end_outbox(
+        "generation:SessionEnd", "competing-recovery", lease_ms = 1_000
+    )
+    release_preparation.set()
+    worker.join(3)
+
+    assert not worker.is_alive()
+
+
+def test_recovery_ownership_loss_cancels_old_owner_before_side_effect(tmp_path, monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    connection = studio_db.get_connection()
+    try:
+        studio_db.enqueue_project_hook_session_end_outbox(
+            connection,
+            [
+                (
+                    "generation:SessionEnd",
+                    json.dumps(
+                        {
+                            "token": {
+                                "project_id": "project",
+                                "session_id": "thread",
+                                "generation": "generation",
+                            }
+                        }
+                    ),
+                )
+            ],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    token = hook_runtime.HookSessionToken("project", "thread", "generation")
+    monkeypatch.setattr(
+        hook_runtime,
+        "_deserialize_project_hook_session_end_snapshot",
+        lambda _raw: SimpleNamespace(token = token),
+    )
+    original_heartbeat = studio_db.project_hook_session_end_claim_heartbeat
+    monkeypatch.setattr(
+        studio_db,
+        "project_hook_session_end_claim_heartbeat",
+        lambda record_id, owner: original_heartbeat(record_id, owner, lease_ms = 1_000),
+    )
+    real_renew = studio_db.renew_project_hook_session_end_outbox_claim
+    renewal_started = threading.Event()
+    release_renewal = threading.Event()
+
+    def blocked_renew(*args, **kwargs):
+        renewal_started.set()
+        assert release_renewal.wait(2)
+        return real_renew(*args, **kwargs)
+
+    monkeypatch.setattr(studio_db, "renew_project_hook_session_end_outbox_claim", blocked_renew)
+    side_effects = []
+
+    def end(_project_id, *, delivery_cancel_event, **_kwargs):
+        assert delivery_cancel_event.wait(2)
+        if not delivery_cancel_event.is_set():
+            side_effects.append("started")
+        return hook_runtime.HookEventResult(
+            event = "SessionEnd",
+            errors = ("Project SessionEnd delivery ownership was lost.",),
+        )
+
+    monkeypatch.setattr(hook_runtime, "end_project_hook_session", end)
+    recovered = []
+    worker = threading.Thread(
+        target = lambda: recovered.extend(
+            hook_runtime.recover_pending_project_hook_session_ends(limit = 1)
+        )
+    )
+    worker.start()
+    assert renewal_started.wait(2)
+
+    connection = studio_db.get_connection()
+    try:
+        connection.execute(
+            "UPDATE project_hook_session_end_outbox SET claim_expires_at = 0 WHERE id = ?",
+            ("generation:SessionEnd",),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    assert studio_db.claim_project_hook_session_end_outbox(
+        "generation:SessionEnd", "replacement-owner"
+    )
+    release_renewal.set()
+    worker.join(3)
+
+    assert not worker.is_alive()
+    assert side_effects == []
+    assert recovered and recovered[0].errors
+    connection = studio_db.get_connection()
+    try:
+        row = connection.execute(
+            "SELECT claim_owner, consumed_at FROM project_hook_session_end_outbox WHERE id = ?",
+            ("generation:SessionEnd",),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row["claim_owner"] == "replacement-owner"
+    assert row["consumed_at"] is None
+
+
+def test_pending_session_end_fences_cross_project_crash_handoff(tmp_path, monkeypatch):
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    snapshot = json.dumps(
+        {
+            "token": {
+                "project_id": "project-a",
+                "session_id": "thread",
+                "generation": "generation-a",
+            }
+        }
+    )
+    connection = studio_db.get_connection()
+    try:
+        studio_db.enqueue_project_hook_session_end_outbox(
+            connection,
+            [("generation-a:SessionEnd", snapshot)],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert studio_db.project_hook_session_end_pending_for("project-b", "thread")
+
+
+def test_project_wide_session_end_fence_blocks_different_member_session(tmp_path, monkeypatch):
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    snapshot = json.dumps(
+        {
+            "token": {
+                "project_id": "project-a",
+                "session_id": "old-thread",
+                "generation": "generation-a",
+            }
+        }
+    )
+    connection = studio_db.get_connection()
+    try:
+        studio_db.enqueue_project_hook_session_end_outbox(
+            connection,
+            [("generation-a:SessionEnd", snapshot)],
+        )
+        connection.commit()
+        studio_db.enqueue_project_hook_session_end_outbox(
+            connection,
+            [("generation-a:SessionEnd", snapshot, "project")],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    assert studio_db.project_hook_session_end_pending_for("project-a", "new-thread")
+    assert not studio_db.project_hook_session_end_pending_for("project-b", "new-thread")
+
+
+def test_clear_all_persists_global_session_end_fence_across_restart(tmp_path, monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    monkeypatch.setattr(
+        chat_history,
+        "_project_hook_session_records",
+        lambda *_args, **_kwargs: [
+            {"project_id": "project-a", "session_id": "old-thread", "model": "model"}
+        ],
+    )
+    snapshot = SimpleNamespace(invocations = (object(),))
+
+    @contextmanager
+    def capture(records, **kwargs):
+        assert kwargs["include_all"] is True
+        assert kwargs["reason"] == "clear"
+        yield [{**records[0], "session_end_snapshot": snapshot}]
+
+    snapshot_json = json.dumps(
+        {
+            "token": {
+                "project_id": "project-a",
+                "session_id": "old-thread",
+                "generation": "generation-clear-all",
+            }
+        }
+    )
+    monkeypatch.setattr(hook_runtime, "capture_project_hook_session_ledgers", capture)
+    monkeypatch.setattr(
+        hook_runtime,
+        "serialize_project_hook_session_end_snapshot",
+        lambda _snapshot: ("generation-clear-all:SessionEnd", snapshot_json),
+    )
+    connection = studio_db.get_connection()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        with chat_history._project_hook_session_ledger(
+            connection,
+            {"old-thread"},
+            include_all = True,
+        ):
+            connection.commit()
+    finally:
+        connection.close()
+
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    connection = studio_db.get_connection()
+    try:
+        scope = connection.execute(
+            "SELECT fence_scope FROM project_hook_session_end_outbox"
+        ).fetchone()["fence_scope"]
+    finally:
+        connection.close()
+
+    assert scope == "global"
+    assert studio_db.project_hook_session_end_pending_for("project-b", "new-thread")
+
+
+def test_session_end_ledger_persists_empty_sealed_snapshot_as_quiescence_fence(
+    tmp_path, monkeypatch
+):
+    from core.agent_workspace import hook_runtime
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    monkeypatch.setattr(
+        chat_history,
+        "_project_hook_session_records",
+        lambda *_args, **_kwargs: [
+            {"project_id": "project", "session_id": "thread", "model": "model"}
+        ],
+    )
+    snapshot = SimpleNamespace(invocations = ())
+
+    @contextmanager
+    def capture(records, **_kwargs):
+        yield [{**records[0], "session_end_snapshot": snapshot}]
+
+    monkeypatch.setattr(hook_runtime, "capture_project_hook_session_ledgers", capture)
+    monkeypatch.setattr(
+        hook_runtime,
+        "serialize_project_hook_session_end_snapshot",
+        lambda _snapshot: (
+            "generation-empty:SessionEnd",
+            json.dumps(
+                {
+                    "token": {
+                        "project_id": "project",
+                        "session_id": "thread",
+                        "generation": "generation-empty",
+                    }
+                }
+            ),
+        ),
+    )
+    connection = studio_db.get_connection()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        with chat_history._project_hook_session_ledger(connection, {"thread"}):
+            connection.commit()
+        row = connection.execute(
+            "SELECT id, consumed_at FROM project_hook_session_end_outbox"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert tuple(row) == ("generation-empty:SessionEnd", None)
+
+
+@pytest.mark.parametrize("reason", ["archive", "other", "delete"])
+def test_project_lifecycle_ledgers_persist_project_wide_fence_scope(tmp_path, monkeypatch, reason):
+    from core.agent_workspace import hook_runtime
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    monkeypatch.setattr(
+        chat_history,
+        "_project_hook_session_records",
+        lambda *_args, **_kwargs: [
+            {"project_id": "project", "session_id": "old-thread", "model": "model"}
+        ],
+    )
+    snapshot = SimpleNamespace(invocations = (object(),))
+
+    @contextmanager
+    def capture(records, **kwargs):
+        assert kwargs["project_ids"] == ("project",)
+        assert kwargs["reason"] == reason
+        yield [{**records[0], "session_end_snapshot": snapshot}]
+
+    snapshot_json = json.dumps(
+        {
+            "token": {
+                "project_id": "project",
+                "session_id": "old-thread",
+                "generation": f"generation-{reason}",
+            }
+        }
+    )
+    monkeypatch.setattr(hook_runtime, "capture_project_hook_session_ledgers", capture)
+    monkeypatch.setattr(
+        hook_runtime,
+        "serialize_project_hook_session_end_snapshot",
+        lambda _snapshot: (f"generation-{reason}:SessionEnd", snapshot_json),
+    )
+    connection = studio_db.get_connection()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        with chat_history._project_hook_session_ledger(
+            connection,
+            {"old-thread"},
+            reason = reason,
+            project_ids = ("project",),
+        ):
+            connection.commit()
+        row = connection.execute(
+            "SELECT fence_scope FROM project_hook_session_end_outbox"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert row["fence_scope"] == "project"
+    assert studio_db.project_hook_session_end_pending_for("project", "new-thread")
+
+
+def test_managed_root_survives_pending_claimed_and_failed_end_then_deletes_on_consumption(
+    tmp_path, linkable_temp_base, monkeypatch
+):
+    from core.inference import tools
+    from storage import studio_db
+
+    safe_root = linkable_temp_base / tmp_path.name
+    safe_root.mkdir(parents = True, exist_ok = True)
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(safe_root / "studio-home"))
+    monkeypatch.setenv(
+        "UNSLOTH_STUDIO_PROJECTS_HOME",
+        str(safe_root / "studio-home" / "Projects"),
+    )
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    project = {"id": "project-root", "name": "Project Root"}
+    managed_root = Path(studio_db._default_project_root(project))
+    sandbox = managed_root / "sandbox"
+    sandbox.mkdir(parents = True)
+    marker = sandbox / "finalizer-visible.txt"
+    marker.write_text("keep", encoding = "utf-8")
+    record_id = "generation-root:SessionEnd"
+    snapshot = json.dumps(
+        {
+            "token": {
+                "project_id": project["id"],
+                "session_id": "thread-root",
+                "generation": "generation-root",
+            }
+        }
+    )
+    connection = studio_db.get_connection()
+    try:
+        studio_db.enqueue_project_hook_session_end_outbox(
+            connection,
+            [(record_id, snapshot, "project")],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    tools.record_orphaned_project(
+        project["id"],
+        str(sandbox),
+        True,
+        str(managed_root),
+    )
+    monkeypatch.setattr(tools, "live_project_owns", lambda *_args: False)
+    monkeypatch.setattr(tools, "wait_for_sessions_idle", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(studio_db, "sandbox_is_referenced_elsewhere", lambda *_args: False)
+
+    tools.collect_orphaned_project_workspaces()
+    assert marker.exists()
+    assert studio_db.claim_project_hook_session_end_outbox(record_id, "first-owner")
+    tools.collect_orphaned_project_workspaces()
+    assert marker.exists()
+    assert studio_db.mark_project_hook_session_end_outbox_failed(
+        record_id,
+        "finalizer failed",
+        claim_owner = "first-owner",
+    )
+    tools.collect_orphaned_project_workspaces()
+    assert marker.exists()
+
+    connection = studio_db.get_connection()
+    try:
+        connection.execute(
+            "UPDATE project_hook_session_end_outbox SET next_attempt_at = 0 WHERE id = ?",
+            (record_id,),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    assert studio_db.claim_project_hook_session_end_outbox(record_id, "recovery-owner")
+    assert studio_db.mark_project_hook_session_end_outbox_consumed(
+        record_id,
+        claim_owner = "recovery-owner",
+    )
+    tools.collect_orphaned_project_workspaces()
+
+    assert not managed_root.exists()
+    assert tools.list_orphaned_projects() == []
+
+
+def test_dead_letter_pressure_never_deletes_unresolved_lifecycle_fences(tmp_path, monkeypatch):
+    from storage import studio_db
+
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    monkeypatch.setenv("UNSLOTH_STUDIO_PROJECTS_HOME", str(tmp_path / "Projects"))
+    monkeypatch.setattr(studio_db, "_schema_ready", False)
+    records = []
+    for index in range(257):
+        generation = f"generation-{index}"
+        records.append(
+            (
+                f"{generation}:SessionEnd",
+                json.dumps(
+                    {
+                        "token": {
+                            "project_id": "project",
+                            "session_id": f"thread-{index}",
+                            "generation": generation,
+                        }
+                    }
+                ),
+            )
+        )
+    connection = studio_db.get_connection()
+    try:
+        studio_db.enqueue_project_hook_session_end_outbox(connection, records)
+        connection.commit()
+    finally:
+        connection.close()
+    for record_id, _snapshot in records:
+        assert studio_db.mark_project_hook_session_end_outbox_failed(
+            record_id,
+            "poison",
+            max_attempts = 1,
+        )
+
+    connection = studio_db.get_connection()
+    try:
+        unresolved = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM project_hook_session_end_outbox
+            WHERE consumed_at IS NULL AND dead_letter_at IS NOT NULL
+            """
+        ).fetchone()[0]
+    finally:
+        connection.close()
+    assert unresolved == 257
+    assert studio_db.project_hook_session_end_pending_for("project", "thread-0")
+
+
 def test_a_clear_does_not_reap_an_image_registered_while_it_was_running(tmp_path, monkeypatch):
     """The reap is global; the delete it accompanies is not.
 
@@ -834,9 +2226,9 @@ def test_a_clear_does_not_reap_an_image_registered_while_it_was_running(tmp_path
         "an image registered while the clear was running belongs to a chat the clear "
         "kept, so reaping it 404s that chat's cards"
     )
-    assert (
-        search_images.lookup_image(old_id) is None
-    ), "the clear still has to reap what it was responsible for"
+    assert search_images.lookup_image(old_id) is None, (
+        "the clear still has to reap what it was responsible for"
+    )
 
 
 def test_replayed_clear_keeps_the_thumbnails_of_a_chat_it_did_not_delete(tmp_path, monkeypatch):
@@ -975,9 +2367,9 @@ def test_clear_history_does_not_read_the_replay_ledger_outside_the_transaction()
     """
     source = inspect.getsource(chat_history.clear_history)
     assert "clear_chat_history_with_replay_status" in source
-    assert (
-        "chat_clear_operation_is_recorded" not in source
-    ), "a pre-transaction ledger read cannot tell a replay from a concurrent clear"
+    assert "chat_clear_operation_is_recorded" not in source, (
+        "a pre-transaction ledger read cannot tell a replay from a concurrent clear"
+    )
 
 
 def test_a_chat_created_in_the_gap_after_the_clear_keeps_its_images(monkeypatch, tmp_path):
@@ -1068,13 +2460,13 @@ def test_the_clear_and_its_image_snapshot_share_one_threadpool_hop():
     """The structural half of the race above, which no test scheduling can hide."""
     source = inspect.getsource(chat_history.clear_history)
     assert source.count("run_in_threadpool(_clear_rows)") == 1
-    assert (
-        "run_in_threadpool(snapshot_and_fence_registrations)" not in source
-    ), "a second hop for the snapshot reopens the gap the first one closed"
+    assert "run_in_threadpool(snapshot_and_fence_registrations)" not in source, (
+        "a second hop for the snapshot reopens the gap the first one closed"
+    )
     body = source.split("def _clear_rows(", 1)[1].split("\n    # The clear reports", 1)[0]
-    assert (
-        "snapshot_and_fence_registrations()" in body
-    ), "the snapshot belongs inside the clear's hop, and it carries the registration fence"
+    assert "snapshot_and_fence_registrations()" in body, (
+        "the snapshot belongs inside the clear's hop, and it carries the registration fence"
+    )
 
 
 def test_a_replay_finishes_a_reap_the_original_clear_died_before_running(monkeypatch, tmp_path):
@@ -1155,9 +2547,9 @@ def test_a_replay_finishes_a_reap_the_original_clear_died_before_running(monkeyp
     clear()
     assert len(reaps) == 2, "the replay has to finish the reap the crash interrupted"
     finished = reaps[1]
-    assert finished == {
-        doomed_image_id
-    }, "bounded to the original clear's own snapshot, so a chat created since keeps its images"
+    assert finished == {doomed_image_id}, (
+        "bounded to the original clear's own snapshot, so a chat created since keeps its images"
+    )
     assert later_image_id not in finished
 
     # And a further retry has nothing left to do.

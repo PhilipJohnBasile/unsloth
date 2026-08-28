@@ -17,6 +17,7 @@ a helper's return value:
 """
 
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
 
@@ -134,6 +135,8 @@ def _run(
         resp = await inf._proxy_to_external_provider(
             payload, request or _request(), current_subject = "t"
         )
+        if not hasattr(resp, "body_iterator"):
+            return json.loads(resp.body)
         return [chunk async for chunk in resp.body_iterator]
 
     return _drive(go())
@@ -363,36 +366,17 @@ def test_an_interactive_session_still_uses_its_saved_connection(monkeypatch):
 # ── the watcher the stream starts is joined, not just cancelled ──────────────
 
 
-def test_the_external_disconnect_watcher_is_awaited_after_cancel():
-    """A bare cancel() leaves the task's exception unretrieved.
+def test_the_external_disconnect_watcher_uses_the_bounded_stop():
+    """A watcher parked in Request.is_disconnected() may survive cancel()."""
+    import inspect
 
-    asyncio logs "Task exception was never retrieved" for it at collection time,
-    which is why both the Codex branch and the local watcher gather the task
-    before returning. The external branch must not be the odd one out.
-    """
-    import ast
-    import pathlib
+    from routes import inference as inf
 
-    source = (pathlib.Path(__file__).resolve().parents[1] / "routes" / "inference.py").read_text(
-        encoding = "utf-8"
-    )
-    tree = ast.parse(source)
-    cancels = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute)
-        and node.attr == "cancel"
-        and isinstance(node.value, ast.Name)
-        and node.value.id == "disconnect_task"
-    ]
-    gathers = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Name) and node.id == "disconnect_task"
-    ]
-    # Every cancel site must be followed by a gather of the same task; counting
-    # the bare references is enough to catch a cancel with no join next to it.
-    assert len(gathers) >= len(cancels) * 3, "each disconnect_task.cancel() needs a gather"
+    source = inspect.getsource(inf._proxy_to_external_provider)
+    assert source.count("await _stop_local_disconnect_cancel_watcher(") == 2
+    assert source.count("disconnect_task,") == 2
+    assert source.count("disconnect_stop_signal,") == 2
+    assert "await asyncio.gather(disconnect_task" not in source
 
 
 def test_transport_cancellation_is_wired_through_the_loop():

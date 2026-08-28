@@ -11,6 +11,7 @@ rides the same orchestrator path, so a single scripted backend covers both.
 
 import asyncio
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -49,10 +50,12 @@ _SEARCH_XML = '<tool_call>{"name": "search", "arguments": {"query": "dogs"}}</to
 
 
 class _Request:
-    state = SimpleNamespace()
     url = SimpleNamespace(path = "/v1/chat/completions")
     method = "POST"
-    scope: dict = {}
+
+    def __init__(self):
+        self.state = SimpleNamespace()
+        self.scope = {}
 
     async def is_disconnected(self):
         return False
@@ -663,6 +666,268 @@ def test_streaming_gen_stream_error_is_not_model_text(monkeypatch):
     )
 
 
+def test_safetensors_worker_failure_aborts_before_project_stop(monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from core.inference.orchestrator import (
+        GenStreamError,
+        GenStreamErrorRaised,
+        InferenceOrchestrator,
+    )
+
+    stop_calls = []
+
+    def run(_project_id, event, payload, **_kwargs):
+        if event == "Stop":
+            stop_calls.append(payload["last_assistant_message"])
+        return hook_runtime.HookEventResult(event = event)
+
+    backend = InferenceOrchestrator.__new__(InferenceOrchestrator)
+
+    def failed_stream(**_kwargs):
+        yield "partial answer"
+        yield GenStreamError("Error: inference worker exited", public = True)
+
+    monkeypatch.setattr(backend, "_generate_inner", failed_stream)
+    monkeypatch.setattr(hook_runtime, "run_project_hook_event", run)
+    turn = hook_runtime.ProjectHookTurn(
+        project_id = "project",
+        session_id = "thread",
+        turn_id = "turn",
+        model = "model",
+        permission_mode = "off",
+        cancel_event = threading.Event(),
+    )
+
+    with hook_runtime.activate_project_hook_turn(turn):
+        with pytest.raises(GenStreamErrorRaised, match = "worker exited") as error:
+            list(
+                backend.generate_chat_response(
+                    messages = [{"role": "user", "content": "hello"}],
+                    cancel_event = turn.cancel_event,
+                    session_id = "project-project",
+                    thread_id = "thread",
+                )
+            )
+
+    assert error.value.public is True
+    assert stop_calls == []
+
+
+def test_safetensors_cancelled_stream_aborts_before_project_stop(monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from core.inference.orchestrator import InferenceOrchestrator
+
+    stop_calls = []
+
+    def run(_project_id, event, payload, **_kwargs):
+        if event == "Stop":
+            stop_calls.append(payload["last_assistant_message"])
+        return hook_runtime.HookEventResult(event = event)
+
+    backend = InferenceOrchestrator.__new__(InferenceOrchestrator)
+
+    def cancelled_stream(**kwargs):
+        yield "partial answer"
+        kwargs["cancel_event"].set()
+
+    monkeypatch.setattr(backend, "_generate_inner", cancelled_stream)
+    monkeypatch.setattr(hook_runtime, "run_project_hook_event", run)
+    turn = hook_runtime.ProjectHookTurn(
+        project_id = "project",
+        session_id = "thread",
+        turn_id = "turn",
+        model = "model",
+        permission_mode = "off",
+        cancel_event = threading.Event(),
+    )
+
+    with hook_runtime.activate_project_hook_turn(turn):
+        chunks = list(
+            backend.generate_chat_response(
+                messages = [{"role": "user", "content": "hello"}],
+                cancel_event = turn.cancel_event,
+                session_id = "project-project",
+                thread_id = "thread",
+            )
+        )
+
+    assert chunks == ["partial answer"]
+    assert stop_calls == []
+
+
+def test_safetensors_stream_requires_positive_worker_completion_before_stop(monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from core.inference.orchestrator import GenStreamErrorRaised, InferenceOrchestrator
+
+    stop_calls = []
+
+    def run(_project_id, event, payload, **_kwargs):
+        if event == "Stop":
+            stop_calls.append(payload["last_assistant_message"])
+        return hook_runtime.HookEventResult(event = event)
+
+    backend = InferenceOrchestrator.__new__(InferenceOrchestrator)
+
+    def vanished_stream(**_kwargs):
+        yield "partial answer"
+
+    monkeypatch.setattr(backend, "_generate_inner", vanished_stream)
+    monkeypatch.setattr(hook_runtime, "run_project_hook_event", run)
+    turn = hook_runtime.ProjectHookTurn(
+        project_id = "project",
+        session_id = "thread",
+        turn_id = "turn",
+        model = "model",
+        permission_mode = "off",
+        cancel_event = threading.Event(),
+    )
+
+    with hook_runtime.activate_project_hook_turn(turn):
+        with pytest.raises(GenStreamErrorRaised, match = "terminal completion"):
+            list(
+                backend.generate_chat_response(
+                    messages = [{"role": "user", "content": "hello"}],
+                    cancel_event = turn.cancel_event,
+                    session_id = "project-project",
+                    thread_id = "thread",
+                )
+            )
+
+    assert stop_calls == []
+
+
+def test_safetensors_adapter_vanished_worker_aborts_before_project_stop(monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from core.inference.orchestrator import GenStreamErrorRaised, InferenceOrchestrator
+
+    stop_calls = []
+
+    def run(_project_id, event, payload, **_kwargs):
+        if event == "Stop":
+            stop_calls.append(payload["last_assistant_message"])
+        return hook_runtime.HookEventResult(event = event)
+
+    backend = InferenceOrchestrator.__new__(InferenceOrchestrator)
+
+    def vanished_stream(**_kwargs):
+        yield "partial answer"
+
+    monkeypatch.setattr(backend, "_generate_dispatched", vanished_stream)
+    monkeypatch.setattr(hook_runtime, "run_project_hook_event", run)
+    turn = hook_runtime.ProjectHookTurn(
+        project_id = "project",
+        session_id = "thread",
+        turn_id = "turn",
+        model = "model",
+        permission_mode = "off",
+        cancel_event = threading.Event(),
+    )
+
+    with hook_runtime.activate_project_hook_turn(turn):
+        with pytest.raises(GenStreamErrorRaised, match = "terminal completion"):
+            list(
+                backend.generate_with_adapter_control(
+                    use_adapter = True,
+                    cancel_event = turn.cancel_event,
+                    session_id = "project-project",
+                    thread_id = "thread",
+                    messages = [{"role": "user", "content": "hello"}],
+                )
+            )
+
+    assert stop_calls == []
+
+
+def test_safetensors_adapter_cancelled_stream_aborts_before_project_stop(monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from core.inference.orchestrator import InferenceOrchestrator
+
+    stop_calls = []
+
+    def run(_project_id, event, payload, **_kwargs):
+        if event == "Stop":
+            stop_calls.append(payload["last_assistant_message"])
+        return hook_runtime.HookEventResult(event = event)
+
+    backend = InferenceOrchestrator.__new__(InferenceOrchestrator)
+
+    def cancelled_stream(**kwargs):
+        yield "partial answer"
+        kwargs["cancel_event"].set()
+
+    monkeypatch.setattr(backend, "_generate_dispatched", cancelled_stream)
+    monkeypatch.setattr(hook_runtime, "run_project_hook_event", run)
+    turn = hook_runtime.ProjectHookTurn(
+        project_id = "project",
+        session_id = "thread",
+        turn_id = "turn",
+        model = "model",
+        permission_mode = "off",
+        cancel_event = threading.Event(),
+    )
+
+    with hook_runtime.activate_project_hook_turn(turn):
+        chunks = list(
+            backend.generate_with_adapter_control(
+                use_adapter = True,
+                cancel_event = turn.cancel_event,
+                session_id = "project-project",
+                thread_id = "thread",
+                messages = [{"role": "user", "content": "hello"}],
+            )
+        )
+
+    assert chunks == ["partial answer"]
+    assert stop_calls == []
+
+
+def test_safetensors_adapter_preserves_completed_stats_for_project_stop(monkeypatch):
+    from core.agent_workspace import hook_runtime
+    from core.inference.orchestrator import InferenceOrchestrator
+
+    stop_calls = []
+
+    def run(_project_id, event, payload, **_kwargs):
+        if event == "Stop":
+            stop_calls.append(payload["last_assistant_message"])
+        return hook_runtime.HookEventResult(event = event)
+
+    backend = InferenceOrchestrator.__new__(InferenceOrchestrator)
+    expected_stats = {"usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3}}
+
+    def completed_stream(**kwargs):
+        kwargs["stats_holder"]["stats"] = expected_stats
+        yield "done"
+
+    monkeypatch.setattr(backend, "_generate_dispatched", completed_stream)
+    monkeypatch.setattr(hook_runtime, "run_project_hook_event", run)
+    turn = hook_runtime.ProjectHookTurn(
+        project_id = "project",
+        session_id = "thread",
+        turn_id = "turn",
+        model = "model",
+        permission_mode = "off",
+        cancel_event = threading.Event(),
+    )
+    stats_holder = {}
+
+    with hook_runtime.activate_project_hook_turn(turn):
+        chunks = list(
+            backend.generate_with_adapter_control(
+                use_adapter = True,
+                cancel_event = turn.cancel_event,
+                stats_holder = stats_holder,
+                session_id = "project-project",
+                thread_id = "thread",
+                messages = [{"role": "user", "content": "hello"}],
+            )
+        )
+
+    assert chunks == ["done"]
+    assert stop_calls == ["done"]
+    assert stats_holder == {"stats": expected_stats}
+
+
 def test_server_tool_streaming_invalid_event_is_error(monkeypatch):
     class _InvalidEventBackend(_ScriptedBackend):
         def __init__(self):
@@ -1146,6 +1411,29 @@ def test_every_tool_loop_turn_is_billed_not_just_the_last():
     assert folded["timings"]["predicted_n"] == 55
     assert folded["timings"]["predicted_ms"] == pytest.approx(550.0)
     assert folded["timings"]["predicted_per_token_ms"] == pytest.approx(10.0)
+
+
+@pytest.mark.parametrize("total_only_first", [False, True])
+def test_mixed_usage_schemas_preserve_unclassified_tokens_and_recompute_rates(total_only_first):
+    total_only = {
+        "usage": {"total_tokens": 10},
+        "timings": {"predicted_ms": 100.0, "predicted_n": 10},
+    }
+    structured = _turn(5, 2)
+    turns = (total_only, structured) if total_only_first else (structured, total_only)
+
+    folded = _fold(*turns)
+
+    assert folded["usage"] == {
+        "prompt_tokens": 5,
+        "completion_tokens": 2,
+        "unclassified_tokens": 10,
+        "total_tokens": 17,
+    }
+    assert folded["timings"]["predicted_n"] == 12
+    assert folded["timings"]["predicted_ms"] == pytest.approx(120.0)
+    assert folded["timings"]["predicted_per_token_ms"] == pytest.approx(10.0)
+    assert folded["timings"]["predicted_per_second"] == pytest.approx(100.0)
 
 
 def test_a_turn_that_ends_before_reporting_does_not_erase_the_loop():

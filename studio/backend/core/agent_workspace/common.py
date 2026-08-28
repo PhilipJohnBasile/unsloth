@@ -86,11 +86,29 @@ def project_workspace(project_id: str) -> ProjectWorkspace:
 
 
 @contextmanager
-def project_workspace_access(project_id: str):
+def project_workspace_access(
+    project_id: str,
+    *,
+    cancel_event = None,
+    deadline = None,
+):
     """Resolve and hold a project workspace against concurrent folder changes."""
     from core.inference.tools import project_workspace_in_flight
-    with project_workspace_in_flight(project_id):
+    with project_workspace_in_flight(
+        project_id,
+        cancel_event = cancel_event,
+        deadline = deadline,
+    ):
         yield project_workspace(project_id)
+
+
+def project_workspace_change_snapshot(project_id: str) -> ProjectWorkspace:
+    """Resolve the old root while a workspace-change fence is already held."""
+    from core.inference.tools import project_workspace_change_is_fenced
+
+    if not project_workspace_change_is_fenced(project_id):
+        raise AgentWorkspaceError("Project workspace change fence is not held.")
+    return project_workspace(project_id)
 
 
 __all__ = [
@@ -98,4 +116,5 @@ __all__ = [
     "ProjectWorkspace",
     "project_workspace",
     "project_workspace_access",
+    "project_workspace_change_snapshot",
 ]

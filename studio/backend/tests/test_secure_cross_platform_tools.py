@@ -31,6 +31,7 @@ from core.agent_workspace.mutation import (
     ProjectFileMutation,
     WindowsMutationRejected,
 )
+from core.agent_workspace.hook_runtime import HookEventResult
 from core.inference import tools
 
 
@@ -226,20 +227,32 @@ def test_full_access_project_commands_keep_the_explicit_escape_hatch(
         )
     else:
         policy = {
-            "decision": None,
+            "decision": "allow",
             "matchedRules": [],
             "policyHash": "a" * 64,
+            "projectId": "secure-tools",
+            "workspaceIdentity": [root.stat().st_dev, root.stat().st_ino],
+            "workspaceRevision": 0,
         }
         monkeypatch.setattr(
             tools,
             "project_terminal_rule_policy",
             lambda *_args, **_kwargs: dict(policy),
         )
+        monkeypatch.setattr(
+            supervisor,
+            "_spawn_authorized_project_host_command",
+            lambda *_args, **_kwargs: reached_popen(),
+        )
         result = tools._bash_exec(
             "echo full",
             session_id = session_id,
             disable_sandbox = True,
-            project_rule_proof = {"policyHash": policy["policyHash"], "approved": False},
+            project_rule_proof = tools.project_terminal_rule_proof(
+                policy,
+                "echo full",
+                approved = True,
+            ),
         )
 
     assert "Execution error: popen reached" in result
@@ -291,6 +304,51 @@ def test_project_tools_dispatch_through_supervisor_with_streaming(tool_name, tmp
     assert observed["project_id"] == "secure-tools"
     assert observed["kwargs"]["cancel_event"] is None
     assert observed["kwargs"]["timeout_seconds"] == 300
+
+
+def test_project_terminal_forbidden_hook_rewrite_never_reaches_supervisor_or_popen(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "repository"
+    root.mkdir()
+    session_id = _bind_project(monkeypatch, root)
+
+    def policy(_session_id, command, **_kwargs):
+        return {
+            "decision": "allow" if command == "echo allowed" else "forbidden",
+            "matchedRules": [],
+            "policyHash": "a" * 64,
+            "projectId": "secure-tools",
+            "workspaceIdentity": [root.stat().st_dev, root.stat().st_ino],
+            "workspaceRevision": 0,
+            "error": "rewritten command is forbidden" if command != "echo allowed" else None,
+        }
+
+    monkeypatch.setattr(tools, "project_terminal_rule_policy", policy)
+    monkeypatch.setattr(
+        supervisor,
+        "run_project_process",
+        lambda *_args, **_kwargs: pytest.fail("forbidden rewrite reached supervisor"),
+    )
+    monkeypatch.setattr(
+        tools.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("forbidden rewrite reached Popen"),
+    )
+    pre_hook = HookEventResult(
+        event = "PreToolUse",
+        updated_input = {"command": "rm forbidden"},
+    )
+
+    result = tools.execute_tool(
+        "terminal",
+        {"command": "echo allowed"},
+        session_id = session_id,
+        thread_id = "thread",
+        project_pre_hook = pre_hook,
+    )
+
+    assert result == "Blocked by project command rules. rewritten command is forbidden"
 
 
 @pytest.mark.parametrize("tool_name", ["python", "terminal"])
@@ -710,6 +768,7 @@ def test_project_edit_and_command_boundaries_share_one_mutation_slot(tmp_path):
     command_boundary.root_identity = (workspace.device_id, workspace.file_id)
     command_boundary._slot = False
     command_boundary._closed = False
+    command_boundary._deadline = None
     command_boundary.recheck = lambda: None
     cancelled = threading.Event()
     cancelled.set()

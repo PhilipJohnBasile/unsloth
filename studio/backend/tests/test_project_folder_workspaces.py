@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
+from core.agent_workspace import hook_runtime, supervisor
 from core.inference import tools
 from routes import chat_history, inference
 from storage import studio_db
@@ -460,6 +461,96 @@ def test_change_and_disconnect_preserve_managed_workspace(tmp_path):
     assert disconnected["rootPath"] == str(managed_root)
     assert disconnected["workspaceRevision"] == 3
     assert marker.read_text(encoding = "utf-8") == "managed"
+
+
+@pytest.mark.parametrize("operation", ["change", "disconnect"])
+def test_active_hook_session_folder_boundary_uses_old_fenced_snapshot(
+    tmp_path, linkable_temp_base, monkeypatch, operation
+):
+    external_root = linkable_temp_base / tmp_path.name
+    external_root.mkdir(parents = True, exist_ok = True)
+    first_folder = external_root / "first-active"
+    second_folder = external_root / "second-active"
+    first_folder.mkdir()
+    second_folder.mkdir()
+    studio_db.upsert_chat_project(_managed_project("project-active"))
+    studio_db.claim_chat_project_folder(
+        _folder_claim("project-active", first_folder),
+        expected_workspace_revision = 0,
+    )
+    studio_db.upsert_chat_thread(
+        {
+            "id": "thread-active",
+            "title": "Active",
+            "modelType": "base",
+            "modelId": "model",
+            "pairId": None,
+            "projectId": "project-active",
+            "archived": False,
+            "createdAt": 1_700_000_000_000,
+        }
+    )
+    token = hook_runtime._resolve_session_token(
+        "project-active",
+        "thread-active",
+        None,
+        create = True,
+    )
+    with hook_runtime._BACKGROUND_LOCK:
+        hook_runtime._STARTED_SESSIONS.add(token)
+    executed_roots = []
+
+    def trusted(_project_id, event, payload, *, session_token, workspace_authority, **_kwargs):
+        assert event == "SessionEnd"
+        invocation = hook_runtime._HookInvocation(
+            project_id = token.project_id,
+            event = event,
+            event_input_json = json.dumps(payload, separators = (",", ":")).encode(),
+            handler_id = "SessionEnd:0:0",
+            handler_json = b'{"command":"finalize","type":"command"}',
+            content_hash = "a" * 64,
+            workspace_identity = (
+                workspace_authority.device_id,
+                workspace_authority.file_id,
+            ),
+            workspace_revision = workspace_authority.revision,
+            trust_revision = 1,
+            session_token = session_token,
+            deadline_monotonic = time.monotonic() + 3,
+        )
+        return [invocation], [{"id": invocation.handler_id, "timeout": 1, "async": False}]
+
+    def run_process(_project_id, _command, **kwargs):
+        executed_roots.append(kwargs["workspace_override"].root)
+        return supervisor.ProjectProcessResult("passed", 0, "", 0, False)
+
+    monkeypatch.setattr(hook_runtime, "_trusted_invocations", trusted)
+    monkeypatch.setattr(supervisor, "_run_project_process", run_process)
+
+    if operation == "change":
+        result = chat_history.change_project_folder(
+            "project-active",
+            chat_history.ProjectFolderMutation(
+                nativePathLease = _sign_folder(second_folder),
+                expectedWorkspaceRevision = 1,
+            ),
+            current_subject = "tester",
+        )
+        assert result.workspacePath == str(second_folder.resolve())
+    else:
+        result = chat_history.disconnect_project_folder(
+            "project-active",
+            chat_history.DisconnectProjectFolderRequest(expectedWorkspaceRevision = 1),
+            current_subject = "tester",
+        )
+        assert result.workspaceKind == "managed"
+
+    assert hook_runtime.snapshot_project_hook_session("project-active", "thread-active") is None
+    assert executed_roots == [first_folder.resolve()]
+    with tools._sessions_free:
+        assert tools._session_key(tools.project_session_id("project-active")) not in (
+            tools._removing_sessions
+        )
 
 
 def test_stale_disconnect_does_not_create_an_unowned_managed_workspace(tmp_path):

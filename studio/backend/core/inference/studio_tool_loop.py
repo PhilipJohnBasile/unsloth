@@ -49,10 +49,11 @@ import asyncio
 import json
 import threading
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
+from core.agent_workspace.hook_runtime import project_stop_hook
 from core.inference import tools as tools_module
 from core.inference.chat_template_helpers import append_assistant_turn
 from core.inference.passthrough_healing import StreamToolCallHealer, heal_gate, nudge_enabled
@@ -81,7 +82,12 @@ from core.inference.tools import (
     build_rag_autoinject,
     execute_tool,
     is_high_risk_tool_call,
+    new_project_hook_session_id,
+    new_project_hook_turn_id,
+    prepare_project_tool_hook,
     project_terminal_rule_policy,
+    project_terminal_rule_proof,
+    run_project_permission_hook,
 )
 from state.tool_approvals import (
     TOOL_REJECTED_MESSAGE,
@@ -209,17 +215,26 @@ def _hosted_arguments_for_model(arguments: Any) -> dict[str, Any]:
 # Consecutive turns that asked for a tool but ran none before the loop gives up.
 _MAX_FRUITLESS_TURNS = 2
 
+# Positive completion proof emitted in process by transports that consume their
+# provider's wire-level DONE marker. It must never be serialized to the client.
+_INTERNAL_TRANSPORT_TERMINAL_TYPE = "_studio_transport_terminal"
+
 
 def _sse(payload: dict[str, Any]) -> str:
     return "data: " + json.dumps(payload, separators = (",", ":"))
 
 
-def _is_done_sentinel(line: str) -> bool:
-    return line.startswith("data:") and line[5:].strip() == "[DONE]"
+def _is_done_sentinel(line: Any) -> bool:
+    if line == {
+        "type": _INTERNAL_TRANSPORT_TERMINAL_TYPE,
+        "protocol": "sse",
+    }:
+        return True
+    return isinstance(line, str) and line.startswith("data:") and line[5:].strip() == "[DONE]"
 
 
-def _chunk_payload(line: str) -> dict[str, Any] | None:
-    if not line.startswith("data:"):
+def _chunk_payload(line: Any) -> dict[str, Any] | None:
+    if not isinstance(line, str) or not line.startswith("data:"):
         return None
     raw = line[5:].strip()
     if not raw or raw == "[DONE]":
@@ -326,7 +341,7 @@ class ToolLoopTransport(Protocol):
         tools: list[dict[str, Any]] | None,
         tool_choice: Any,
         cancel_event: threading.Event,
-    ) -> AsyncIterator[str]: ...
+    ) -> AsyncIterator[Any]: ...
 
 
 @dataclass(frozen = True)
@@ -758,21 +773,62 @@ async def _drain_step_task(task: Any, cancel_event: threading.Event) -> None:
         pass
 
 
-async def stream_with_studio_tools(
+@project_stop_hook
+async def stream_with_project_stop_passthrough(
     transport: ToolLoopTransport,
     *,
     run: ToolLoopRun,
     policy: ToolLoopPolicy,
     cancel_event: threading.Event,
+    continuation_state: dict[str, Any] | None = None,
+) -> AsyncIterator[str]:
+    """Preserve caller tools while adding project Stop at the provider boundary."""
+    conversation = [dict(message) for message in run.messages]
+    if continuation_state is not None:
+        continuation_state["messages"] = conversation
+    upstream = transport.stream(
+        messages = conversation,
+        tools = policy.tools or None,
+        tool_choice = run.tool_choice,
+        cancel_event = cancel_event,
+    )
+    try:
+        async for line in upstream:
+            yield line
+    finally:
+        aclose = getattr(upstream, "aclose", None)
+        if aclose is not None:
+            try:
+                await aclose()
+            except (RuntimeError, GeneratorExit):
+                pass
+
+
+@project_stop_hook
+async def _stream_with_studio_tools_with_project_stop(
+    transport: ToolLoopTransport,
+    *,
+    run: ToolLoopRun,
+    policy: ToolLoopPolicy,
+    cancel_event: threading.Event,
+    continuation_state: dict[str, Any] | None = None,
 ) -> AsyncIterator[str]:
     """Stream a provider, execute requested Unsloth tools, continue to a final answer."""
     conversation = [dict(message) for message in run.messages]
+    if continuation_state is not None:
+        continuation_state["messages"] = conversation
     # Kept before the loop appends anything: this is the branch the request is on.
     request_branch = list(run.messages)
     remaining = policy.max_calls
     unlimited = remaining >= 9999
     session_id = run.session_id
     thread_id = run.thread_id
+    hook_session_id = thread_id or (
+        new_project_hook_session_id()
+        if isinstance(session_id, str) and session_id.startswith("project-")
+        else None
+    )
+    hook_turn_id = new_project_hook_turn_id()
     tools = policy.tools
     tool_choice = run.tool_choice if run.tool_choice is not None else "auto"
     allowed_tool_names = _tool_names(tools)
@@ -836,6 +892,11 @@ async def stream_with_studio_tools(
             # capped; this caps the asking, so the conversation cannot grow
             # without bound when nothing ever executes.
             break
+        if provider_turns:
+            # The Stop wrapper reviews only the final settled provider turn.
+            # Text and tool-call state from a prior local-tool round must not
+            # leak into that final candidate.
+            yield {"type": "_project_hook_candidate_boundary"}
         provider_turns += 1
         turn = _Turn(round = provider_turns)
         healer = StreamToolCallHealer(heal_names, tools) if heal_names else None
@@ -860,12 +921,15 @@ async def stream_with_studio_tools(
             tool_choice = turn_tool_choice,
             cancel_event = cancel_event,
         )
+        saw_done_sentinel = False
+        saw_finish_reason = False
         try:
             async for line in generator:
                 if _is_done_sentinel(line):
                     # Every turn ends with one. Relaying it mid-loop tells a
                     # spec-compliant client the response is over, and it stops before
                     # the tool cards and the real answer. The route emits the final one.
+                    saw_done_sentinel = True
                     continue
                 # This loop writes its tool cards, badges and the approval
                 # handshake onto the same stream the provider's chunks are
@@ -921,6 +985,7 @@ async def stream_with_studio_tools(
                 turn.note_hosted_tool_event(payload.get("_toolEvent"))
                 if isinstance(choice.get("finish_reason"), str):
                     turn.finish_reason = choice["finish_reason"]
+                    saw_finish_reason = True
 
                 if isinstance(raw_calls, list) and raw_calls:
                     if healer is not None and not healer.dormant:
@@ -980,6 +1045,13 @@ async def stream_with_studio_tools(
                     await aclose()
                 except (RuntimeError, GeneratorExit):
                     pass
+
+        if cancel_event.is_set():
+            return
+        if not saw_finish_reason or not saw_done_sentinel:
+            raise RuntimeError(
+                "External provider stream ended without a complete finish and DONE sequence."
+            )
 
         # Both of these mean the turn ended before the model finished saying what
         # it wanted: "length" hit the token ceiling, "content_filter" had the
@@ -1165,6 +1237,36 @@ async def stream_with_studio_tools(
                 ):
                     yield card_line
                 continue
+            name = decision.tool_name
+            arguments, pre_hook, call_id = await asyncio.to_thread(
+                prepare_project_tool_hook,
+                decision.tool_name,
+                decision.arguments,
+                session_id = session_id,
+                hook_session_id = hook_session_id,
+                hook_turn_id = hook_turn_id,
+                tool_use_id = decision.tool_call_id,
+                permission_mode = permission_mode,
+                bypass_permissions = bypass_permissions,
+                cancel_event = cancel_event,
+            )
+            decision = controller.reclassify_rewritten_call(decision, arguments)
+            decision = replace(decision, tool_call_id = call_id)
+            if not decision.should_execute:
+                completion = controller.record_noop(decision)
+                noop_messages.append(completion.model_message())
+                for card_line in _unrun_call_card(
+                    tool_name = decision.tool_name,
+                    tool_call_id = call.get("stream_id") or decision.tool_call_id,
+                    arguments = decision.arguments,
+                    result = _TOOL_SKIPPED.get(
+                        decision.action,
+                        "Unsloth did not run this call.",
+                    ),
+                    provenance = decision.provenance,
+                ):
+                    yield card_line
+                continue
             assistant_call = decision.as_assistant_tool_call()
             call_extra = call.get("extra_content")
             if isinstance(call_extra, dict) and call_extra:
@@ -1172,10 +1274,6 @@ async def stream_with_studio_tools(
                 # back with this exact call.
                 assistant_call["extra_content"] = call_extra
             assistant_tool_calls.append(assistant_call)
-
-            name = decision.tool_name
-            arguments = decision.arguments
-            call_id = decision.tool_call_id
             project_rule = (
                 project_terminal_rule_policy(
                     session_id,
@@ -1194,6 +1292,30 @@ async def stream_with_studio_tools(
                 needs_confirmation = True
             elif project_rule is not None and project_rule.get("decision") == "forbidden":
                 needs_confirmation = False
+            permission_arguments = arguments
+            hook_verdict = "deny" if pre_hook.blocked else pre_hook.permission_decision
+            hook_denial_message = pre_hook.reason
+            if hook_verdict in {"allow", "deny"}:
+                needs_confirmation = False
+            if needs_confirmation:
+                permission = await asyncio.to_thread(
+                    run_project_permission_hook,
+                    name,
+                    arguments,
+                    session_id = session_id,
+                    thread_id = thread_id,
+                    hook_session_id = hook_session_id,
+                    hook_turn_id = hook_turn_id,
+                    tool_use_id = call_id,
+                    permission_mode = permission_mode,
+                    bypass_permissions = bypass_permissions,
+                    hook_session_token = pre_hook.session_token,
+                    cancel_event = cancel_event,
+                )
+                hook_verdict = "deny" if permission.blocked else permission.permission_decision
+                hook_denial_message = permission.reason
+                if hook_verdict in {"allow", "deny"}:
+                    needs_confirmation = False
             approval_id = new_approval_id() if needs_confirmation else ""
             decision_slot = (
                 begin_tool_decision(session_id, approval_id) if needs_confirmation else None
@@ -1209,7 +1331,7 @@ async def stream_with_studio_tools(
                     awaiting_approval_status(name) if needs_confirmation else decision.status_text
                 )
                 yield _sse(start_event)
-                verdict = None
+                verdict = hook_verdict
                 if decision_slot is not None:
                     waiter = asyncio.ensure_future(
                         asyncio.to_thread(
@@ -1244,19 +1366,20 @@ async def stream_with_studio_tools(
                     abort_tool_decision(decision_slot, approval_id)
 
             if denied:
+                denial_result = hook_denial_message or TOOL_REJECTED_MESSAGE
                 yield _sse(
                     {
                         "type": "tool_end",
                         "tool_name": name,
                         "tool_call_id": call_id,
-                        "result": TOOL_REJECTED_MESSAGE,
+                        "result": denial_result,
                         "provenance": decision.provenance,
                     }
                 )
                 denied_message: dict[str, Any] = {
                     "role": "tool",
                     "name": name,
-                    "content": TOOL_REJECTED_MESSAGE,
+                    "content": denial_result,
                 }
                 if call_id:
                     denied_message["tool_call_id"] = call_id
@@ -1265,13 +1388,10 @@ async def stream_with_studio_tools(
                 reprompts = max_reprompts
                 continue
 
-            project_rule_proof = (
-                {
-                    "policyHash": project_rule.get("policyHash"),
-                    "approved": verdict == "allow",
-                }
-                if project_rule is not None
-                else None
+            rule_proof = project_terminal_rule_proof(
+                project_rule,
+                str(permission_arguments.get("command") or ""),
+                approved = verdict == "allow",
             )
 
             def _invoke(output_callback: Any, call = decision) -> str:
@@ -1309,9 +1429,19 @@ async def stream_with_studio_tools(
                 if accepts_output_callback(execute_tool):
                     kwargs["output_callback"] = output_callback
                 if accepts_kwarg(execute_tool, "project_rule_proof"):
-                    kwargs["project_rule_proof"] = project_rule_proof
+                    kwargs["project_rule_proof"] = rule_proof
+                if accepts_kwarg(execute_tool, "tool_use_id"):
+                    kwargs["tool_use_id"] = call_id
+                if accepts_kwarg(execute_tool, "hook_session_id"):
+                    kwargs["hook_session_id"] = hook_session_id
+                if accepts_kwarg(execute_tool, "hook_turn_id"):
+                    kwargs["hook_turn_id"] = hook_turn_id
+                if accepts_kwarg(execute_tool, "project_pre_hook"):
+                    kwargs["project_pre_hook"] = pre_hook
+                if accepts_kwarg(execute_tool, "permission_mode"):
+                    kwargs["permission_mode"] = permission_mode
                 kwargs.update(search_images_kwargs(execute_tool, call.tool_name))
-                return execute_tool(call.tool_name, call.arguments, **kwargs)
+                return execute_tool(call.tool_name, permission_arguments, **kwargs)
 
             # The same wrapper the local loops run tools through: live stdout for
             # the card, and a heartbeat so a long call cannot idle the stream out.
@@ -1444,3 +1574,38 @@ async def stream_with_studio_tools(
     usage_line = _usage_chunk_line(model_name, usage_totals)
     if usage_line is not None:
         yield usage_line
+    # This loop consumes every provider DONE sentinel while it executes tools.
+    # Hand the Stop wrapper an unforgeable in-process proof that the final turn
+    # reached both a finish chunk and DONE, so it can emit one terminal sequence.
+    yield {
+        "type": "_project_hook_terminal",
+        "protocol": "sse",
+    }
+
+
+async def stream_with_studio_tools(
+    transport: ToolLoopTransport,
+    *,
+    run: ToolLoopRun,
+    policy: ToolLoopPolicy,
+    cancel_event: threading.Event,
+    continuation_state: dict[str, Any] | None = None,
+) -> AsyncIterator[str]:
+    """Run the hooked loop while leaving the final DONE marker to its route."""
+    generator = _stream_with_studio_tools_with_project_stop(
+        transport,
+        run = run,
+        policy = policy,
+        cancel_event = cancel_event,
+        continuation_state = continuation_state,
+    )
+    try:
+        async for line in generator:
+            if _is_done_sentinel(line):
+                continue
+            yield line
+    finally:
+        try:
+            await generator.aclose()
+        except (RuntimeError, GeneratorExit):
+            pass

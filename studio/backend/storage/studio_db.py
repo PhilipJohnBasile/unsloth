@@ -18,6 +18,7 @@ import sqlite3
 import stat
 import threading
 import uuid
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -662,8 +663,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_api_usage_events_created_at "
-        "ON api_usage_events(created_at)"
+        "CREATE INDEX IF NOT EXISTS idx_api_usage_events_created_at ON api_usage_events(created_at)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_api_usage_events_subject_created_at "
@@ -833,6 +833,84 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE chat_clear_operations ADD COLUMN reapable_image_ids_json TEXT")
     if "caches_cleared_at" not in chat_clear_operation_cols:
         conn.execute("ALTER TABLE chat_clear_operations ADD COLUMN caches_cleared_at INTEGER")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS project_hook_session_end_outbox (
+            id TEXT NOT NULL PRIMARY KEY,
+            snapshot_json TEXT NOT NULL,
+            project_id TEXT,
+            session_id TEXT,
+            generation TEXT,
+            fence_scope TEXT NOT NULL DEFAULT 'session',
+            created_at INTEGER NOT NULL,
+            consumed_at INTEGER,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            dead_letter_at INTEGER,
+            claim_owner TEXT,
+            claim_expires_at INTEGER NOT NULL DEFAULT 0
+        ) WITHOUT ROWID
+        """
+    )
+    project_hook_outbox_cols = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(project_hook_session_end_outbox)").fetchall()
+    }
+    for column, definition in (
+        ("project_id", "TEXT"),
+        ("session_id", "TEXT"),
+        ("generation", "TEXT"),
+        ("fence_scope", "TEXT NOT NULL DEFAULT 'session'"),
+        ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_attempt_at", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_error", "TEXT"),
+        ("dead_letter_at", "INTEGER"),
+        ("claim_owner", "TEXT"),
+        ("claim_expires_at", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column not in project_hook_outbox_cols:
+            conn.execute(
+                f"ALTER TABLE project_hook_session_end_outbox ADD COLUMN {column} {definition}"
+            )
+    stale_outbox_identities = conn.execute(
+        """
+        SELECT id, snapshot_json
+        FROM project_hook_session_end_outbox
+        WHERE project_id IS NULL OR session_id IS NULL OR generation IS NULL
+        """
+    ).fetchall()
+    for row in stale_outbox_identities:
+        try:
+            token = json.loads(str(row["snapshot_json"]))["token"]
+            project_id = str(token["project_id"])
+            session_id = str(token["session_id"])
+            generation = str(token["generation"])
+        except (KeyError, TypeError, ValueError):
+            # Leave malformed legacy rows unscoped. Admission treats any such
+            # unconsumed record as a global fail-closed lifecycle fence.
+            continue
+        if project_id and session_id and generation:
+            conn.execute(
+                """
+                UPDATE project_hook_session_end_outbox
+                SET project_id = ?, session_id = ?, generation = ?
+                WHERE id = ?
+                """,
+                (project_id, session_id, generation, row["id"]),
+            )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_hook_session_end_outbox_pending "
+        "ON project_hook_session_end_outbox(consumed_at, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_hook_session_end_outbox_retry "
+        "ON project_hook_session_end_outbox(consumed_at, dead_letter_at, next_attempt_at, created_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_project_hook_session_end_outbox_identity "
+        "ON project_hook_session_end_outbox(project_id, session_id, consumed_at)"
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS chat_messages (
@@ -2233,13 +2311,43 @@ def _raise_if_chat_thread_deleted(conn: sqlite3.Connection, thread_id: str) -> N
         raise ChatThreadDeletedError(thread_id)
 
 
-def upsert_chat_thread(thread: dict) -> dict:
+def upsert_chat_thread(
+    thread: dict,
+    *,
+    hook_session_ledger = None,
+    _hook_admission_fenced: bool = False,
+) -> dict:
+    if hook_session_ledger is not None and not _hook_admission_fenced:
+        from core.agent_workspace.hook_runtime import project_hook_admission_fence
+        with project_hook_admission_fence():
+            return upsert_chat_thread(
+                thread,
+                hook_session_ledger = hook_session_ledger,
+                _hook_admission_fenced = True,
+            )
     conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
     try:
         conn.execute("BEGIN IMMEDIATE")
         _raise_if_chat_thread_deleted(conn, thread["id"])
-        conn.execute(
-            """
+        current = conn.execute(
+            "SELECT project_id, archived FROM chat_threads WHERE id = ?",
+            (thread["id"],),
+        ).fetchone()
+        next_project_id = thread.get("projectId")
+        next_archived = bool(thread.get("archived"))
+        lifecycle_boundary = current is not None and (
+            str(current["project_id"] or "") != str(next_project_id or "")
+            or (not bool(current["archived"]) and next_archived)
+        )
+        reason = "archive" if next_archived else "other"
+        ledger = (
+            hook_session_ledger(conn, {str(thread["id"])}, reason = reason)
+            if lifecycle_boundary and hook_session_ledger is not None
+            else nullcontext(None)
+        )
+        with ledger as hook_sessions:
+            conn.execute(
+                """
             INSERT INTO chat_threads
                 (id, title, model_type, model_id, model_gguf_variant, pair_id, project_id, archived, created_at, updated_at, openai_code_exec_container_id, anthropic_code_exec_container_id, forked_from_thread_id, forked_from_message_id, settings_json)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2264,26 +2372,32 @@ def upsert_chat_thread(thread: dict) -> dict:
                 -- an absent snapshot keeps the stored one: most writers rebuild the record without it.
                 settings_json = COALESCE(excluded.settings_json, chat_threads.settings_json)
             """,
-            (
-                thread["id"],
-                thread.get("title") or "New Chat",
-                thread["modelType"],
-                thread.get("modelId") or "",
-                thread.get("modelGgufVariant"),
-                thread.get("pairId"),
-                thread.get("projectId"),
-                1 if thread.get("archived") else 0,
-                int(thread["createdAt"]),
-                int(thread["updatedAt"]) if thread.get("updatedAt") is not None else None,
-                thread.get("openaiCodeExecContainerId"),
-                thread.get("anthropicCodeExecContainerId"),
-                thread.get("forkedFromThreadId"),
-                thread.get("forkedFromMessageId"),
-                json.dumps(thread["settings"]) if thread.get("settings") is not None else None,
-            ),
-        )
-        conn.commit()
-        return get_chat_thread(thread["id"]) or thread
+                (
+                    thread["id"],
+                    thread.get("title") or "New Chat",
+                    thread["modelType"],
+                    thread.get("modelId") or "",
+                    thread.get("modelGgufVariant"),
+                    thread.get("pairId"),
+                    thread.get("projectId"),
+                    1 if thread.get("archived") else 0,
+                    int(thread["createdAt"]),
+                    int(thread["updatedAt"]) if thread.get("updatedAt") is not None else None,
+                    thread.get("openaiCodeExecContainerId"),
+                    thread.get("anthropicCodeExecContainerId"),
+                    thread.get("forkedFromThreadId"),
+                    thread.get("forkedFromMessageId"),
+                    json.dumps(thread["settings"]) if thread.get("settings") is not None else None,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM chat_threads WHERE id = ?", (thread["id"],)
+            ).fetchone()
+            conn.commit()
+        result = _chat_thread_from_row(row) if row is not None else thread
+        if lifecycle_boundary and hook_session_ledger is not None:
+            result["hookSessions"] = hook_sessions
+        return result
     except Exception:
         conn.rollback()
         raise
@@ -2299,12 +2413,6 @@ class ChatThreadPreconditionFailed(Exception):
 # Watermarks kept per thread, one per tab that has written its settings.
 _MAX_SETTINGS_WRITERS = 32
 
-_OPENING_USER_MESSAGE = """(
-    SELECT id FROM chat_messages
-    WHERE thread_id = ? AND role = 'user'
-    ORDER BY created_at ASC, id ASC LIMIT 1
-) IS ?"""
-
 
 def update_chat_thread(
     id: str,
@@ -2312,6 +2420,8 @@ def update_chat_thread(
     expected_title: Optional[str] = None,
     expected_opening_message_id: Optional[str] = None,
     settings_write: Optional[dict] = None,
+    hook_session_ledger = None,
+    _hook_admission_fenced: bool = False,
 ) -> Optional[dict]:
     """Patch a thread. With expected_title, the write only lands while the row
     still holds that title, so a concurrent rename wins instead of being lost.
@@ -2357,42 +2467,87 @@ def update_chat_thread(
     if not assignments and settings_write is None:
         return get_chat_thread(id)
 
+    if hook_session_ledger is not None and not _hook_admission_fenced:
+        from core.agent_workspace.hook_runtime import project_hook_admission_fence
+        with project_hook_admission_fence():
+            return update_chat_thread(
+                id,
+                patch,
+                expected_title = expected_title,
+                expected_opening_message_id = expected_opening_message_id,
+                settings_write = settings_write,
+                hook_session_ledger = hook_session_ledger,
+                _hook_admission_fenced = True,
+            )
+
     conn = get_connection()
     try:
         # The snapshot rides in the same transaction as the guarded metadata write, or a
         # rejected precondition returns 409 with the settings change already committed.
         conn.execute("BEGIN IMMEDIATE")
-        # Guards ride in the WHERE clause, so check and write are one statement.
-        where = ["id = ?"]
-        guard: list = [id]
-        if expected_title is not None:
-            where.append("title = ?")
-            guard.append(expected_title)
-        if expected_opening_message_id is not None:
-            where.append(_OPENING_USER_MESSAGE)
-            guard += [id, expected_opening_message_id]
-        guarded = expected_title is not None or expected_opening_message_id is not None
-        applied = 1
-        if assignments:
-            cursor = conn.execute(
-                f"UPDATE chat_threads SET {', '.join(assignments)} WHERE {' AND '.join(where)}",
-                (*values, *guard),
-            )
-            applied = cursor.rowcount
-        if guarded and applied == 0:
+        current = conn.execute(
+            "SELECT project_id, archived, title FROM chat_threads WHERE id = ?", (id,)
+        ).fetchone()
+        if current is None:
             conn.rollback()
-            if conn.execute("SELECT 1 FROM chat_threads WHERE id = ?", (id,)).fetchone() is None:
-                return None
+            return None
+        if expected_title is not None and current["title"] != expected_title:
+            conn.rollback()
             raise ChatThreadPreconditionFailed(id)
+        if expected_opening_message_id is not None:
+            opening = conn.execute(
+                """
+                SELECT id FROM chat_messages
+                WHERE thread_id = ? AND role = 'user'
+                ORDER BY created_at ASC, id ASC LIMIT 1
+                """,
+                (id,),
+            ).fetchone()
+            if opening is None or opening["id"] != expected_opening_message_id:
+                conn.rollback()
+                raise ChatThreadPreconditionFailed(id)
+        next_project_id = patch.get("projectId") if "projectId" in patch else current["project_id"]
+        next_archived = (
+            bool(patch.get("archived")) if "archived" in patch else bool(current["archived"])
+        )
+        lifecycle_boundary = str(current["project_id"] or "") != str(next_project_id or "") or (
+            not bool(current["archived"]) and next_archived
+        )
+        reason = "archive" if next_archived else "other"
         if settings_write is not None:
+            # Validate and stage the settings mutation before hook capture. The
+            # transaction still owns the change, so a later lifecycle failure
+            # rolls it back, while a missing-row result cannot cancel a live
+            # project turn that the database update did not change.
             if _write_chat_thread_settings_in_conn(conn, id, **settings_write) is None:
                 conn.rollback()
                 return None
-        conn.commit()
-        row = conn.execute("SELECT * FROM chat_threads WHERE id = ?", (id,)).fetchone()
+        ledger = (
+            hook_session_ledger(conn, {str(id)}, reason = reason)
+            if lifecycle_boundary and hook_session_ledger is not None
+            else nullcontext(None)
+        )
+        with ledger as hook_sessions:
+            where = ["id = ?"]
+            guard: list = [id]
+            applied = 1
+            if assignments:
+                cursor = conn.execute(
+                    f"UPDATE chat_threads SET {', '.join(assignments)} WHERE {' AND '.join(where)}",
+                    (*values, *guard),
+                )
+                applied = cursor.rowcount
+            if applied == 0:
+                conn.rollback()
+                return None
+            conn.commit()
+            row = conn.execute("SELECT * FROM chat_threads WHERE id = ?", (id,)).fetchone()
         if row is None:
             return None
-        return _chat_thread_from_row(row)
+        result = _chat_thread_from_row(row)
+        if lifecycle_boundary and hook_session_ledger is not None:
+            result["hookSessions"] = hook_sessions
+        return result
     finally:
         conn.close()
 
@@ -2692,28 +2847,48 @@ def _active_chat_generation_run_ids(
     return [row["id"] for row in sorted(rows, key = lambda row: (row["created_at"], row["id"]))]
 
 
-def delete_chat_threads_with_active_runs(ids: list[str]) -> tuple[list[str], list[str]]:
+def delete_chat_threads_with_active_runs(
+    ids: list[str],
+    *,
+    hook_session_ledger = None,
+    _hook_admission_fenced: bool = False,
+):
     if not ids:
-        return [], []
+        return ([], [], []) if hook_session_ledger is not None else ([], [])
+    if hook_session_ledger is not None and not _hook_admission_fenced:
+        from core.agent_workspace.hook_runtime import project_hook_admission_fence
+        with project_hook_admission_fence():
+            return delete_chat_threads_with_active_runs(
+                ids,
+                hook_session_ledger = hook_session_ledger,
+                _hook_admission_fenced = True,
+            )
     conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
     try:
         conn.execute("BEGIN IMMEDIATE")
         _ensure_chat_attachment_inventory_current(conn)
         thread_ids = set(ids)
-        active_research_run_ids = _active_research_run_ids(conn, thread_ids)
-        active_chat_run_ids = _active_chat_generation_run_ids(conn, thread_ids)
-        _reparent_surviving_forks(conn, thread_ids)
-        # Record the delete even when no row exists yet. A late POST carrying the same unique id
-        # must not recreate a thread after this request has confirmed deletion.
-        _tombstone_chat_threads(conn, thread_ids)
-        conn.executemany(
-            "DELETE FROM chat_attachment_tombstones WHERE thread_id = ?",
-            [(id,) for id in ids],
+        ledger = (
+            hook_session_ledger(conn, thread_ids)
+            if hook_session_ledger is not None
+            else nullcontext(None)
         )
-        conn.executemany("DELETE FROM chat_threads WHERE id = ?", [(id,) for id in ids])
-        _mark_chat_attachment_inventory_clean(conn)
-        conn.commit()
-        return active_research_run_ids, active_chat_run_ids
+        with ledger as hook_sessions:
+            active_research_run_ids = _active_research_run_ids(conn, thread_ids)
+            active_chat_run_ids = _active_chat_generation_run_ids(conn, thread_ids)
+            _reparent_surviving_forks(conn, thread_ids)
+            # Record the delete even when no row exists yet. A late POST carrying the same unique id
+            # must not recreate a thread after this request has confirmed deletion.
+            _tombstone_chat_threads(conn, thread_ids)
+            conn.executemany(
+                "DELETE FROM chat_attachment_tombstones WHERE thread_id = ?",
+                [(id,) for id in ids],
+            )
+            conn.executemany("DELETE FROM chat_threads WHERE id = ?", [(id,) for id in ids])
+            _mark_chat_attachment_inventory_clean(conn)
+            conn.commit()
+        result = (active_research_run_ids, active_chat_run_ids)
+        return (*result, hook_sessions) if hook_session_ledger is not None else result
     except Exception:
         conn.rollback()
         raise
@@ -2729,6 +2904,424 @@ def delete_chat_threads_with_active_research_runs(ids: list[str]) -> list[str]:
 def delete_chat_threads(ids: list[str]) -> list[str]:
     """Delete threads and return the active research runs removed with them."""
     return delete_chat_threads_with_active_research_runs(ids)
+
+
+def enqueue_project_hook_session_end_outbox(
+    conn: sqlite3.Connection, records: Iterable[tuple[str, str] | tuple[str, str, str]]
+) -> None:
+    """Persist exact SessionEnd snapshots in the caller's destructive transaction."""
+    created_at = int(datetime.now(timezone.utc).timestamp() * 1000)
+    values = []
+    for record in records:
+        if len(record) == 2:
+            record_id, snapshot_json = record
+            fence_scope = "session"
+        elif len(record) == 3:
+            record_id, snapshot_json, fence_scope = record
+        else:
+            raise ValueError("Project hook SessionEnd outbox record is invalid.")
+        if fence_scope not in {"session", "project", "global"}:
+            raise ValueError("Project hook SessionEnd outbox fence scope is invalid.")
+        try:
+            token = json.loads(snapshot_json)["token"]
+            project_id = str(token["project_id"])
+            session_id = str(token["session_id"])
+            generation = str(token["generation"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Project hook SessionEnd outbox identity is invalid.") from exc
+        if not project_id or not session_id or not generation:
+            raise ValueError("Project hook SessionEnd outbox identity is invalid.")
+        values.append(
+            (
+                record_id,
+                snapshot_json,
+                project_id,
+                session_id,
+                generation,
+                fence_scope,
+                created_at,
+            )
+        )
+    conn.executemany(
+        """
+        INSERT INTO project_hook_session_end_outbox (
+            id, snapshot_json, project_id, session_id, generation, fence_scope,
+            created_at, consumed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+        ON CONFLICT(id) DO UPDATE SET fence_scope = CASE
+            WHEN project_hook_session_end_outbox.fence_scope = 'global'
+              OR excluded.fence_scope = 'global' THEN 'global'
+            WHEN project_hook_session_end_outbox.fence_scope = 'project'
+              OR excluded.fence_scope = 'project' THEN 'project'
+            ELSE 'session'
+        END
+        WHERE project_hook_session_end_outbox.consumed_at IS NULL
+        """,
+        values,
+    )
+
+
+def project_hook_session_end_pending_for(project_id: str, session_id: str) -> bool:
+    """Fence a new generation behind every unconsumed prior SessionEnd."""
+    if (
+        not isinstance(project_id, str)
+        or not project_id
+        or not isinstance(session_id, str)
+        or not session_id
+    ):
+        raise ValueError("Project hook outbox admission identity is invalid.")
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM project_hook_session_end_outbox
+            WHERE consumed_at IS NULL
+              AND (
+                  session_id = ?
+                  OR (project_id = ? AND fence_scope = 'project')
+                  OR fence_scope = 'global'
+                  OR project_id IS NULL
+                  OR session_id IS NULL
+                  OR generation IS NULL
+              )
+            LIMIT 1
+            """,
+            (session_id, project_id),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def project_hook_session_end_pending_for_project(project_id: str) -> bool:
+    """Keep a deleted project's managed root until every finalizer releases it."""
+    if not isinstance(project_id, str) or not project_id:
+        raise ValueError("Project hook outbox project identity is invalid.")
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM project_hook_session_end_outbox
+            WHERE consumed_at IS NULL
+              AND (project_id = ? OR project_id IS NULL)
+            LIMIT 1
+            """,
+            (project_id,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def pending_project_hook_session_end_outbox(*, limit: int = 64) -> list[dict[str, Any]]:
+    bounded_limit = max(1, min(int(limit), 256))
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, snapshot_json, attempt_count
+            FROM project_hook_session_end_outbox
+            WHERE consumed_at IS NULL
+              AND dead_letter_at IS NULL
+              AND next_attempt_at <= ?
+              AND (claim_owner IS NULL OR claim_expires_at <= ?)
+            ORDER BY created_at, id
+            LIMIT ?
+            """,
+            (now, now, bounded_limit),
+        ).fetchall()
+        return [
+            {
+                "id": str(row["id"]),
+                "snapshot_json": str(row["snapshot_json"]),
+                "attempt_count": int(row["attempt_count"] or 0),
+            }
+            for row in rows
+        ]
+    finally:
+        conn.close()
+
+
+def claim_project_hook_session_end_outbox(
+    record_id: str,
+    claim_owner: str,
+    *,
+    lease_ms: int = 30_000,
+) -> bool:
+    """Atomically lease one pending delivery to exactly one finalizer."""
+    if not isinstance(claim_owner, str) or not claim_owner:
+        raise ValueError("Project hook outbox claim owner is required.")
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    expires_at = now + max(1_000, min(int(lease_ms), 60_000))
+    conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
+            """
+            UPDATE project_hook_session_end_outbox
+            SET claim_owner = ?, claim_expires_at = ?
+            WHERE id = ?
+              AND consumed_at IS NULL
+              AND dead_letter_at IS NULL
+              AND next_attempt_at <= ?
+              AND (
+                  claim_owner IS NULL
+                  OR claim_expires_at <= ?
+                  OR claim_owner = ?
+              )
+            """,
+            (claim_owner, expires_at, record_id, now, now, claim_owner),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def claim_pending_project_hook_session_end_outbox(
+    claim_owner: str,
+    *,
+    limit: int = 64,
+    lease_ms: int = 30_000,
+) -> list[dict[str, Any]]:
+    """Claim a fair bounded batch in one SQLite write transaction."""
+    if not isinstance(claim_owner, str) or not claim_owner:
+        raise ValueError("Project hook outbox claim owner is required.")
+    bounded_limit = max(1, min(int(limit), 256))
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    expires_at = now + max(1_000, min(int(lease_ms), 60_000))
+    conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            SELECT id, snapshot_json, attempt_count
+            FROM project_hook_session_end_outbox
+            WHERE consumed_at IS NULL
+              AND dead_letter_at IS NULL
+              AND next_attempt_at <= ?
+              AND (claim_owner IS NULL OR claim_expires_at <= ?)
+            ORDER BY created_at, id
+            LIMIT ?
+            """,
+            (now, now, bounded_limit),
+        ).fetchall()
+        claimed = []
+        for row in rows:
+            cursor = conn.execute(
+                """
+                UPDATE project_hook_session_end_outbox
+                SET claim_owner = ?, claim_expires_at = ?
+                WHERE id = ?
+                  AND consumed_at IS NULL
+                  AND dead_letter_at IS NULL
+                  AND (claim_owner IS NULL OR claim_expires_at <= ?)
+                """,
+                (claim_owner, expires_at, row["id"], now),
+            )
+            if cursor.rowcount == 1:
+                claimed.append(
+                    {
+                        "id": str(row["id"]),
+                        "snapshot_json": str(row["snapshot_json"]),
+                        "attempt_count": int(row["attempt_count"] or 0),
+                    }
+                )
+        conn.commit()
+        return claimed
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def renew_project_hook_session_end_outbox_claim(
+    record_id: str,
+    claim_owner: str,
+    *,
+    lease_ms: int = 30_000,
+) -> bool:
+    """Extend only the exact live owner's durable delivery lease."""
+    if not isinstance(claim_owner, str) or not claim_owner:
+        raise ValueError("Project hook outbox claim owner is required.")
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    expires_at = now + max(1_000, min(int(lease_ms), 60_000))
+    conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE project_hook_session_end_outbox
+            SET claim_expires_at = ?
+            WHERE id = ?
+              AND consumed_at IS NULL
+              AND claim_owner = ?
+            """,
+            (expires_at, record_id, claim_owner),
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+@contextmanager
+def project_hook_session_end_claim_heartbeat(
+    record_id: str,
+    claim_owner: str,
+    *,
+    lease_ms: int = 30_000,
+):
+    """Keep one delivery exclusively leased while its in-process owner lives."""
+    stopped = threading.Event()
+    ownership_lost = threading.Event()
+    interval = max(0.05, min(float(lease_ms) / 3000.0, 20.0))
+
+    def heartbeat() -> None:
+        while not stopped.wait(interval):
+            try:
+                if not renew_project_hook_session_end_outbox_claim(
+                    record_id,
+                    claim_owner,
+                    lease_ms = lease_ms,
+                ):
+                    ownership_lost.set()
+                    return
+            except Exception:
+                ownership_lost.set()
+                logger.warning(
+                    "Could not renew project SessionEnd outbox claim %s",
+                    record_id,
+                    exc_info = True,
+                )
+
+    owner = threading.Thread(
+        target = heartbeat,
+        name = "unsloth-project-hook-outbox-heartbeat",
+        daemon = True,
+    )
+    owner.start()
+    try:
+        yield ownership_lost
+    finally:
+        stopped.set()
+        owner.join(1)
+
+
+def mark_project_hook_session_end_outbox_consumed(
+    record_id: str, *, claim_owner: Optional[str] = None
+) -> bool:
+    conn = get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE project_hook_session_end_outbox
+            SET consumed_at = COALESCE(consumed_at, ?),
+                claim_owner = NULL,
+                claim_expires_at = 0
+            WHERE id = ?
+              AND (? IS NULL OR claim_owner = ?)
+            """,
+            (
+                int(datetime.now(timezone.utc).timestamp() * 1000),
+                record_id,
+                claim_owner,
+                claim_owner,
+            ),
+        )
+        # Keep a bounded recent audit trail without allowing successful
+        # lifecycle deliveries to grow the DB forever.
+        conn.execute(
+            """
+            DELETE FROM project_hook_session_end_outbox
+            WHERE consumed_at IS NOT NULL
+              AND id NOT IN (
+                  SELECT id FROM project_hook_session_end_outbox
+                  WHERE consumed_at IS NOT NULL
+                  ORDER BY consumed_at DESC, id DESC
+                  LIMIT 1024
+              )
+            """
+        )
+        conn.commit()
+        return cursor.rowcount == 1
+    finally:
+        conn.close()
+
+
+def mark_project_hook_session_end_outbox_failed(
+    record_id: str,
+    error: str,
+    *,
+    max_attempts: int = 5,
+    claim_owner: Optional[str] = None,
+) -> bool:
+    """Back off a failed at-least-once delivery and eventually quarantine it."""
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT attempt_count FROM project_hook_session_end_outbox
+            WHERE id = ? AND (? IS NULL OR claim_owner = ?)
+            """,
+            (record_id, claim_owner, claim_owner),
+        ).fetchone()
+        if row is None:
+            return False
+        attempts = int(row["attempt_count"] or 0) + 1
+        dead_letter_at = now if attempts >= max(1, int(max_attempts)) else None
+        delay_ms = min(60_000, 100 * (2 ** min(attempts - 1, 9)))
+        conn.execute(
+            """
+            UPDATE project_hook_session_end_outbox
+            SET attempt_count = ?, next_attempt_at = ?, last_error = ?, dead_letter_at = ?,
+                claim_owner = NULL, claim_expires_at = 0
+            WHERE id = ? AND consumed_at IS NULL
+              AND (? IS NULL OR claim_owner = ?)
+            """,
+            (
+                attempts,
+                now + delay_ms,
+                str(error)[:4096],
+                dead_letter_at,
+                record_id,
+                claim_owner,
+                claim_owner,
+            ),
+        )
+        # Unresolved dead letters are durable lifecycle fences. They retain the
+        # stable delivery id until an explicit administrative resolution; cap
+        # pressure must never silently admit a new generation past one.
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def project_hook_session_end_dead_letters(*, limit: int = 64) -> list[dict[str, Any]]:
+    bounded_limit = max(1, min(int(limit), 256))
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, attempt_count, last_error, dead_letter_at
+            FROM project_hook_session_end_outbox
+            WHERE dead_letter_at IS NOT NULL
+            ORDER BY dead_letter_at DESC, id DESC
+            LIMIT ?
+            """,
+            (bounded_limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
 
 
 def unreaped_clear_operation_image_ids(operation_id: Optional[str]) -> Optional[set]:
@@ -2828,6 +3421,7 @@ def clear_chat_history(
     additional_thread_ids: Iterable[str] = (),
     operation_id: Optional[str] = None,
     include_chat_generation_runs: bool = False,
+    hook_session_ledger = None,
 ) -> "tuple[list[str], list[str]] | tuple[list[str], list[str], list[str]]":
     """Delete every chat thread. Returns (thread ids removed, research runs cascaded)."""
 
@@ -2835,10 +3429,17 @@ def clear_chat_history(
         additional_thread_ids,
         operation_id = operation_id,
         include_chat_generation_runs = include_chat_generation_runs,
+        hook_session_ledger = hook_session_ledger,
     )
     if include_chat_generation_runs:
+        if hook_session_ledger is not None:
+            removed, active_runs, active_chat_runs, _replayed, hook_sessions = result
+            return removed, active_runs, active_chat_runs, hook_sessions
         removed, active_runs, active_chat_runs, _replayed = result
         return removed, active_runs, active_chat_runs
+    if hook_session_ledger is not None:
+        removed, active_runs, _replayed, hook_sessions = result
+        return removed, active_runs, hook_sessions
     removed, active_runs, _replayed = result
     return removed, active_runs
 
@@ -2847,6 +3448,8 @@ def clear_chat_history_with_replay_status(
     additional_thread_ids: Iterable[str] = (),
     operation_id: Optional[str] = None,
     include_chat_generation_runs: bool = False,
+    hook_session_ledger = None,
+    _hook_admission_fenced: bool = False,
 ) -> "tuple[list[str], list[str], bool] | tuple[list[str], list[str], list[str], bool]":
     """`clear_chat_history`, plus whether this call replayed a recorded outcome.
 
@@ -2868,6 +3471,17 @@ def clear_chat_history_with_replay_status(
     id when its first attempt times out, and Starlette does not cancel the handler
     the client hung up on, so both really are in flight at once.
     """
+    additional_thread_ids = tuple(str(value) for value in additional_thread_ids)
+    if hook_session_ledger is not None and not _hook_admission_fenced:
+        from core.agent_workspace.hook_runtime import project_hook_admission_fence
+        with project_hook_admission_fence():
+            return clear_chat_history_with_replay_status(
+                additional_thread_ids,
+                operation_id = operation_id,
+                include_chat_generation_runs = include_chat_generation_runs,
+                hook_session_ledger = hook_session_ledger,
+                _hook_admission_fenced = True,
+            )
     conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -2880,46 +3494,59 @@ def clear_chat_history_with_replay_status(
                 (operation_id,),
             ).fetchone()
             if completed is not None:
+                removed = list(json.loads(completed["deleted_thread_ids_json"]))
                 conn.commit()
+                hook_sessions = []
                 # The original request already signalled its workers. Replaying that signal can
                 # leave a cancellation event behind after the worker has exited.
-                replay = (list(json.loads(completed["deleted_thread_ids_json"])), [])
-                return (*replay, [], True) if include_chat_generation_runs else (*replay, True)
+                replay = (removed, [])
+                result = (*replay, [], True) if include_chat_generation_runs else (*replay, True)
+                return (*result, hook_sessions) if hook_session_ledger is not None else result
         _ensure_chat_attachment_inventory_current(conn)
         removed = sorted(str(row[0]) for row in conn.execute("SELECT id FROM chat_threads"))
-        status_placeholders = ",".join("?" for _ in _ACTIVE_RESEARCH_RUN_STATUSES)
-        active_runs = [
-            row["id"]
-            for row in conn.execute(
-                f"SELECT id FROM research_runs WHERE status IN ({status_placeholders}) "
-                "AND lease_owner IS NOT NULL ORDER BY created_at, id",
-                _ACTIVE_RESEARCH_RUN_STATUSES,
-            )
-        ]
-        active_chat_runs = _active_chat_generation_run_ids(conn)
-        # Fence pending frontend writes and legacy-only ids in the same transaction as the clear.
-        _tombstone_chat_threads(conn, sorted(set(additional_thread_ids) | set(removed)))
-        conn.execute("DELETE FROM chat_attachment_tombstones")
-        conn.execute("DELETE FROM chat_threads")
-        _mark_chat_attachment_inventory_clean(conn)
-        if operation_id is not None:
-            conn.execute(
-                """
-                INSERT INTO chat_clear_operations (
-                    id, active_research_run_ids_json, deleted_thread_ids_json, cleared_at
-                ) VALUES (?, ?, ?, ?)
-                """,
-                (
-                    operation_id,
-                    json.dumps(active_runs),
-                    json.dumps(removed),
-                    int(datetime.now(timezone.utc).timestamp() * 1000),
-                ),
-            )
-        conn.commit()
-        if include_chat_generation_runs:
-            return removed, active_runs, active_chat_runs, False
-        return removed, active_runs, False
+        hook_thread_ids = set(removed) | set(additional_thread_ids)
+        ledger = (
+            hook_session_ledger(conn, hook_thread_ids)
+            if hook_session_ledger is not None
+            else nullcontext(None)
+        )
+        with ledger as hook_sessions:
+            status_placeholders = ",".join("?" for _ in _ACTIVE_RESEARCH_RUN_STATUSES)
+            active_runs = [
+                row["id"]
+                for row in conn.execute(
+                    f"SELECT id FROM research_runs WHERE status IN ({status_placeholders}) "
+                    "AND lease_owner IS NOT NULL ORDER BY created_at, id",
+                    _ACTIVE_RESEARCH_RUN_STATUSES,
+                )
+            ]
+            active_chat_runs = _active_chat_generation_run_ids(conn)
+            # Fence pending frontend writes and legacy-only ids in the same transaction as the clear.
+            _tombstone_chat_threads(conn, sorted(set(additional_thread_ids) | set(removed)))
+            conn.execute("DELETE FROM chat_attachment_tombstones")
+            conn.execute("DELETE FROM chat_threads")
+            _mark_chat_attachment_inventory_clean(conn)
+            if operation_id is not None:
+                conn.execute(
+                    """
+                    INSERT INTO chat_clear_operations (
+                        id, active_research_run_ids_json, deleted_thread_ids_json, cleared_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        operation_id,
+                        json.dumps(active_runs),
+                        json.dumps(removed),
+                        int(datetime.now(timezone.utc).timestamp() * 1000),
+                    ),
+                )
+            conn.commit()
+        result = (
+            (removed, active_runs, active_chat_runs, False)
+            if include_chat_generation_runs
+            else (removed, active_runs, False)
+        )
+        return (*result, hook_sessions) if hook_session_ledger is not None else result
     except Exception:
         conn.rollback()
         raise
@@ -3084,6 +3711,8 @@ def claim_chat_project_folder(
     expected_workspace_revision: int | None = None,
     reuse_existing_identity: bool = False,
     require_existing: bool = False,
+    hook_session_ledger = None,
+    _hook_admission_fenced: bool = False,
 ) -> Optional[dict]:
     """Create or update a project using one identity-bound existing folder.
 
@@ -3108,6 +3737,17 @@ def claim_chat_project_folder(
         device_id,
         file_id,
     )
+    if hook_session_ledger is not None and not _hook_admission_fenced:
+        from core.agent_workspace.hook_runtime import project_hook_admission_fence
+        with project_hook_admission_fence():
+            return claim_chat_project_folder(
+                project,
+                expected_workspace_revision = expected_workspace_revision,
+                reuse_existing_identity = reuse_existing_identity,
+                require_existing = require_existing,
+                hook_session_ledger = hook_session_ledger,
+                _hook_admission_fenced = True,
+            )
 
     conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
     try:
@@ -3182,16 +3822,30 @@ def claim_chat_project_folder(
                     int(project["updatedAt"]),
                 ),
             )
-        else:
-            current_revision = int(current["workspace_revision"] or 0)
-            if expected_workspace_revision is None:
-                raise ChatProjectWorkspaceRevisionConflictError(
-                    "Project workspace revision is required."
-                )
-            if current_revision != max(0, int(expected_workspace_revision)):
-                raise ChatProjectWorkspaceRevisionConflictError(
-                    "Project workspace changed before this update completed."
-                )
+            row = conn.execute("SELECT * FROM chat_projects WHERE id = ?", (project_id,)).fetchone()
+            conn.commit()
+            return _chat_project_from_row(row) if row is not None else None
+        current_revision = int(current["workspace_revision"] or 0)
+        if expected_workspace_revision is None:
+            raise ChatProjectWorkspaceRevisionConflictError(
+                "Project workspace revision is required."
+            )
+        if current_revision != max(0, int(expected_workspace_revision)):
+            raise ChatProjectWorkspaceRevisionConflictError(
+                "Project workspace changed before this update completed."
+            )
+        thread_ids = {
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM chat_threads WHERE project_id = ?", (project_id,)
+            ).fetchall()
+        }
+        ledger = (
+            hook_session_ledger(conn, thread_ids)
+            if hook_session_ledger is not None
+            else nullcontext(None)
+        )
+        with ledger as hook_sessions:
             conn.execute(
                 """
                 UPDATE chat_projects
@@ -3205,9 +3859,14 @@ def claim_chat_project_folder(
                 """,
                 (folder_path, device_id, file_id, int(project["updatedAt"]), project_id),
             )
-        row = conn.execute("SELECT * FROM chat_projects WHERE id = ?", (project_id,)).fetchone()
-        conn.commit()
-        return _chat_project_from_row(row) if row is not None else None
+            row = conn.execute("SELECT * FROM chat_projects WHERE id = ?", (project_id,)).fetchone()
+            conn.commit()
+        if row is None:
+            return None
+        result = _chat_project_from_row(row)
+        if hook_session_ledger is not None:
+            result["hookSessions"] = hook_sessions
+        return result
     except Exception:
         conn.rollback()
         raise
@@ -3220,6 +3879,8 @@ def disconnect_chat_project_folder(
     *,
     expected_workspace_revision: int | None = None,
     updated_at: int,
+    hook_session_ledger = None,
+    _hook_admission_fenced: bool = False,
 ) -> Optional[dict]:
     """Return a folder-backed project to its preserved managed workspace."""
     snapshot = get_chat_project(project_id)
@@ -3234,6 +3895,16 @@ def disconnect_chat_project_folder(
         )
     if _project_workspace_kind(snapshot) == "managed":
         return snapshot
+    if hook_session_ledger is not None and not _hook_admission_fenced:
+        from core.agent_workspace.hook_runtime import project_hook_admission_fence
+        with project_hook_admission_fence():
+            return disconnect_chat_project_folder(
+                project_id,
+                expected_workspace_revision = expected_workspace_revision,
+                updated_at = updated_at,
+                hook_session_ledger = hook_session_ledger,
+                _hook_admission_fenced = True,
+            )
     requested_root = str(snapshot.get("managedRootPath") or _default_project_root(snapshot))
     for _attempt in range(3):
         prepared = _prepare_project_workspace(requested_root)
@@ -3266,24 +3937,43 @@ def disconnect_chat_project_folder(
                 )
             if not _prepared_workspace_identity_matches(prepared):
                 raise _PreparedProjectWorkspaceChangedError(prepared.root_path)
-            conn.execute(
-                """
-                UPDATE chat_projects
-                SET root_path = ?,
-                    workspace_kind = 'managed',
-                    folder_path = NULL,
-                    folder_device_id = NULL,
-                    folder_file_id = NULL,
-                    workspace_revision = workspace_revision + 1,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (prepared.root_path, int(updated_at), project_id),
+            thread_ids = {
+                str(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM chat_threads WHERE project_id = ?", (project_id,)
+                ).fetchall()
+            }
+            ledger = (
+                hook_session_ledger(conn, thread_ids)
+                if hook_session_ledger is not None
+                else nullcontext(None)
             )
-            row = conn.execute("SELECT * FROM chat_projects WHERE id = ?", (project_id,)).fetchone()
-            conn.commit()
+            with ledger as hook_sessions:
+                conn.execute(
+                    """
+                    UPDATE chat_projects
+                    SET root_path = ?,
+                        workspace_kind = 'managed',
+                        folder_path = NULL,
+                        folder_device_id = NULL,
+                        folder_file_id = NULL,
+                        workspace_revision = workspace_revision + 1,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (prepared.root_path, int(updated_at), project_id),
+                )
+                row = conn.execute(
+                    "SELECT * FROM chat_projects WHERE id = ?", (project_id,)
+                ).fetchone()
+                conn.commit()
             committed = True
-            return _chat_project_from_row(row) if row is not None else None
+            if row is None:
+                return None
+            result = _chat_project_from_row(row)
+            if hook_session_ledger is not None:
+                result["hookSessions"] = hook_sessions
+            return result
         except _PreparedProjectWorkspaceChangedError:
             if conn is not None:
                 conn.rollback()
@@ -3302,7 +3992,22 @@ def disconnect_chat_project_folder(
     )
 
 
-def update_chat_project(id: str, patch: dict) -> Optional[dict]:
+def update_chat_project(
+    id: str,
+    patch: dict,
+    *,
+    hook_session_ledger = None,
+    _hook_admission_fenced: bool = False,
+) -> Optional[dict]:
+    if hook_session_ledger is not None and not _hook_admission_fenced:
+        from core.agent_workspace.hook_runtime import project_hook_admission_fence
+        with project_hook_admission_fence():
+            return update_chat_project(
+                id,
+                patch,
+                hook_session_ledger = hook_session_ledger,
+                _hook_admission_fenced = True,
+            )
     allowed = {
         "name": ("name", patch.get("name")),
         "instructions": ("instructions", patch.get("instructions")),
@@ -3319,15 +4024,36 @@ def update_chat_project(id: str, patch: dict) -> Optional[dict]:
     if not assignments:
         return get_chat_project(id)
 
-    conn = get_connection()
+    conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
     try:
-        conn.execute(
-            f"UPDATE chat_projects SET {', '.join(assignments)} WHERE id = ?",
-            (*values, id),
+        conn.execute("BEGIN IMMEDIATE")
+        thread_ids = {
+            str(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM chat_threads WHERE project_id = ?", (id,)
+            ).fetchall()
+        }
+        ledger = (
+            hook_session_ledger(conn, thread_ids)
+            if hook_session_ledger is not None
+            else nullcontext(None)
         )
-        conn.commit()
-        row = conn.execute("SELECT * FROM chat_projects WHERE id = ?", (id,)).fetchone()
-        return _chat_project_from_row(row) if row is not None else None
+        with ledger as hook_sessions:
+            conn.execute(
+                f"UPDATE chat_projects SET {', '.join(assignments)} WHERE id = ?",
+                (*values, id),
+            )
+            row = conn.execute("SELECT * FROM chat_projects WHERE id = ?", (id,)).fetchone()
+            conn.commit()
+        if row is None:
+            return None
+        result = _chat_project_from_row(row)
+        if hook_session_ledger is not None:
+            result["hookSessions"] = hook_sessions
+        return result
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -3388,7 +4114,22 @@ def list_chat_projects(include_archived: bool = False) -> list[dict]:
         conn.close()
 
 
-def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
+def delete_chat_project(
+    id: str,
+    delete_files: bool = False,
+    *,
+    hook_session_ledger = None,
+    _hook_admission_fenced: bool = False,
+) -> Optional[dict]:
+    if hook_session_ledger is not None and not _hook_admission_fenced:
+        from core.agent_workspace.hook_runtime import project_hook_admission_fence
+        with project_hook_admission_fence():
+            return delete_chat_project(
+                id,
+                delete_files = delete_files,
+                hook_session_ledger = hook_session_ledger,
+                _hook_admission_fenced = True,
+            )
     conn = get_connection(_CONTENDED_BUSY_TIMEOUT_SECONDS)
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -3405,34 +4146,40 @@ def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
                 (id,),
             )
         }
-        # Read before the cascade removes them: afterwards nothing can tell the
-        # supervisor which runs to stop, and a worker keeps doing model, web and
-        # RAG work for a project that is gone.
-        active_runs = (
-            [
-                row["id"]
-                for row in conn.execute(
-                    "SELECT id FROM research_runs WHERE thread_id IN ({}) "
-                    "AND status IN ({}) AND lease_owner IS NOT NULL "
-                    "ORDER BY created_at, id".format(
-                        ",".join("?" for _ in thread_ids) or "NULL",
-                        ",".join("?" for _ in _ACTIVE_RESEARCH_RUN_STATUSES),
-                    ),
-                    (*tuple(sorted(thread_ids)), *_ACTIVE_RESEARCH_RUN_STATUSES),
-                )
-            ]
-            if thread_ids
-            else []
+        ledger = (
+            hook_session_ledger(conn, thread_ids)
+            if hook_session_ledger is not None
+            else nullcontext(None)
         )
-        active_chat_runs = _active_chat_generation_run_ids(conn, thread_ids)
-        _reparent_surviving_forks(conn, thread_ids)
-        # Fence the exact membership selected by this transaction so a late writer cannot
-        # recreate a project member after the project and its workspace are gone.
-        _tombstone_chat_threads(conn, thread_ids)
-        conn.execute("DELETE FROM chat_threads WHERE project_id = ?", (id,))
-        conn.execute("DELETE FROM chat_projects WHERE id = ?", (id,))
-        _mark_chat_attachment_inventory_clean(conn)
-        conn.commit()
+        with ledger as hook_sessions:
+            # Read before the cascade removes them: afterwards nothing can tell the
+            # supervisor which runs to stop, and a worker keeps doing model, web and
+            # RAG work for a project that is gone.
+            active_runs = (
+                [
+                    row["id"]
+                    for row in conn.execute(
+                        "SELECT id FROM research_runs WHERE thread_id IN ({}) "
+                        "AND status IN ({}) AND lease_owner IS NOT NULL "
+                        "ORDER BY created_at, id".format(
+                            ",".join("?" for _ in thread_ids) or "NULL",
+                            ",".join("?" for _ in _ACTIVE_RESEARCH_RUN_STATUSES),
+                        ),
+                        (*tuple(sorted(thread_ids)), *_ACTIVE_RESEARCH_RUN_STATUSES),
+                    )
+                ]
+                if thread_ids
+                else []
+            )
+            active_chat_runs = _active_chat_generation_run_ids(conn, thread_ids)
+            _reparent_surviving_forks(conn, thread_ids)
+            # Fence the exact membership selected by this transaction so a late writer cannot
+            # recreate a project member after the project and its workspace are gone.
+            _tombstone_chat_threads(conn, thread_ids)
+            conn.execute("DELETE FROM chat_threads WHERE project_id = ?", (id,))
+            conn.execute("DELETE FROM chat_projects WHERE id = ?", (id,))
+            _mark_chat_attachment_inventory_clean(conn)
+            conn.commit()
         project = _chat_project_from_row(row)
         if delete_files:
             _delete_project_workspace(project)
@@ -3442,6 +4189,8 @@ def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
         project["memberIds"] = sorted(thread_ids)
         project["activeResearchRunIds"] = active_runs
         project["activeChatGenerationRunIds"] = active_chat_runs
+        if hook_session_ledger is not None:
+            project["hookSessions"] = hook_sessions
         return project
     except Exception:
         conn.rollback()

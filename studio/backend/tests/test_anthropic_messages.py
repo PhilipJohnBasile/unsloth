@@ -1721,6 +1721,7 @@ class TestAnthropicPassthroughStreamAdapter:
             captured["body"] = json.loads(request.content.decode())
             chunks = [
                 {"choices": [{"delta": {"content": "hi"}}]},
+                {"choices": [{"delta": {}, "finish_reason": "stop"}]},
                 {
                     "choices": [],
                     "usage": {
@@ -1784,6 +1785,96 @@ class TestAnthropicPassthroughStreamAdapter:
         message_delta = self._payloads(lines, "message_delta")[0]
         assert message_delta["usage"]["input_tokens"] == 2
         assert message_delta["usage"]["output_tokens"] == 4
+
+    def test_stop_cancel_stays_registered_before_continuation_dispatch(self, monkeypatch):
+        import routes.inference as inf_mod
+        from core.agent_workspace import hook_runtime
+
+        requests = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(json.loads(request.content.decode()))
+            if len(requests) > 1:
+                return httpx.Response(
+                    200,
+                    json = {
+                        "choices": [
+                            {
+                                "message": {"role": "assistant", "content": "continued"},
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    },
+                )
+            content = 'data: {"choices": [{"delta": {"content": "first"}}]}\n\n'
+            content += 'data: {"choices": [{"delta": {}, "finish_reason": "stop"}]}\n\n'
+            content += "data: [DONE]\n\n"
+            return httpx.Response(
+                200,
+                content = content.encode(),
+                headers = {"content-type": "text/event-stream"},
+            )
+
+        transport = httpx.MockTransport(handler)
+        real_async_client = httpx.AsyncClient
+
+        def _client(*args, **kwargs):
+            return real_async_client(transport = transport, timeout = kwargs.get("timeout", 600))
+
+        monkeypatch.setattr(inf_mod.httpx, "AsyncClient", _client)
+        cancelled = []
+
+        def stop_hook(_project_id, event, _payload, **_kwargs):
+            cancelled.append(inf_mod._cancel_by_keys(("cancel-gap",)))
+            return hook_runtime.HookEventResult(
+                event = event,
+                continuation_reason = "continue",
+                continuation_reasons = ("continue",),
+                continuation_fragments = (("review", "continue"),),
+            )
+
+        monkeypatch.setattr(hook_runtime, "run_project_hook_event", stop_hook)
+        cancel_event = threading.Event()
+        turn = hook_runtime.ProjectHookTurn(
+            project_id = "project",
+            session_id = "thread",
+            turn_id = "turn",
+            model = "test-model",
+            permission_mode = "default",
+            cancel_event = cancel_event,
+            transport = "anthropic",
+        )
+        backend = SimpleNamespace(
+            base_url = "http://llama.test",
+            context_length = 4096,
+            count_chat_tokens = lambda *args, **kwargs: 2,
+        )
+
+        async def run():
+            response = await _anthropic_passthrough_stream(
+                self._Request(),
+                cancel_event,
+                backend,
+                [{"role": "user", "content": "hi"}],
+                [{"type": "function", "function": {"name": "lookup", "parameters": {}}}],
+                0.7,
+                0.95,
+                20,
+                16,
+                "msg_1",
+                "test-model",
+                session_id = "project-project",
+                cancel_id = "cancel-gap",
+            )
+            with hook_runtime.activate_project_hook_turn(turn):
+                return await self._collect(response)
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(run())
+
+        assert cancelled == [1]
+        assert cancel_event.is_set()
+        assert len(requests) == 1
 
     @pytest.mark.parametrize(
         "reasoning_kwargs, expected",
@@ -2247,9 +2338,11 @@ def _basic_payload(**fields) -> AnthropicMessagesRequest:
 
 @pytest.fixture(autouse = True)
 def _reset_policy():
+    TestAnthropicMessagesToolRouting._Request.state = SimpleNamespace()
     reset_tool_policy()
     yield
     reset_tool_policy()
+    TestAnthropicMessagesToolRouting._Request.state = SimpleNamespace()
 
 
 @pytest.fixture(autouse = True)
@@ -3657,9 +3750,9 @@ def assert_anthropic_stream_conformant(lines):
         if name == "content_block_start":
             assert not saw_message_delta, "content_block_start after message_delta"
             assert open_index is None, f"block {open_index} still open"
-            assert (
-                data["index"] == next_index
-            ), f"index {data['index']} out of sequence, expected {next_index}"
+            assert data["index"] == next_index, (
+                f"index {data['index']} out of sequence, expected {next_index}"
+            )
             block = data["content_block"]
             if block["type"] == "thinking":
                 assert block.get("thinking") == ""
@@ -3677,9 +3770,9 @@ def assert_anthropic_stream_conformant(lines):
                 "signature_delta": "thinking",
                 "input_json_delta": "tool_use",
             }[delta["type"]]
-            assert (
-                blocks[open_index]["type"] == expected
-            ), f"{delta['type']} inside a {blocks[open_index]['type']} block"
+            assert blocks[open_index]["type"] == expected, (
+                f"{delta['type']} inside a {blocks[open_index]['type']} block"
+            )
             blocks[open_index]["text"] += delta.get("text") or delta.get("thinking") or ""
         elif name == "content_block_stop":
             assert open_index is not None, "content_block_stop with no open block"

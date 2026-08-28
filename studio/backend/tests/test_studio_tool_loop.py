@@ -17,6 +17,7 @@ import threading
 
 import pytest
 
+from core.agent_workspace import hook_runtime
 from core.inference import studio_tool_loop as loop_mod
 from core.inference.studio_tool_loop import (
     ToolLoopPolicy,
@@ -57,6 +58,8 @@ def _tool(name: str, description: str = "") -> dict:
 
 
 WEB = _tool("web_search")
+WEB_EMPTY = _tool("web_search")
+WEB_EMPTY["function"]["parameters"]["required"] = []
 PY = _tool("python")
 TERMINAL = _tool("terminal")
 
@@ -112,6 +115,8 @@ def _run(
     tools = None,
     tool_choice = None,
     messages = None,
+    session_id = "s1",
+    thread_id = "t1",
     **policy_kwargs,
 ):
     policy_fields = {
@@ -132,8 +137,8 @@ def _run(
             transport,
             run = ToolLoopRun(
                 messages = messages or [{"role": "user", "content": "hi"}],
-                session_id = "s1",
-                thread_id = "t1",
+                session_id = session_id,
+                thread_id = thread_id,
                 tool_choice = tool_choice,
             ),
             policy = ToolLoopPolicy(**policy_fields),
@@ -655,7 +660,15 @@ def test_project_prompt_rule_restores_confirmation_in_full_access(executed, monk
     assert slots == ["project-rule"]
     assert _events(lines, "tool_start")[0]["awaiting_confirmation"] is True
     assert executed[0]["disable_sandbox"] is True
-    assert executed[0]["project_rule_proof"] == {"policyHash": "a" * 64, "approved": True}
+    assert executed[0]["project_rule_proof"] == {
+        "policyHash": "a" * 64,
+        "approved": True,
+        "command": "gh pr view 17",
+        "argv": ["bash", "-c", "gh pr view 17"],
+        "projectId": None,
+        "workspaceIdentity": None,
+        "workspaceRevision": None,
+    }
 
 
 def test_sandbox_stays_on_by_default(executed):
@@ -682,6 +695,135 @@ def test_sandbox_stays_on_by_default(executed):
     _run(transport, tools = [PY])
 
     assert executed[0]["disable_sandbox"] is False
+
+
+def test_empty_object_hook_rewrite_survives_controller_permission_and_execution(
+    executed, monkeypatch
+):
+    permission_arguments = []
+
+    def rewrite(_name, _arguments, **kwargs):
+        return (
+            {},
+            hook_runtime.HookEventResult(event = "PreToolUse", updated_input = {}),
+            kwargs["tool_use_id"],
+        )
+
+    def permission(_name, arguments, **_kwargs):
+        permission_arguments.append(arguments)
+        return hook_runtime.HookEventResult(
+            event = "PermissionRequest",
+            permission_decision = "allow",
+        )
+
+    monkeypatch.setattr(loop_mod, "prepare_project_tool_hook", rewrite)
+    monkeypatch.setattr(loop_mod, "run_project_permission_hook", permission)
+    transport = FakeTransport(
+        [
+            [
+                _sse(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "c1",
+                                "function": {
+                                    "name": "web_search",
+                                    "arguments": '{"query":"discard me"}',
+                                },
+                            }
+                        ]
+                    }
+                ),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "ok"}), _sse(finish = "stop"), _DONE],
+        ]
+    )
+
+    lines = _run(
+        transport,
+        tools = [WEB_EMPTY],
+        confirm_calls = True,
+        permission_mode = "default",
+        session_id = "project-project",
+        thread_id = "thread",
+    )
+
+    assert permission_arguments == [{}]
+    assert executed[0]["arguments"] == {}
+    assert _events(lines, "tool_start")[0]["arguments"] == {}
+
+
+def test_project_stop_reviews_final_answer_after_real_provider_tool_turn(executed, monkeypatch):
+    observed = []
+
+    def run(_project_id, event, payload, **_kwargs):
+        observed.append((event, payload["last_assistant_message"]))
+        if len(observed) == 1:
+            return hook_runtime.HookEventResult(
+                event = event,
+                continuation_reason = "continue",
+                continuation_reasons = ("continue",),
+                continuation_fragments = (("review", "continue"),),
+            )
+        return hook_runtime.HookEventResult(event = event)
+
+    monkeypatch.setattr(hook_runtime, "run_project_hook_event", run)
+    monkeypatch.setattr(
+        loop_mod,
+        "prepare_project_tool_hook",
+        lambda name, arguments, **kwargs: (
+            arguments,
+            hook_runtime.HookEventResult(event = "PreToolUse"),
+            kwargs["tool_use_id"],
+        ),
+    )
+    transport = FakeTransport(
+        [
+            [
+                _sse(
+                    {
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "c1",
+                                "function": {
+                                    "name": "web_search",
+                                    "arguments": '{"query":"x"}',
+                                },
+                            }
+                        ]
+                    }
+                ),
+                _sse(finish = "tool_calls"),
+                _DONE,
+            ],
+            [_sse({"content": "final"}), _sse(finish = "stop"), _DONE],
+            [_sse({"content": "continued"}), _sse(finish = "stop"), _DONE],
+        ]
+    )
+    turn = hook_runtime.ProjectHookTurn(
+        project_id = "project",
+        session_id = "thread",
+        turn_id = "turn",
+        model = "model",
+        permission_mode = "default",
+        cancel_event = threading.Event(),
+    )
+
+    with hook_runtime.activate_project_hook_turn(turn):
+        lines = _run(
+            transport,
+            session_id = "project-project",
+            thread_id = "thread",
+        )
+
+    assert [call["name"] for call in executed] == ["web_search"]
+    assert observed == [("Stop", "final"), ("Stop", "continued")]
+    assert "final" in "".join(str(line) for line in lines)
+    assert "continued" in "".join(str(line) for line in lines)
 
 
 # ── Forced tool choice ────────────────────────────────────────────

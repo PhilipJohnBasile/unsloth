@@ -35,6 +35,7 @@ import {
   visibleProjectHookText,
 } from "../api/project-hooks-api";
 import type { ProjectRecord } from "../types";
+import { projectHookHandlerPresentation } from "./project-hook-handler-presentation";
 
 type MutationKey = "trust" | "revoke" | `handler:${string}`;
 
@@ -318,8 +319,10 @@ export function ProjectHooksPanel({ project }: { project: ProjectRecord }) {
               Project hooks
             </p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              Review configured hook commands and manage exact-file trust. Hook
-              execution is a separate lifecycle integration.
+              Review configured hook commands and manage exact-file trust.
+              Trusted foreground hooks can run immediately at supported
+              lifecycle points. Background hooks run later and are informational
+              only.
             </p>
           </div>
           <Button
@@ -422,9 +425,11 @@ export function ProjectHooksPanel({ project }: { project: ProjectRecord }) {
             <AlertDialogTitle>Trust project hooks?</AlertDialogTitle>
             <AlertDialogDescription>
               Trust records approval for this exact file hash and workspace. It
-              does not run hooks. Command execution and lifecycle wiring are a
-              separate integration. Trusting resets handler preferences and
-              enables all configured handlers.
+              allows enabled hooks to run now and on future supported lifecycle
+              events while the exact file and workspace still match. Background
+              hooks are informational and cannot approve, deny, rewrite, or
+              delay the triggering operation. Trusting resets handler
+              preferences and enables all configured handlers.
             </AlertDialogDescription>
           </AlertDialogHeader>
           {trustConfirmation ? (
@@ -575,7 +580,7 @@ function HooksBrowser({
           >
             {hooks.trusted
               ? "Trusted for this exact content hash."
-              : "This file is untrusted. Any lifecycle integration must require trust for this exact file and workspace."}
+              : "This file is untrusted. No configured hook can run until this exact file and workspace are trusted."}
           </p>
         </div>
         {hooks.trusted ? (
@@ -725,6 +730,12 @@ function HandlerRow({
     enabled: boolean,
   ) => Promise<void>;
 }) {
+  const presentation = projectHookHandlerPresentation({
+    trusted,
+    enabled: handler.enabled,
+    active: handler.active,
+    background: handler.async,
+  });
   return (
     <div className="rounded-lg bg-muted/40 px-3 py-2">
       <div className="flex items-start justify-between gap-3">
@@ -752,17 +763,12 @@ function HandlerRow({
               onSetEnabled(handler, checked === true).catch(() => undefined);
             }}
           />
-          {updating
-            ? "Saving..."
-            : `${handler.enabled ? "Enabled" : "Disabled"} preference, ${handler.active ? "trusted and eligible" : "not eligible"}`}
+          {updating ? "Saving..." : presentation.state}
         </div>
       </div>
       <p className="mt-1 text-[10px] text-muted-foreground">
-        Timeout {handler.timeout}s,{" "}
-        {handler.async
-          ? "background requested (runtime follow-up)"
-          : "foreground requested (runtime follow-up)"}
-        , context limit {handler.additionalContextLimit}
+        Timeout {handler.timeout}s, {presentation.execution}, context limit{" "}
+        {handler.additionalContextLimit}
       </p>
       {handler.statusMessage ? (
         <VisibleProjectHookText

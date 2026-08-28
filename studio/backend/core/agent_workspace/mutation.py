@@ -22,6 +22,7 @@ import os
 import stat
 import struct
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,14 +39,24 @@ _MUTATION_CONDITION = threading.Condition()
 _ACTIVE_MUTATION_ROOTS: set[tuple[int, int]] = set()
 
 
-def acquire_workspace_mutation_slot(identity: tuple[int, int], cancel_event = None) -> bool:
+def acquire_workspace_mutation_slot(
+    identity: tuple[int, int],
+    cancel_event = None,
+    deadline: float | None = None,
+) -> bool:
     """Serialize processes and edits that can mutate one project root."""
     key = (int(identity[0]), int(identity[1]))
     with _MUTATION_CONDITION:
         while key in _ACTIVE_MUTATION_ROOTS:
             if cancel_event is not None and cancel_event.is_set():
                 return False
-            _MUTATION_CONDITION.wait(timeout = 0.05)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                _MUTATION_CONDITION.wait(timeout = min(0.05, remaining))
+            else:
+                _MUTATION_CONDITION.wait(timeout = 0.05)
         if cancel_event is not None and cancel_event.is_set():
             return False
         _ACTIVE_MUTATION_ROOTS.add(key)

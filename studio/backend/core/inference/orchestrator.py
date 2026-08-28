@@ -32,6 +32,7 @@ from core.inference.audio_errors import (
     AudioBackendUnsupportedError,
     AudioGenerationCancelledError,
 )
+from core.agent_workspace.hook_runtime import project_stop_hook
 from utils.hardware import get_device, prepare_gpu_selection
 from utils.utils import hf_env_offline
 
@@ -173,24 +174,57 @@ def _summed_tool_loop_stats(total, turn):
         return turn
     prior_usage = total.get("usage") or {}
     usage = dict(turn.get("usage") or {})
-    completion = (usage.get("completion_tokens") or 0) + (prior_usage.get("completion_tokens") or 0)
-    usage["completion_tokens"] = completion
-    # The prompt is the loop's, not one turn's, so a turn that ended before
-    # reporting keeps the last count that arrived. Its details describe that same
-    # count and move with it, or cached tokens could outnumber prompt tokens.
-    if not usage.get("prompt_tokens"):
-        usage["prompt_tokens"] = prior_usage.get("prompt_tokens") or 0
-        usage.pop("prompt_tokens_details", None)
-        if prior_usage.get("prompt_tokens_details") is not None:
-            usage["prompt_tokens_details"] = prior_usage["prompt_tokens_details"]
-    usage["total_tokens"] = usage["prompt_tokens"] + completion
-    # Details describe the completion, so they sum with it rather than describing
-    # one turn against every turn's tokens.
-    details = dict(prior_usage.get("completion_tokens_details") or {})
-    for field, value in (usage.get("completion_tokens_details") or {}).items():
-        details[field] = (details.get(field) or 0) + (value or 0)
-    if details:
-        usage["completion_tokens_details"] = details
+    prior_structured = "prompt_tokens" in prior_usage or "completion_tokens" in prior_usage
+    turn_structured = "prompt_tokens" in usage or "completion_tokens" in usage
+    total_only = "total_tokens" in usage and not turn_structured and not prior_structured
+    if total_only:
+        usage["total_tokens"] = (usage.get("total_tokens") or 0) + (
+            prior_usage.get("total_tokens") or 0
+        )
+    else:
+
+        def _unclassified_tokens(value):
+            explicit = value.get("unclassified_tokens")
+            if isinstance(explicit, (int, float)) and not isinstance(explicit, bool):
+                return explicit
+            if "prompt_tokens" in value or "completion_tokens" in value:
+                reported = value.get("total_tokens")
+                classified = (value.get("prompt_tokens") or 0) + (
+                    value.get("completion_tokens") or 0
+                )
+                if isinstance(reported, (int, float)) and not isinstance(reported, bool):
+                    return max(0, reported - classified)
+                return 0
+            reported = value.get("total_tokens")
+            return (
+                reported
+                if isinstance(reported, (int, float)) and not isinstance(reported, bool)
+                else 0
+            )
+
+        unclassified = _unclassified_tokens(prior_usage) + _unclassified_tokens(usage)
+        completion = (usage.get("completion_tokens") or 0) + (
+            prior_usage.get("completion_tokens") or 0
+        )
+        usage["completion_tokens"] = completion
+        # The prompt is the loop's, not one turn's, so a turn that ended before
+        # reporting keeps the last count that arrived. Its details describe that same
+        # count and move with it, or cached tokens could outnumber prompt tokens.
+        if not usage.get("prompt_tokens"):
+            usage["prompt_tokens"] = prior_usage.get("prompt_tokens") or 0
+            usage.pop("prompt_tokens_details", None)
+            if prior_usage.get("prompt_tokens_details") is not None:
+                usage["prompt_tokens_details"] = prior_usage["prompt_tokens_details"]
+        if unclassified:
+            usage["unclassified_tokens"] = unclassified
+        usage["total_tokens"] = usage["prompt_tokens"] + completion + unclassified
+        # Details describe the completion, so they sum with it rather than describing
+        # one turn against every turn's tokens.
+        details = dict(prior_usage.get("completion_tokens_details") or {})
+        for field, value in (usage.get("completion_tokens_details") or {}).items():
+            details[field] = (details.get(field) or 0) + (value or 0)
+        if details:
+            usage["completion_tokens_details"] = details
     summed = dict(turn)
     summed["usage"] = usage
     timings = dict(turn.get("timings") or {})
@@ -467,8 +501,21 @@ class InferenceOrchestrator:
         return proc is not None and proc.is_alive()
 
     def _shutdown_subprocess(self, timeout: float = 10.0) -> bool:
+        owned_runtime_present = bool(self.active_model_name or self.models)
         with self._subprocess_shutdown_lock:
-            return self._shutdown_subprocess_locked(timeout)
+            stopped = self._shutdown_subprocess_locked(timeout)
+        if stopped and owned_runtime_present:
+            try:
+                from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+                    end_project_hook_sessions_for_owner,
+                )
+                end_project_hook_sessions_for_owner(
+                    f"standard:{id(self)}",
+                    reason = "other",
+                )
+            except Exception as exc:  # noqa: BLE001 - process teardown remains authoritative
+                logger.warning("Could not end project hook sessions for worker shutdown: %s", exc)
+        return stopped
 
     def _shutdown_subprocess_locked(self, timeout: float) -> bool:
         """Gracefully shut down the inference subprocess.
@@ -1700,7 +1747,12 @@ class InferenceOrchestrator:
         from core.inference import stt_registry
         return stt_registry.resident()
 
-    def unload_model(self, model_name: str) -> bool:
+    def unload_model(
+        self,
+        model_name: str,
+        *,
+        hook_end_reason: str = "other",
+    ) -> bool:
         """Unload a model from the subprocess."""
         # active_model_name can differ in case from the client's raw /unload name (the
         # load path canonicalizes casing). Match case-insensitively and use the canonical
@@ -1711,6 +1763,29 @@ class InferenceOrchestrator:
             and model_name.lower() == self.active_model_name.lower()
         ):
             model_name = self.active_model_name
+        runtime_owner = f"standard:{id(self)}"
+        owned_runtime_present = bool(
+            self.active_model_name == model_name or model_name in self.models
+        )
+
+        def finish(result: bool) -> bool:
+            if owned_runtime_present and (
+                self.active_model_name != model_name and model_name not in self.models
+            ):
+                try:
+                    from core.agent_workspace.hook_runtime import (  # noqa: PLC0415
+                        end_project_hook_sessions_for_owner,
+                    )
+                    end_project_hook_sessions_for_owner(
+                        runtime_owner,
+                        reason = hook_end_reason,
+                    )
+                except Exception as exc:  # noqa: BLE001 - teardown remains authoritative
+                    logger.warning(
+                        "Could not end project hook sessions for model teardown: %s", exc
+                    )
+            return result
+
         # In-flight load: tear its subprocess down (shared loading-cancel logic; no
         # worker command sent).
         if self.cancel_load(model_name):
@@ -1721,14 +1796,14 @@ class InferenceOrchestrator:
             self.models.pop(model_name, None)
             if self.active_model_name == model_name:
                 self.active_model_name = None
-            return True
+            return finish(True)
 
         # Nothing loaded under this name: don't unload a stale model. The worker falls
         # back to unloading its *active* model when the name is absent, so a stale unload
         # (lost a race to a concurrent load) would hit the wrong one.
         if model_name != self.active_model_name and model_name not in self.models:
             self.models.pop(model_name, None)
-            return True
+            return finish(True)
 
         # The subprocess runs commands sequentially, so a bare unload queues behind a
         # running generate (a 2-3 min hang). Cancel first (via the mp.Event the worker
@@ -1762,7 +1837,7 @@ class InferenceOrchestrator:
                 self.models.pop(model_name, None)
                 if self.active_model_name == model_name:
                     self.active_model_name = None
-                return True
+                return finish(True)
 
             try:
                 # Stop the compare-mode dispatcher so it can't consume the "unloaded" reply
@@ -1779,7 +1854,7 @@ class InferenceOrchestrator:
                     self.models.pop(model_name, None)
                     if self.active_model_name == model_name:
                         self.active_model_name = None
-                    return True
+                    return finish(True)
                 # Drop stale tokens so they can't be read as the unload reply.
                 self._drain_queue()
                 self._send_cmd(
@@ -1806,7 +1881,7 @@ class InferenceOrchestrator:
                         self._shutdown_subprocess(timeout = 5)
                     except Exception as exc:
                         logger.warning("Could not shut the idle inference subprocess down: %s", exc)
-                return True
+                return finish(True)
 
             except Exception as exc:
                 logger.error("Error unloading model '%s': %s", model_name, exc)
@@ -1814,7 +1889,7 @@ class InferenceOrchestrator:
                 self.models.pop(model_name, None)
                 if self.active_model_name == model_name:
                     self.active_model_name = None
-                return False
+                return finish(False)
             finally:
                 self._gen_lock.release()
         finally:
@@ -1822,6 +1897,7 @@ class InferenceOrchestrator:
             if self._drain_event is not None:
                 self._drain_event.clear()
 
+    @project_stop_hook
     def generate_chat_response(
         self,
         messages: list,
@@ -1845,6 +1921,9 @@ class InferenceOrchestrator:
         frequency_penalty: float = 0.0,
         logit_bias: Optional[dict] = None,
         stop: Optional[list] = None,
+        session_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        continuation_state: Optional[dict[str, Any]] = None,
     ) -> Generator[str, None, None]:
         """Generate response, streaming tokens from subprocess.
 
@@ -1858,7 +1937,18 @@ class InferenceOrchestrator:
 
         ``presence_penalty`` matches the GGUF sampling path (0 disables it).
         """
-        yield from self._generate_inner(
+        conversation = list(messages)
+        if system_prompt:
+            conversation = [{"role": "system", "content": system_prompt}, *conversation]
+        if continuation_state is not None:
+            continuation_state["messages"] = conversation
+        # Always provide a request-local completion latch, even when the route
+        # does not ask for usage. ``_consume_token_stream`` writes the key only
+        # after the worker's gen_done event, which distinguishes a clean empty
+        # answer from a cancelled or vanished stream.
+        stream_stats = stats_holder if stats_holder is not None else {}
+        stream_stats.pop("stats", None)
+        stream = self._generate_inner(
             messages = messages,
             system_prompt = system_prompt,
             image = image,
@@ -1875,13 +1965,32 @@ class InferenceOrchestrator:
             reasoning_effort = reasoning_effort,
             preserve_thinking = preserve_thinking,
             continue_final_message = continue_final_message,
-            stats_holder = stats_holder,
+            stats_holder = stream_stats,
             presence_penalty = presence_penalty,
             seed = seed,
             frequency_penalty = frequency_penalty,
             logit_bias = logit_bias,
             stop = stop,
         )
+        try:
+            for chunk in stream:
+                if isinstance(chunk, GenStreamError):
+                    raise GenStreamErrorRaised(str(chunk), public = chunk.public)
+                yield chunk
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()
+
+        # Cancellation is an intentional abort and the Stop decorator observes
+        # the same event, so return without turning it into a completed answer.
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        if "stats" not in stream_stats:
+            raise GenStreamErrorRaised(
+                "Error: generation ended before terminal completion.",
+                public = True,
+            )
 
     def generate_chat_completion_with_tools(
         self,
@@ -1964,12 +2073,13 @@ class InferenceOrchestrator:
                 stop = stop,
             )
             if use_adapter is not None:
-                stream = self.generate_with_adapter_control(
+                stream = type(self).generate_with_adapter_control.__wrapped__(
+                    self,
                     use_adapter = use_adapter,
                     **common_kwargs,
                 )
             else:
-                stream = self.generate_chat_response(**common_kwargs)
+                stream = type(self).generate_chat_response.__wrapped__(self, **common_kwargs)
             close_stream = False
             try:
                 for chunk in stream:
@@ -2041,11 +2151,15 @@ class InferenceOrchestrator:
             max_tokens = max_new_tokens,
         )
 
+    @project_stop_hook
     def generate_with_adapter_control(
         self,
         use_adapter: Optional[Union[bool, str]] = None,
         cancel_event = None,
         stats_holder: Optional[dict] = None,
+        session_id: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        continuation_state: Optional[dict[str, Any]] = None,
         **gen_kwargs,
     ) -> Generator[str, None, None]:
         """Generate with adapter control, streaming tokens from subprocess.
@@ -2055,10 +2169,18 @@ class InferenceOrchestrator:
         sequential command loop. Backend failures raise instead of becoming
         assistant text.
         """
+        conversation = list(gen_kwargs.get("messages") or [])
+        system_prompt = gen_kwargs.get("system_prompt")
+        if system_prompt:
+            conversation = [{"role": "system", "content": system_prompt}, *conversation]
+        if continuation_state is not None:
+            continuation_state["messages"] = conversation
+        stream_stats = stats_holder if stats_holder is not None else {}
+        stream_stats.pop("stats", None)
         stream = self._generate_dispatched(
             use_adapter = use_adapter,
             cancel_event = cancel_event,
-            stats_holder = stats_holder,
+            stats_holder = stream_stats,
             **gen_kwargs,
         )
         try:
@@ -2073,6 +2195,13 @@ class InferenceOrchestrator:
             close = getattr(stream, "close", None)
             if callable(close):
                 close()
+        if cancel_event is not None and cancel_event.is_set():
+            return
+        if "stats" not in stream_stats:
+            raise GenStreamErrorRaised(
+                "Error: generation ended before terminal completion.",
+                public = True,
+            )
 
     def _generate_inner(
         self,

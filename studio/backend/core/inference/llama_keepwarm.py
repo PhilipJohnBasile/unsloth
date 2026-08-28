@@ -883,7 +883,7 @@ async def idle_unload_loop(poll_seconds: float = 15.0) -> None:
                             _delete_resume_files(manifest)
                         continue
                     try:
-                        await asyncio.to_thread(backend.unload_model)
+                        await asyncio.to_thread(backend.unload_model, hook_end_reason = "idle")
                     except Exception:
                         # Failed unload means nothing will stash the manifest.
                         if manifest:
